@@ -13,7 +13,9 @@ use super::pane::{Pane, PaneObserver, PaneSpec};
 use super::render::Frame;
 use super::window::Window;
 use crate::project::ProjectId;
-use crate::protocol::{SessionCommand, SessionId, SessionInfo, Size, Split, WindowSummary};
+use crate::protocol::{
+    SessionCommand, SessionId, SessionInfo, SessionState, Size, Split, WindowSummary,
+};
 
 const FALLBACK_WINDOW_NAME: &str = "shell";
 
@@ -79,6 +81,7 @@ impl Session {
 
     pub fn rename(&self, name: String) {
         *lock(&self.name) = name;
+        self.state().status_changed();
     }
 
     pub fn binding(&self) -> Option<&Binding> {
@@ -91,6 +94,19 @@ impl Session {
 
     pub fn windows(&self) -> Vec<WindowSummary> {
         self.state().list.iter().map(Window::summary).collect()
+    }
+
+    pub fn status(&self) -> SessionState {
+        let name = self.name();
+        let windows = self.state();
+        SessionState {
+            name,
+            windows: windows.list.iter().map(Window::summary).collect(),
+            active: windows
+                .active_window()
+                .map(Window::index)
+                .unwrap_or_default(),
+        }
     }
 
     pub fn info(&self) -> SessionInfo {
@@ -115,6 +131,13 @@ impl Session {
     pub fn watch_windows(&self) -> watch::Receiver<()> {
         match &self.state().signals {
             Some(signals) => signals.windows.subscribe(),
+            None => closed(),
+        }
+    }
+
+    pub fn watch_status(&self) -> watch::Receiver<()> {
+        match &self.state().signals {
+            Some(signals) => signals.status.subscribe(),
             None => closed(),
         }
     }
@@ -209,7 +232,21 @@ impl Session {
                 let active = self.state().active;
                 self.remove_window(active)
             }
+            SessionCommand::RenameWindow(name) => self.rename_window(name),
         }
+    }
+
+    fn rename_window(&self, name: String) -> Result<()> {
+        if name.trim().is_empty() {
+            bail!("a window name can't be empty");
+        }
+        if name.chars().any(char::is_control) {
+            bail!("a window name can't contain control characters");
+        }
+        let mut windows = self.state();
+        windows.active_window_mut().ok_or_else(ended)?.rename(name);
+        windows.structure_changed();
+        Ok(())
     }
 
     pub fn select(&self, window: Option<usize>, pane: Option<usize>) -> Result<()> {
@@ -224,7 +261,7 @@ impl Session {
             selected.focus(id);
         }
         windows.active = position;
-        windows.redraw();
+        windows.active_changed();
         Ok(())
     }
 
@@ -351,6 +388,7 @@ enum Cycle {
 struct Signals {
     frames: watch::Sender<()>,
     windows: watch::Sender<()>,
+    status: watch::Sender<()>,
 }
 
 impl Windows {
@@ -363,6 +401,7 @@ impl Windows {
             signals: Some(Signals {
                 frames: watch::channel(()).0,
                 windows: watch::channel(()).0,
+                status: watch::channel(()).0,
             }),
         }
     }
@@ -403,7 +442,7 @@ impl Windows {
             Cycle::Next => (self.active + 1) % count,
             Cycle::Previous => (self.active + count - 1) % count,
         };
-        self.redraw();
+        self.active_changed();
     }
 
     fn focus(&mut self, change: impl FnOnce(&mut Window, Size) -> bool) {
@@ -456,10 +495,22 @@ impl Windows {
         }
     }
 
+    fn active_changed(&self) {
+        self.redraw();
+        self.status_changed();
+    }
+
+    fn status_changed(&self) {
+        if let Some(signals) = &self.signals {
+            signals.status.send_replace(());
+        }
+    }
+
     fn structure_changed(&self) {
         if let Some(signals) = &self.signals {
             signals.frames.send_replace(());
             signals.windows.send_replace(());
+            signals.status.send_replace(());
         }
     }
 }

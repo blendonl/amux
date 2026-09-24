@@ -16,8 +16,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use amux::protocol::{
-    self, AttachedSession, ClientMessage, Duplex, NewSession, Role, ServerMessage, SessionCommand,
-    SessionInfo, Size, Version, Welcome, WindowSummary,
+    self, AttachedSession, ClientMessage, ClusterStatus, Duplex, NewSession, Role, ServerMessage,
+    SessionCommand, SessionInfo, SessionState, Size, Version, Welcome, WindowSummary,
 };
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
@@ -513,6 +513,14 @@ pub fn screen_region(screen: &vt100::Screen, cols: Range<u16>) -> String {
         .join("\n")
 }
 
+pub fn screen_row(screen: &vt100::Screen, row: u16) -> String {
+    let (_, cols) = screen.size();
+    screen
+        .contents_between(row, 0, row, cols)
+        .trim_end()
+        .to_owned()
+}
+
 pub fn screen_column(screen: &vt100::Screen, col: u16) -> String {
     let (rows, _) = screen.size();
     (0..rows)
@@ -669,6 +677,8 @@ pub struct TestClient {
     incoming: mpsc::Receiver<ServerMessage>,
     outgoing: mpsc::Sender<ClientMessage>,
     screen: vt100::Parser,
+    session_state: Option<SessionState>,
+    cluster_statuses: Vec<ClusterStatus>,
 }
 
 impl TestClient {
@@ -687,6 +697,8 @@ impl TestClient {
             incoming,
             outgoing,
             screen: vt100::Parser::new(SIZE.rows, SIZE.cols, 0),
+            session_state: None,
+            cluster_statuses: Vec::new(),
         }
     }
 
@@ -709,14 +721,66 @@ impl TestClient {
             .expect("the server closed the connection");
     }
 
+    pub fn session_state(&self) -> Option<&SessionState> {
+        self.session_state.as_ref()
+    }
+
+    pub fn cluster_statuses(&self) -> &[ClusterStatus] {
+        &self.cluster_statuses
+    }
+
     pub async fn recv(&mut self) -> Option<ServerMessage> {
-        let message = tokio::time::timeout(TIMEOUT, self.incoming.recv())
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        let message = self
+            .recv_until(deadline)
             .await
             .expect("timed out waiting for the server");
         if let Some(ServerMessage::Output(bytes)) = &message {
             self.screen.process(bytes);
         }
         message
+    }
+
+    async fn recv_until(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<ServerMessage>, tokio::time::error::Elapsed> {
+        loop {
+            let message = tokio::time::timeout_at(deadline, self.incoming.recv()).await?;
+            if let Some(message) = self.absorb_state(message) {
+                return Ok(message);
+            }
+        }
+    }
+
+    fn absorb_state(&mut self, message: Option<ServerMessage>) -> Option<Option<ServerMessage>> {
+        match message {
+            Some(ServerMessage::SessionState(state)) => self.session_state = Some(state),
+            Some(ServerMessage::ClusterStatus(status)) => self.cluster_statuses.push(status),
+            other => return Some(other),
+        }
+        None
+    }
+
+    pub async fn wait_until(&mut self, what: &str, done: impl Fn(&Self) -> bool) {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        while !done(self) {
+            let message = tokio::time::timeout_at(deadline, self.incoming.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "timed out waiting for {what}; state {:?}, cluster {:?}",
+                        self.session_state, self.cluster_statuses
+                    )
+                });
+            match self.absorb_state(message) {
+                None => {}
+                Some(Some(ServerMessage::Output(bytes))) => self.screen.process(&bytes),
+                Some(other) => {
+                    panic!("expected output or state while waiting for {what}, got {other:?}")
+                }
+            }
+        }
     }
 
     pub fn session_request(&self, name: Option<&str>) -> NewSession {
@@ -808,7 +872,8 @@ impl TestClient {
                 return;
             }
             let contents = self.contents();
-            let message = tokio::time::timeout_at(deadline, self.incoming.recv())
+            let message = self
+                .recv_until(deadline)
                 .await
                 .unwrap_or_else(|_| panic!("timed out waiting for {what}; screen:\n{contents}"));
             match message {
@@ -915,16 +980,33 @@ impl TerminalClient {
     }
 
     pub fn wait_for(&mut self, what: &str, done: impl Fn(&str) -> bool) -> String {
+        self.wait_for_screen(what, |screen| done(&screen.contents()));
+        self.contents()
+    }
+
+    pub fn screen(&self) -> &vt100::Screen {
+        self.screen.screen()
+    }
+
+    pub fn status_line(&self) -> String {
+        screen_row(self.screen(), SIZE.rows - 1)
+    }
+
+    pub fn wait_for_status(&mut self, what: &str, done: impl Fn(&str) -> bool) -> String {
+        self.wait_for_screen(what, |screen| done(&screen_row(screen, SIZE.rows - 1)));
+        self.status_line()
+    }
+
+    pub fn wait_for_screen(&mut self, what: &str, done: impl Fn(&vt100::Screen) -> bool) {
         let deadline = Instant::now() + TIMEOUT;
         loop {
-            let contents = self.contents();
-            if done(&contents) {
-                return contents;
+            if done(self.screen.screen()) {
+                return;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             match self.output.recv_timeout(remaining) {
                 Ok(bytes) => self.screen.process(&bytes),
-                Err(_) => panic!("timed out waiting for {what}; screen:\n{contents}"),
+                Err(_) => panic!("timed out waiting for {what}; screen:\n{}", self.contents()),
             }
         }
     }

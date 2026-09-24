@@ -1,15 +1,12 @@
-#[allow(dead_code, unused_imports)]
 mod chrome;
 mod keys;
 mod listing;
-mod overlay;
 mod projects;
+mod relay;
 mod terminal;
-#[allow(dead_code)]
 mod tree;
 
 use std::env;
-use std::fmt;
 use std::fs::OpenOptions;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -20,7 +17,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use tokio::net::UnixStream;
-use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 
 use crate::cli::{Grouping, NewArgs};
@@ -29,12 +25,11 @@ use crate::config::{self, ServerConfig};
 use crate::paths;
 use crate::project::{self, Detected};
 use crate::protocol::{
-    self, is_locale_variable, AttachedSession, ClientMessage, DebugCommand, Duplex,
-    IncompatibleServer, NewSession, ProjectRef, Role, ServerMessage, ServerView, SessionInfo,
-    Version,
+    self, is_locale_variable, ClientMessage, DebugCommand, Duplex, IncompatibleServer, NewSession,
+    ProjectRef, Role, ServerMessage, ServerView, SessionInfo, Version,
 };
 use crate::target::{self, Target};
-use keys::{Action, PrefixRouter, DEFAULT_PREFIX};
+use relay::Relay;
 use terminal::RawTerminal;
 
 const SERVER_START_ATTEMPTS: u32 = 50;
@@ -72,7 +67,7 @@ pub async fn new_session(endpoint: &Endpoint, args: NewArgs) -> Result<()> {
         project,
         branch,
         clone: args.clone,
-        ..NewSession::new(args.name, terminal::size()?)
+        ..NewSession::new(args.name, terminal::session_size()?)
     });
     attach(server, &welcome.server_name, request).await
 }
@@ -138,7 +133,7 @@ pub async fn attach_session(endpoint: &Endpoint, target: Option<String>) -> Resu
     let (welcome, server) = greet_server(connect_stream(&endpoint.socket).await?).await?;
     let request = ClientMessage::Attach {
         target,
-        size: terminal::size()?,
+        size: terminal::session_size()?,
     };
     attach(server, &welcome.server_name, request).await
 }
@@ -366,93 +361,13 @@ async fn attach(server: ServerConnection, local: &str, request: ClientMessage) -
         None => bail!("server closed the connection"),
     };
 
-    let mut session = SessionLabel {
-        local: local.to_owned(),
-        attached,
-    };
+    let mut relay = Relay::new(local.to_owned(), attached, terminal::size()?);
     let outcome = {
         let _terminal = RawTerminal::enter()?;
-        relay(incoming, outgoing, &mut session).await?
+        relay::run(incoming, outgoing, &mut relay).await?
     };
-    println!("[{outcome} (from session {session})]");
+    println!("[{outcome} (from session {})]", relay.label());
     Ok(())
-}
-
-struct SessionLabel {
-    local: String,
-    attached: AttachedSession,
-}
-
-impl fmt::Display for SessionLabel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.attached.server == self.local {
-            f.write_str(&self.attached.session)
-        } else {
-            self.attached.fmt(f)
-        }
-    }
-}
-
-enum Outcome {
-    Detached,
-    Exited,
-    ServerExited,
-}
-
-impl fmt::Display for Outcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Detached => "detached",
-            Self::Exited => "exited",
-            Self::ServerExited => "server exited",
-        })
-    }
-}
-
-async fn relay(
-    mut incoming: mpsc::Receiver<ServerMessage>,
-    outgoing: mpsc::Sender<ClientMessage>,
-    session: &mut SessionLabel,
-) -> Result<Outcome> {
-    let mut stdin = terminal::stdin_chunks();
-    let mut resizes = signal(SignalKind::window_change())?;
-    let mut router = PrefixRouter::new(DEFAULT_PREFIX);
-    let mut stdin_open = true;
-
-    loop {
-        tokio::select! {
-            message = incoming.recv() => match message {
-                Some(ServerMessage::Output(bytes)) => terminal::write_output(&bytes)?,
-                Some(ServerMessage::Attached(attached)) => session.attached = attached,
-                Some(ServerMessage::Reconnecting { server }) => {
-                    terminal::write_output(&overlay::reconnecting(&server, terminal::size()?))?;
-                }
-                Some(ServerMessage::Detached) => return Ok(Outcome::Detached),
-                Some(ServerMessage::Exited) => return Ok(Outcome::Exited),
-                Some(ServerMessage::Error(message)) => bail!(message),
-                Some(other) => bail!("unexpected message from server: {other:?}"),
-                None => return Ok(Outcome::ServerExited),
-            },
-            chunk = stdin.recv(), if stdin_open => {
-                let Some(chunk) = chunk else {
-                    stdin_open = false;
-                    send(&outgoing, ClientMessage::Detach).await?;
-                    continue;
-                };
-                for action in router.route(&chunk) {
-                    let message = match action {
-                        Action::Forward(bytes) => ClientMessage::Input(bytes),
-                        Action::Detach => ClientMessage::Detach,
-                        Action::Command(command) => ClientMessage::Command(command),
-                    };
-                    send(&outgoing, message).await?;
-                }
-            }
-            _ = resizes.recv() => {
-                send(&outgoing, ClientMessage::Resize(terminal::size()?)).await?;
-            }
-        }
-    }
 }
 
 async fn send(outgoing: &mpsc::Sender<ClientMessage>, message: ClientMessage) -> Result<()> {

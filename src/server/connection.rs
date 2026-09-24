@@ -10,6 +10,7 @@ use super::forward::{self, Host, Opening};
 use super::mouse::MouseDecoder;
 use super::render::GridDiffer;
 use super::session::Session;
+use super::status::StatusFeed;
 use super::{target_index, Resolved, Server};
 use crate::protocol::{
     AttachedSession, ClientMessage, DebugCommand, Duplex, NewSession, ServerMessage, Size,
@@ -298,6 +299,13 @@ async fn attach(
     send(&client.outgoing, attached).await?;
 
     let mut updates = session.subscribe();
+    let mut status = session.watch_status();
+    send(
+        &client.outgoing,
+        ServerMessage::SessionState(session.status()),
+    )
+    .await?;
+    let mut cluster = StatusFeed::new(server, origin);
     let mut differ = GridDiffer::new(*size);
     let mut mouse = MouseDecoder::new();
     let escape = tokio::time::sleep(Duration::ZERO);
@@ -326,6 +334,14 @@ async fn attach(
                 }
                 dirty = true;
             }
+            Ok(()) = status.changed() => {
+                send(&client.outgoing, ServerMessage::SessionState(session.status())).await?;
+            }
+            () = cluster.due() => {
+                if let Some(message) = cluster.update(server, &server.identity().name) {
+                    send(&client.outgoing, message).await?;
+                }
+            }
             () = &mut escape, if mouse.has_pending() => {
                 if let Some(pending) = mouse.flush() {
                     session.input(pending);
@@ -351,8 +367,14 @@ async fn attach(
                 Some(ClientMessage::Command(command)) => {
                     resize_to_latest(session, *size);
                     session.record_input();
-                    if let Err(err) = session.run(command) {
+                    if let Err(err) = session.run(command.clone()) {
                         debug!(?command, "command failed: {err:#}");
+                        send(&client.outgoing, ServerMessage::Error(format!("{err:#}"))).await?;
+                    }
+                }
+                Some(ClientMessage::RenameSession { target, name }) => {
+                    if let Err(err) = rename_session(server, &target, name, origin).await {
+                        send(&client.outgoing, ServerMessage::Error(format!("{err:#}"))).await?;
                     }
                 }
                 Some(ClientMessage::Redraw) => {

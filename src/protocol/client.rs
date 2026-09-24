@@ -172,7 +172,7 @@ pub enum Direction {
     Down,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionCommand {
     NewWindow,
     NextWindow,
@@ -183,6 +183,7 @@ pub enum SessionCommand {
     SelectPane(Direction),
     KillPane,
     KillWindow,
+    RenameWindow(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,6 +243,21 @@ impl fmt::Display for AttachedSession {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionState {
+    pub name: String,
+    pub windows: Vec<WindowSummary>,
+    pub active: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterStatus {
+    pub local: String,
+    pub host: String,
+    pub latency: Option<Duration>,
+    pub offline: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerMessage {
     Attached(AttachedSession),
     Sessions(Vec<SessionInfo>),
@@ -250,6 +266,8 @@ pub enum ServerMessage {
     Links(Vec<LinkInfo>),
     Done,
     Output(Vec<u8>),
+    SessionState(SessionState),
+    ClusterStatus(ClusterStatus),
     Reconnecting { server: String },
     Detached,
     Exited,

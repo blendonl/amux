@@ -2,6 +2,9 @@ use crate::protocol::{Direction, SessionCommand, Split};
 
 pub const DEFAULT_PREFIX: u8 = 0x02;
 const DETACH_KEY: u8 = b'd';
+const RENAME_WINDOW_KEY: u8 = b',';
+const RENAME_SESSION_KEY: u8 = b'$';
+const CLUSTER_TREE_KEY: u8 = b's';
 const ESC: u8 = 0x1b;
 const SEQUENCE_INTRODUCERS: [u8; 2] = [b'[', b'O'];
 const SEQUENCE_PARAMETERS: std::ops::RangeInclusive<u8> = 0x20..=0x3f;
@@ -12,6 +15,14 @@ pub enum Action {
     Forward(Vec<u8>),
     Detach,
     Command(SessionCommand),
+    Open(Panel),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Panel {
+    RenameWindow,
+    RenameSession,
+    ClusterTree,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,18 +52,22 @@ impl PrefixRouter {
         }
     }
 
-    pub fn route(&mut self, input: &[u8]) -> Vec<Action> {
+    pub fn route<'a>(&mut self, input: &'a [u8]) -> (Vec<Action>, &'a [u8]) {
         let mut actions = Vec::new();
         let mut forward = Vec::new();
 
-        for &byte in input {
+        for (index, &byte) in input.iter().enumerate() {
             match self.step(byte) {
                 Step::Forward(byte) => forward.push(byte),
                 Step::Act(action) => {
                     if !forward.is_empty() {
                         actions.push(Action::Forward(std::mem::take(&mut forward)));
                     }
+                    let opens_a_panel = matches!(action, Action::Open(_));
                     actions.push(action);
+                    if opens_a_panel {
+                        return (actions, &input[index + 1..]);
+                    }
                 }
                 Step::Swallow => {}
             }
@@ -61,7 +76,7 @@ impl PrefixRouter {
         if !forward.is_empty() {
             actions.push(Action::Forward(forward));
         }
-        actions
+        (actions, &[])
     }
 
     fn step(&mut self, byte: u8) -> Step {
@@ -79,9 +94,7 @@ impl PrefixRouter {
                         self.state = State::PrefixEscape;
                         Step::Swallow
                     }
-                    DETACH_KEY => Step::Act(Action::Detach),
-                    _ => command_for(byte)
-                        .map_or(Step::Swallow, |command| Step::Act(Action::Command(command))),
+                    _ => binding(byte).map_or(Step::Swallow, Step::Act),
                 }
             }
             State::PrefixEscape if SEQUENCE_INTRODUCERS.contains(&byte) => {
@@ -106,6 +119,16 @@ impl PrefixRouter {
                 self.step(byte)
             }
         }
+    }
+}
+
+fn binding(key: u8) -> Option<Action> {
+    match key {
+        DETACH_KEY => Some(Action::Detach),
+        RENAME_WINDOW_KEY => Some(Action::Open(Panel::RenameWindow)),
+        RENAME_SESSION_KEY => Some(Action::Open(Panel::RenameSession)),
+        CLUSTER_TREE_KEY => Some(Action::Open(Panel::ClusterTree)),
+        _ => command_for(key).map(Action::Command),
     }
 }
 
@@ -142,6 +165,40 @@ mod tests {
         PrefixRouter::new(DEFAULT_PREFIX)
     }
 
+    fn route(router: &mut PrefixRouter, input: &[u8]) -> Vec<Action> {
+        let (actions, rest) = router.route(input);
+        assert!(rest.is_empty(), "unrouted input {rest:?}");
+        actions
+    }
+
+    fn routed(input: &[u8]) -> Vec<Action> {
+        route(&mut router(), input)
+    }
+
+    #[test]
+    fn panel_keys_open_a_panel_and_hand_it_the_rest_of_the_input() {
+        for (key, panel) in [
+            (b',', Panel::RenameWindow),
+            (b'$', Panel::RenameSession),
+            (b's', Panel::ClusterTree),
+        ] {
+            let input = [b'a', DEFAULT_PREFIX, key, b'x', DEFAULT_PREFIX, b'd'];
+            let mut router = router();
+            let (actions, rest) = router.route(&input);
+            assert_eq!(
+                actions,
+                vec![Action::Forward(b"a".to_vec()), Action::Open(panel)],
+                "key {:?}",
+                char::from(key)
+            );
+            assert_eq!(rest, [b'x', DEFAULT_PREFIX, b'd']);
+            assert_eq!(
+                route(&mut router, b"y"),
+                vec![Action::Forward(b"y".to_vec())]
+            );
+        }
+    }
+
     fn command(command: SessionCommand) -> Action {
         Action::Command(command)
     }
@@ -149,7 +206,7 @@ mod tests {
     #[test]
     fn plain_input_is_forwarded_untouched() {
         assert_eq!(
-            router().route(b"ls -la\r"),
+            routed(b"ls -la\r"),
             vec![Action::Forward(b"ls -la\r".to_vec())]
         );
     }
@@ -157,7 +214,7 @@ mod tests {
     #[test]
     fn prefix_then_detach_key_detaches_after_flushing_earlier_input() {
         assert_eq!(
-            router().route(b"ab\x02d"),
+            routed(b"ab\x02d"),
             vec![Action::Forward(b"ab".to_vec()), Action::Detach]
         );
     }
@@ -165,7 +222,7 @@ mod tests {
     #[test]
     fn double_prefix_sends_a_literal_prefix() {
         assert_eq!(
-            router().route(b"\x02\x02"),
+            routed(b"\x02\x02"),
             vec![Action::Forward(vec![DEFAULT_PREFIX])]
         );
     }
@@ -173,16 +230,13 @@ mod tests {
     #[test]
     fn prefix_state_carries_across_chunks() {
         let mut router = router();
-        assert_eq!(router.route(b"\x02"), vec![]);
-        assert_eq!(router.route(b"d"), vec![Action::Detach]);
+        assert_eq!(route(&mut router, b"\x02"), vec![]);
+        assert_eq!(route(&mut router, b"d"), vec![Action::Detach]);
     }
 
     #[test]
     fn unbound_keys_after_prefix_are_swallowed() {
-        assert_eq!(
-            router().route(b"\x02zx"),
-            vec![Action::Forward(b"x".to_vec())]
-        );
+        assert_eq!(routed(b"\x02zx"), vec![Action::Forward(b"x".to_vec())]);
     }
 
     #[test]
@@ -201,7 +255,7 @@ mod tests {
         ];
         for (key, bound) in bindings {
             assert_eq!(
-                router().route(&[b'a', DEFAULT_PREFIX, key, b'b']),
+                routed(&[b'a', DEFAULT_PREFIX, key, b'b']),
                 vec![
                     Action::Forward(b"a".to_vec()),
                     command(bound),
@@ -222,7 +276,7 @@ mod tests {
             (b"\x02\x1bOD", Direction::Left),
         ] {
             assert_eq!(
-                router().route(keys),
+                routed(keys),
                 vec![command(SessionCommand::SelectPane(direction))]
             );
         }
@@ -231,10 +285,10 @@ mod tests {
     #[test]
     fn an_arrow_split_across_chunks_still_selects_a_pane() {
         let mut router = router();
-        assert_eq!(router.route(b"\x02\x1b"), vec![]);
-        assert_eq!(router.route(b"["), vec![]);
+        assert_eq!(route(&mut router, b"\x02\x1b"), vec![]);
+        assert_eq!(route(&mut router, b"["), vec![]);
         assert_eq!(
-            router.route(b"Cls"),
+            route(&mut router, b"Cls"),
             vec![
                 command(SessionCommand::SelectPane(Direction::Right)),
                 Action::Forward(b"ls".to_vec()),
@@ -245,17 +299,14 @@ mod tests {
     #[test]
     fn other_sequences_after_prefix_are_swallowed() {
         assert_eq!(
-            router().route(b"\x02\x1b[1;5Aa\x02\x1b[<0;3;4Mb"),
+            routed(b"\x02\x1b[1;5Aa\x02\x1b[<0;3;4Mb"),
             vec![Action::Forward(b"ab".to_vec())]
         );
     }
 
     #[test]
     fn a_lone_escape_after_prefix_leaves_the_next_key_alone() {
-        assert_eq!(
-            router().route(b"\x02\x1bx"),
-            vec![Action::Forward(b"x".to_vec())]
-        );
-        assert_eq!(router().route(b"\x02\x1b\x02d"), vec![Action::Detach]);
+        assert_eq!(routed(b"\x02\x1bx"), vec![Action::Forward(b"x".to_vec())]);
+        assert_eq!(routed(b"\x02\x1b\x02d"), vec![Action::Detach]);
     }
 }

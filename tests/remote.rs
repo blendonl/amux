@@ -193,6 +193,10 @@ async fn dropping_the_link_mid_attach_reconnects_with_a_full_redraw() {
         Some(ServerMessage::Reconnecting { server }) => assert_eq!(server, "b"),
         other => panic!("expected to reconnect, got {other:?}"),
     }
+    match client.recv().await {
+        Some(ServerMessage::Attached(attached)) => assert_eq!(attached.session, "s"),
+        other => panic!("expected to be attached again, got {other:?}"),
+    }
     let frame = client.next_output().await;
     let mut fresh = vt100::Parser::new(SIZE.rows, SIZE.cols, 0);
     fresh.process(&frame);

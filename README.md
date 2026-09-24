@@ -26,7 +26,7 @@ cargo run -- servers remove laptop
 cargo run -- kill-server                 # stop the server and all sessions
 ```
 
-Inside a session, press `Ctrl-b d` to detach and `Ctrl-b Ctrl-b` to send a literal `Ctrl-b`. The other keys after `Ctrl-b` manage windows and panes, as in tmux.
+Inside a session, press `Ctrl-b d` to detach and `Ctrl-b Ctrl-b` to send a literal `Ctrl-b`. The other keys after `Ctrl-b` manage windows and panes, as in tmux, and `Ctrl-b s` opens a tree of every session in the cluster. The bottom row is a status bar that shows the session, its server and its windows.
 
 `-L <name>` picks a named server socket in the runtime directory and `-S <path>` sets an explicit socket path. Both work like tmux's flags, so you can run an isolated dev server next to your usual one. Each `-L` name is its own cluster: a `-L dev` server only links to other `-L dev` servers.
 
@@ -45,15 +45,50 @@ A session holds numbered windows, and each window splits into panes, each runnin
 | `Ctrl-b` arrow key      | The pane in that direction                       |
 | `Ctrl-b x`              | Kill the active pane                             |
 | `Ctrl-b &`              | Kill the active window                           |
+| `Ctrl-b ,`              | Rename the active window                         |
+| `Ctrl-b $`              | Rename the session                               |
+| `Ctrl-b s`              | Pick a session or window anywhere in the cluster |
 | `Ctrl-b d`              | Detach                                           |
 | `Ctrl-b Ctrl-b`         | Send a literal `Ctrl-b`                          |
 
 - Windows are numbered from 0. A new window takes the lowest free number, and the others keep theirs when one closes. `amux ls` counts the windows of every session in the cluster.
-- A split shares the pane's space equally with its siblings, and every shell is resized to its pane. A split that leaves no room for the new pane is ignored.
+- A split shares the pane's space equally with its siblings, and every shell is resized to its pane. A split that leaves no room for the new pane is refused, and the status bar says why.
 - A pane whose shell exits leaves the layout and its neighbours take over its space. A window closes with its last pane, and the session ends with its last window.
 - Every client attached to a session sees the same active window and pane. The window takes the size of the client that typed last, and a client with a smaller terminal sees the top-left part of it.
 - While a window has more than one pane, the terminal reports mouse clicks to amux, and clicking a pane makes it the active one. Most terminals still select text when you hold Shift. A program that turns on mouse reporting itself, like `vim` with `mouse=a` or `htop`, gets the clicks inside its own pane in its own coordinates.
 - These keys work the same on a session on another server: they travel over the peer link to the server that holds the session.
+
+### Status bar and the cluster tree
+
+The client keeps the bottom row of the terminal for a status bar, so a session gets one row less than the terminal has:
+
+```
+[notes@laptop] 0:sh  1:vim                            home-server offline  12 ms
+```
+
+- `[session@server]` is the attached session and the server that holds it.
+- The windows follow, with the active one highlighted. When they don't fit, the list is cut around the active window and `…` marks the hidden ones.
+- On the right are the servers that are offline and, for a session on another server, the latency of the link to it. On a narrow terminal the offline servers shrink to a count and then go away before any window does.
+- When something you asked for fails, such as a split with no room, a rename to a name that is taken or a switch to a session that has just gone, the status bar shows the error for three seconds. The client stays attached.
+
+`Ctrl-b s` opens the cluster tree over the session: every server, then its projects, then their sessions and windows, starting on the session you are in.
+
+```
+- desktop  (this server)
+  - amux
+    + amux/main  2 windows  attached
+  - (no project)
+    + scratch  1 window
+- laptop  12 ms
+  - notes
+    + notes/main  1 window
+```
+
+`j` and `k` or the arrow keys move, `l` and `h` expand and collapse, `g` and `G` jump to the top and the bottom, and `Enter` picks. `q`, `Escape` and `Ctrl-c` close the tree. Picking a session or a window switches this client to it, wherever it runs, without leaving the client. The sessions of a server that is offline are dimmed as stale and can't be picked.
+
+`Ctrl-b ,` and `Ctrl-b $` open a prompt on the status bar, filled in with the window's or the session's current name. The arrow keys, `Home`, `End`, `Ctrl-a`, `Ctrl-e`, `Backspace`, `Delete` and `Ctrl-u` edit it, `Enter` renames and `Escape` or `Ctrl-c` cancels. Renaming a session works the same when it runs on another server.
+
+While the tree or a prompt is open, keys and mouse clicks go to it and never reach the session. A lone `Escape` closes it after 50 ms, since it could also be the start of an arrow key.
 
 ### Targets
 
@@ -133,7 +168,7 @@ A server that `amux bridge` starts over SSH inherits a non-interactive SSH envir
 A client only ever talks to its local server. Attaching to a session on another server opens a channel over the peer link to that server, which treats the channel like any other attached client. `amux new --on laptop`, `attach`, `rename` and `kill` all work the same way whichever server holds the session.
 
 - A session created on another server starts in that server's `$HOME`, because paths differ between machines. The client's `LANG`, `LC_*` and `COLORTERM` are applied to the new shell wherever it runs, in place of the server's own.
-- When the link drops while you are attached, the session keeps running on its server and your terminal shows "reconnecting to laptop…". Once the link is back you get a full redraw. `Ctrl-b d` still detaches in the meantime.
+- When the link drops while you are attached, the session keeps running on its server, a box saying "reconnecting to laptop…" covers the screen and the status bar lists laptop as offline. Once the link is back you get a full redraw. `Ctrl-b d` still detaches in the meantime, and `Ctrl-b s` can switch to another session.
 - If that server is stopped with `kill-server`, or restarts and loses the session, the client exits as it would for a local session.
 - When several clients are attached to one session, the one that typed or resized last sets its size, like tmux's `window-size latest`.
 
@@ -179,6 +214,7 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 - The **protocol** uses length-prefixed `postcard` frames. A connection opens with a `Greeting` and a `Welcome` whose layout never changes, then carries `ClientMessage` and `ServerMessage`. Any change to those messages bumps the major version. The server handles a connection as a `Duplex`, a pair of message channels, so it doesn't care what transport sits underneath.
 - A **peer link** carries the same frames. After the greeting both servers send a `Hello`, the lower ID decides whether the link is a duplicate, and then each side sends a snapshot of its sessions followed by events stamped with its incarnation and a sequence number, so stale or repeated updates are dropped. One writer drains a control lane (pongs, credit, goodbyes) ahead of a bulk lane (snapshots, events and channel data), and the reader never waits on anything the other side controls, so a peer that stops reading cannot stall this one.
 - A **channel** tunnels one client connection through a peer link. Each server numbers the channels it opens, and the server hosting the session runs the channel through the same connection handler as a local client, except that it only ever looks up its own sessions. The host sends at most four frames ahead and waits for the opening server to pass each one on to its client, so frames stay pulled end to end. Each channel has its own capped queue on the receiving side: a channel that overflows is closed on its own and the link stays up. The opening server forwards client messages without reading them, apart from detaching, switching sessions and listing the cluster, and reattaches by the host's incarnation and session ID when a dropped link comes back.
+- The client draws its own **chrome**: the status bar, the reconnect overlay, the prompts and the cluster tree. It sends the host its terminal size without the status row, in the first request, on every resize and on a reattach, so the host never draws there. The host sends the session's name, windows and active window when the client attaches and whenever they change. The server the client is connected to adds a cluster status (its own name, the session's server, the link latency and the offline servers) on attach, whenever the cluster changes and every two seconds. A channel never carries a cluster status, since the server at the client's end knows it best. The status bar is drawn again after each batch of output, saving and restoring the cursor around it. While the tree is open the client drops the session's output, and closing the tree or a prompt asks the host for a full redraw.
 - A client's terminal size is clamped to at least 2 rows by 2 columns, on the client and on the server, because the terminal emulator can't handle anything smaller.
 - **Git** runs through the `git` CLI in blocking tasks, never while the server holds its sessions lock. Registry changes are serialized and saved before they are published as a `ProjectsChanged` event, and creates for the same project and branch wait on a per-worktree lock, so concurrent `amux new`s share one session.
 
@@ -205,6 +241,7 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 | `src/cluster/ssh.rs`       | Addresses, the SSH and exec transport, `amux bridge`                     |
 | `src/server/mod.rs`        | Accept loop, session registry, state events, shutdown                    |
 | `src/server/connection.rs` | Per-client requests, target routing and the attach loop                  |
+| `src/server/status.rs`     | The cluster status sent to attached clients                              |
 | `src/server/forward.rs`    | Forwarding a client to a session on another server, reconnects           |
 | `src/server/projects.rs`   | Project registry, checkouts, clones, worktree sessions and removal       |
 | `src/server/session.rs`    | Session state, its windows and the commands that change them             |
@@ -213,12 +250,14 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 | `src/server/render/`       | The compositor, the per-client differ and escape sequences               |
 | `src/server/mouse.rs`      | Decoding and re-encoding mouse reports                                   |
 | `src/server/pane.rs`       | PTY, shell process, terminal emulation                                   |
-| `src/client/mod.rs`        | Commands, server bootstrap, attach relay                                 |
+| `src/client/mod.rs`        | Commands, server bootstrap, attaching                                    |
+| `src/client/relay.rs`      | The attached client: keys, panels, chrome and switching sessions         |
+| `src/client/chrome/`       | Status bar, prompt, reconnect overlay, key decoding and drawing helpers  |
+| `src/client/tree.rs`       | The `Ctrl-b s` cluster tree                                              |
 | `src/client/listing.rs`    | `amux ls`, `amux projects` and `amux servers` output                     |
 | `src/client/projects.rs`   | Resolving `-p` against the projects the cluster knows                    |
-| `src/client/overlay.rs`    | The "reconnecting to …" overlay                                          |
 | `src/client/terminal.rs`   | Raw mode, alternate screen, stdin reader                                 |
-| `src/client/keys.rs`       | Prefix key handling and the window and pane bindings                     |
+| `src/client/keys.rs`       | Prefix key handling and the key bindings                                 |
 | `tests/common/mod.rs`      | `TestServer`, `TestClient`, a PTY-driven client and linked test clusters |
 | `tests/common/git.rs`      | Temporary repos with a local bare `origin` for the project tests         |
 
@@ -241,6 +280,16 @@ amux is growing into a multiplexer that spans machines, following [docs/design.m
 - [x] Projects and worktrees: `new -p -b`, `--clone`, `amux projects`
 - [x] Windows within a session (`Ctrl-b c`, `n`, `p`)
 - [x] Pane splits with a layout tree and a cell-level compositor
-- [ ] Status bar and the `Ctrl-b s` cluster tree
+- [x] Status bar with cluster information, rename prompts and the `Ctrl-b s` cluster tree
+
+Phases 1 to 6 of the design are done. What remains is its phase 7, "Later":
+
+- [ ] A direct TCP transport with a keypair for each server (Noise), so links don't need sshd
+- [ ] Session persistence: layouts and working directories that survive a server restart
+- [ ] Predictive local echo for high-latency links, like mosh
+- [ ] Finding peers from `tailscale status`
+
+Beyond the design:
+
 - [ ] Prefix key, shell and key bindings in the config file
 - [ ] Scrollback and copy mode

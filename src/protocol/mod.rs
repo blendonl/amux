@@ -12,9 +12,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 pub use client::{
-    is_locale_variable, AttachedSession, ClientMessage, DebugCommand, Direction, LinkInfo,
-    LinkState, NewSession, ProjectCheckout, ProjectRef, ServerMessage, ServerStatus, ServerView,
-    SessionCommand, SessionId, SessionInfo, Size, Split, WindowSummary, MIN_COLS, MIN_ROWS,
+    is_locale_variable, AttachedSession, ClientMessage, ClusterStatus, DebugCommand, Direction,
+    LinkInfo, LinkState, NewSession, ProjectCheckout, ProjectRef, ServerMessage, ServerStatus,
+    ServerView, SessionCommand, SessionId, SessionInfo, SessionState, Size, Split, WindowSummary,
+    MIN_COLS, MIN_ROWS,
 };
 pub use greeting::{
     accept, greet, Greeting, IncompatibleServer, Role, Version, Welcome, MAGIC, PROTOCOL_MAJOR,
@@ -179,6 +180,7 @@ mod tests {
                 size: Size { rows: 24, cols: 80 },
             },
             ClientMessage::Switch("@laptop".parse().unwrap()),
+            ClientMessage::Command(SessionCommand::RenameWindow("logs".into())),
             ClientMessage::Input(b"ls\r".to_vec()),
             ClientMessage::Detach,
         ];
@@ -190,6 +192,38 @@ mod tests {
 
         let mut received = Vec::new();
         while let Some(message) = read_message::<_, ClientMessage>(&mut server).await.unwrap() {
+            received.push(message);
+        }
+        assert_eq!(received, sent);
+    }
+
+    #[tokio::test]
+    async fn chrome_messages_survive_a_round_trip() {
+        let (mut server, mut client) = byte_pipe(1024);
+        let sent = vec![
+            ServerMessage::SessionState(SessionState {
+                name: "work".into(),
+                windows: vec![WindowSummary {
+                    index: 2,
+                    name: "vim".into(),
+                    panes: 3,
+                }],
+                active: 2,
+            }),
+            ServerMessage::ClusterStatus(ClusterStatus {
+                local: "laptop".into(),
+                host: "desktop".into(),
+                latency: Some(std::time::Duration::from_millis(12)),
+                offline: vec!["home-server".into()],
+            }),
+        ];
+        for message in &sent {
+            write_message(&mut server, message).await.unwrap();
+        }
+        drop(server);
+
+        let mut received = Vec::new();
+        while let Some(message) = read_message::<_, ServerMessage>(&mut client).await.unwrap() {
             received.push(message);
         }
         assert_eq!(received, sent);

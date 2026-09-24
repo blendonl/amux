@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info};
 
 use super::connection::{send, switch_or_refuse, ClientConnection, Origin, Outcome};
+use super::status::StatusFeed;
 use super::Server;
 use crate::cluster::{Channel, ChannelEnd};
 use crate::config::ServerId;
@@ -64,6 +65,7 @@ pub async fn run(
         server,
         host,
         attached: None,
+        status: StatusFeed::new(server, Origin::Local),
     };
     let mut channel = Some(channel);
     loop {
@@ -98,6 +100,7 @@ struct Forward<'a> {
     server: &'a Arc<Server>,
     host: &'a Host,
     attached: Option<AttachedSession>,
+    status: StatusFeed,
 }
 
 impl Forward<'_> {
@@ -121,14 +124,11 @@ impl Forward<'_> {
                 }
                 message = channel.recv(), if pending.is_none() => match message {
                     Some(ServerMessage::Attached(session)) => {
-                        let first = self.attached.is_none();
-                        self.attached = Some(session.clone());
-                        if first {
-                            pending = Some(ServerMessage::Attached(session));
-                        } else {
+                        if self.attached.is_some() {
                             debug!(host = %self.host.name, "reattached");
-                            channel.delivered();
                         }
+                        self.attached = Some(session.clone());
+                        pending = Some(ServerMessage::Attached(session));
                     }
                     Some(ServerMessage::Detached) => {
                         send(&client.outgoing, ServerMessage::Detached).await?;
@@ -138,13 +138,16 @@ impl Forward<'_> {
                         send(&client.outgoing, ServerMessage::Exited).await?;
                         return Ok(Step::Done(Outcome::Exited));
                     }
-                    Some(ServerMessage::Error(message)) => {
+                    Some(ServerMessage::Error(message)) if self.attached.is_none() => {
                         send(&client.outgoing, ServerMessage::Error(message)).await?;
                         return Ok(Step::Done(Outcome::Exited));
                     }
                     Some(message) => pending = Some(message),
                     None => return self.channel_ended(&client.outgoing, channel.end()).await,
                 },
+                () = self.status.due(), if self.attached.is_some() && pending.is_none() => {
+                    self.send_status(&client.outgoing).await?;
+                }
                 message = client.incoming.recv() => match message {
                     Some(ClientMessage::ListCluster) => {
                         let servers = ServerMessage::Cluster(self.server.cluster_view());
@@ -167,6 +170,13 @@ impl Forward<'_> {
                     None => return Ok(Step::Done(Outcome::Detached)),
                 },
             }
+        }
+    }
+
+    async fn send_status(&mut self, outgoing: &mpsc::Sender<ServerMessage>) -> Result<()> {
+        match self.status.update(self.server, &self.host.name) {
+            Some(message) => send(outgoing, message).await,
+            None => Ok(()),
         }
     }
 
@@ -219,6 +229,7 @@ impl Forward<'_> {
                         return Ok(Step::Done(Outcome::Exited));
                     }
                 }
+                () = self.status.due() => self.send_status(&client.outgoing).await?,
                 message = client.incoming.recv() => match message {
                     Some(ClientMessage::Detach) => {
                         send(&client.outgoing, ServerMessage::Detached).await?;

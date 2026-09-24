@@ -6,6 +6,7 @@ mod pane;
 mod projects;
 mod render;
 mod session;
+mod status;
 mod window;
 
 use std::collections::BTreeMap;
@@ -28,9 +29,9 @@ use crate::config::{Config, Incarnation, ServerId, ServerIdentity};
 use crate::paths;
 use crate::project::Registry;
 use crate::protocol::{
-    self, ClientMessage, Duplex, Event, NewSession, PeerAddress, ProjectCheckout, Role,
-    ServerMessage, ServerState, ServerStatus, ServerView, SessionId, SessionInfo, Size, Snapshot,
-    StateEvent, Version, WindowSummary,
+    self, ClientMessage, ClusterStatus, Duplex, Event, NewSession, PeerAddress, ProjectCheckout,
+    Role, ServerMessage, ServerState, ServerStatus, ServerView, SessionId, SessionInfo, Size,
+    Snapshot, StateEvent, Version, WindowSummary,
 };
 use crate::target::{self, Candidate, Target};
 use connection::Origin;
@@ -464,6 +465,28 @@ impl Server {
         let mut servers = vec![local];
         servers.extend(self.cluster.view());
         servers
+    }
+
+    fn cluster_status(&self, host: &str) -> ClusterStatus {
+        let peers = self.cluster.view();
+        let latency = peers
+            .iter()
+            .filter(|peer| peer.name == host)
+            .find_map(|peer| match peer.status {
+                ServerStatus::Online { latency } => latency,
+                _ => None,
+            });
+        let offline = peers
+            .into_iter()
+            .filter(|peer| matches!(peer.status, ServerStatus::Offline { .. }))
+            .map(|peer| peer.name)
+            .collect();
+        ClusterStatus {
+            local: self.identity.name.clone(),
+            host: host.to_owned(),
+            latency,
+            offline,
+        }
     }
 
     fn track_client(self: &Arc<Self>, session: &Arc<Session>) -> AttachedClient {

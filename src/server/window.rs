@@ -33,6 +33,10 @@ impl Window {
         self.index
     }
 
+    pub fn rename(&mut self, name: String) {
+        self.name = name;
+    }
+
     pub fn summary(&self) -> WindowSummary {
         WindowSummary {
             index: self.index,

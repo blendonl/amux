@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use crate::protocol::Size;
 
 const STDIN_BUFFER_LEN: usize = 4096;
+pub const STATUS_ROWS: u16 = 1;
 const STDIN_CAPACITY: usize = 64;
 const RESET_INPUT_MODES: &[u8] =
     b"\x1b[?1l\x1b>\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[0m";
@@ -16,6 +17,18 @@ const RESET_INPUT_MODES: &[u8] =
 pub fn size() -> Result<Size> {
     let (cols, rows) = terminal::size()?;
     Ok(Size { rows, cols }.clamped())
+}
+
+pub fn session_size() -> Result<Size> {
+    Ok(session_area(size()?))
+}
+
+pub fn session_area(size: Size) -> Size {
+    Size {
+        rows: size.rows.saturating_sub(STATUS_ROWS),
+        cols: size.cols,
+    }
+    .clamped()
 }
 
 pub struct RawTerminal;

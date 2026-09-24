@@ -7,6 +7,7 @@ const BAR: Style = Style::PLAIN.fg(Color::Black).bg(Color::Green);
 const TAG: Style = BAR.bold();
 const ACTIVE_WINDOW: Style = BAR.bold().reverse();
 const OFFLINE: Style = Style::PLAIN.fg(Color::White).bg(Color::Red).bold();
+const MESSAGE: Style = Style::PLAIN.fg(Color::Black).bg(Color::Yellow);
 const HIDDEN_WINDOWS: &str = "…";
 const MIN_SESSION_COLUMNS: usize = 4;
 const GAP: usize = 1;
@@ -44,15 +45,20 @@ pub struct StatusLine {
     pub windows: Vec<WindowTab>,
     pub latency: Option<Duration>,
     pub offline: Vec<String>,
+    pub message: Option<String>,
 }
 
 impl StatusLine {
     pub fn render(&self, width: u16) -> Vec<u8> {
         let columns = usize::from(width);
+        let (spans, fill) = match &self.message {
+            Some(message) => (vec![Span::new(message.as_str(), MESSAGE)], MESSAGE),
+            None => (self.spans(columns), BAR),
+        };
         let mut out = Vec::new();
         out.extend_from_slice(draw::SAVE_CURSOR);
         out.extend_from_slice(draw::MOVE_TO_LAST_ROW);
-        draw::write_spans(&mut out, &self.spans(columns), columns, BAR);
+        draw::write_spans(&mut out, &spans, columns, fill);
         out.extend_from_slice(draw::RESTORE_CURSOR);
         out
     }
@@ -219,6 +225,7 @@ mod tests {
             ],
             latency: Some(Duration::from_millis(12)),
             offline: vec!["laptop".into()],
+            message: None,
         }
     }
 
@@ -273,6 +280,25 @@ mod tests {
     }
 
     #[test]
+    fn a_message_takes_the_whole_bar_until_it_is_cleared() {
+        let status = StatusLine {
+            message: Some("can't find session: gone@desktop".into()),
+            ..remote()
+        };
+        let parser = draw(&status, 40);
+        assert_eq!(
+            row_text(&parser, STATUS_ROW),
+            "can't find session: gone@desktop"
+        );
+        let cell = parser.screen().cell(STATUS_ROW, 39).unwrap();
+        assert_eq!(cell.bgcolor(), vt100::Color::Idx(3));
+        assert_eq!(parser.screen().cursor_position(), (1, 0));
+
+        let parser = draw(&status, 10);
+        assert_eq!(row_text(&parser, STATUS_ROW), "can't fin…");
+    }
+
+    #[test]
     fn a_local_session_shows_no_latency() {
         let status = StatusLine {
             local: true,
@@ -324,6 +350,7 @@ mod tests {
             windows: (0..10).map(|index| tab(index, "w", index == 7)).collect(),
             latency: None,
             offline: Vec::new(),
+            message: None,
         };
         let parser = draw(&status, 30);
         assert_eq!(row_text(&parser, STATUS_ROW), "[s@h]… 6:w  7:w  8:w  9:w");
@@ -367,6 +394,7 @@ mod tests {
             windows: vec![tab(0, "編集", true)],
             latency: None,
             offline: Vec::new(),
+            message: None,
         };
         for (width, expected) in [
             (21, "[日本語@東京] 0:編集"),
