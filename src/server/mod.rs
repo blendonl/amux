@@ -1,14 +1,12 @@
 mod connection;
 mod forward;
-#[cfg_attr(not(test), allow(dead_code))]
 mod layout;
-#[cfg_attr(not(test), allow(dead_code))]
 mod mouse;
 mod pane;
 mod projects;
-#[cfg_attr(not(test), allow(dead_code, unused_imports))]
 mod render;
 mod session;
+mod window;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -32,7 +30,7 @@ use crate::project::Registry;
 use crate::protocol::{
     self, ClientMessage, Duplex, Event, NewSession, PeerAddress, ProjectCheckout, Role,
     ServerMessage, ServerState, ServerStatus, ServerView, SessionId, SessionInfo, Size, Snapshot,
-    StateEvent, Version,
+    StateEvent, Version, WindowSummary,
 };
 use crate::target::{self, Candidate, Target};
 use connection::Origin;
@@ -243,14 +241,14 @@ impl Server {
         };
         state.last_session_id += 1;
         let id = SessionId(state.last_session_id);
-        let session = Arc::new(Session::spawn(
+        let session = Session::spawn(
             id,
             name.clone(),
             spec.cwd,
             spec.size,
             spec.env,
             spec.binding,
-        )?);
+        )?;
         state.sessions.insert(name.clone(), Arc::clone(&session));
         self.publish(&mut state, StateEvent::SessionCreated(session.info()));
         drop(state);
@@ -261,19 +259,21 @@ impl Server {
     }
 
     async fn watch_session(self: Arc<Self>, session: Arc<Session>) {
-        let mut updates = session.active_pane().subscribe();
+        let mut windows = session.watch_windows();
         let mut published = Instant::now();
         let mut pending = false;
         loop {
             let flush = tokio::time::sleep_until((published + ACTIVITY_INTERVAL).into());
             tokio::select! {
-                changed = updates.changed() => {
+                changed = windows.changed() => {
                     if changed.is_err() {
                         break;
                     }
-                    pending = true;
+                    self.session_changed(&session);
+                    published = Instant::now();
+                    pending = false;
                 }
-                () = session.input_recorded() => pending = true,
+                () = session.activity() => pending = true,
                 () = flush, if pending => {
                     self.session_changed(&session);
                     published = Instant::now();
@@ -303,21 +303,25 @@ impl Server {
                 is_local: true,
             })
             .collect();
+        let views: Vec<ServerView> = match origin {
+            Origin::Local => self
+                .cluster
+                .view()
+                .into_iter()
+                .filter(|view| view.name != *local_name)
+                .collect(),
+            Origin::Peer => Vec::new(),
+        };
         let mut peers = Vec::new();
-        if origin == Origin::Local {
-            for view in self.cluster.view() {
-                if view.name == *local_name {
-                    continue;
-                }
-                candidates.extend(view.sessions.iter().map(|session| Candidate {
-                    server: view.name.clone(),
-                    session: session.name.clone(),
-                    last_activity: millis(session.last_activity),
-                    is_local: false,
-                }));
-                servers.push(view.name.clone());
-                peers.push((view.name, view.id));
-            }
+        for view in &views {
+            candidates.extend(view.sessions.iter().map(|session| Candidate {
+                server: view.name.clone(),
+                session: session.name.clone(),
+                last_activity: millis(session.last_activity),
+                is_local: false,
+            }));
+            servers.push(view.name.clone());
+            peers.push((view.name.clone(), view.id));
         }
 
         let found = target::resolve_with_servers(target, &servers, &candidates)?;
@@ -327,8 +331,17 @@ impl Server {
                 .find(|(name, _)| *name == found.session)
                 .map(|(_, session)| session)
                 .ok_or_else(|| anyhow!("can't find session: {}", found.session))?;
+            check_position(target, &found.session, &session.windows())?;
             return Ok(Resolved::Local(session));
         }
+        let windows = views
+            .iter()
+            .filter(|view| view.name == found.server)
+            .flat_map(|view| &view.sessions)
+            .find(|session| session.name == found.session)
+            .map(|session| session.windows.as_slice())
+            .unwrap_or_default();
+        check_position(target, &found.to_string(), windows)?;
         let peer = self.reachable_peer(&found.server, &peers)?;
         Ok(Resolved::Remote(RemoteSession {
             host: Host {
@@ -548,6 +561,26 @@ impl Drop for AttachedClient {
         self.session.client_detached();
         self.server.session_changed(&self.session);
     }
+}
+
+fn check_position(target: &Target, session: &str, windows: &[WindowSummary]) -> Result<()> {
+    let Some(index) = target.window else {
+        return Ok(());
+    };
+    let window = windows
+        .iter()
+        .find(|window| window.index == target_index(index))
+        .ok_or_else(|| anyhow!("can't find window {index} in session {session}"))?;
+    match target.pane {
+        Some(pane) if target_index(pane) >= window.panes => {
+            bail!("can't find pane {pane} in window {index} of session {session}")
+        }
+        _ => Ok(()),
+    }
+}
+
+fn target_index(index: u32) -> usize {
+    usize::try_from(index).unwrap_or(usize::MAX)
 }
 
 fn millis(time: SystemTime) -> u64 {

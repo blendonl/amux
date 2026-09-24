@@ -5,6 +5,7 @@ pub mod git;
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File};
 use std::io::{Read, Write};
+use std::ops::Range;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
@@ -15,8 +16,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use amux::protocol::{
-    self, AttachedSession, ClientMessage, Duplex, NewSession, Role, ServerMessage, SessionInfo,
-    Size, Version, Welcome,
+    self, AttachedSession, ClientMessage, Duplex, NewSession, Role, ServerMessage, SessionCommand,
+    SessionInfo, Size, Version, Welcome, WindowSummary,
 };
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
@@ -427,6 +428,31 @@ impl TestServer {
         TestClient::connect(&self.socket, &self.home()).await
     }
 
+    pub async fn windows_of(&self, session: &str) -> Option<Vec<WindowSummary>> {
+        self.client()
+            .await
+            .list_sessions()
+            .await
+            .into_iter()
+            .find(|info| info.name == session)
+            .map(|info| info.windows)
+    }
+
+    pub async fn wait_for_windows(&self, session: &str, expected: &[WindowSummary]) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let windows = self.windows_of(session).await;
+            if windows.as_deref() == Some(expected) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for windows {expected:?} of {session}, got {windows:?}"
+            );
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
     pub fn terminal(&self, args: &[&str]) -> TerminalClient {
         TerminalClient::spawn(self, &self.home(), args, &[])
     }
@@ -477,6 +503,33 @@ impl Drop for TestServer {
                 stop_after_timeout(child);
             }
         }
+    }
+}
+
+pub fn screen_region(screen: &vt100::Screen, cols: Range<u16>) -> String {
+    screen
+        .rows(cols.start, cols.end - cols.start)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn screen_column(screen: &vt100::Screen, col: u16) -> String {
+    let (rows, _) = screen.size();
+    (0..rows)
+        .map(|row| {
+            screen
+                .cell(row, col)
+                .map(|cell| cell.contents().to_owned())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+pub fn window_summary(index: usize, panes: usize) -> WindowSummary {
+    WindowSummary {
+        index,
+        name: "sh".into(),
+        panes,
     }
 }
 
@@ -645,6 +698,10 @@ impl TestClient {
         self.screen.screen().contents()
     }
 
+    pub fn screen(&self) -> &vt100::Screen {
+        self.screen.screen()
+    }
+
     pub async fn send(&self, message: ClientMessage) {
         tokio::time::timeout(TIMEOUT, self.outgoing.send(message))
             .await
@@ -725,6 +782,10 @@ impl TestClient {
             .await;
     }
 
+    pub async fn command(&self, command: SessionCommand) {
+        self.send(ClientMessage::Command(command)).await;
+    }
+
     pub async fn next_output(&mut self) -> Vec<u8> {
         match self.recv().await {
             Some(ServerMessage::Output(bytes)) => bytes,
@@ -733,18 +794,26 @@ impl TestClient {
     }
 
     pub async fn wait_for_text(&mut self, text: &str) -> String {
+        self.wait_for_screen(&format!("{text:?}"), |screen| {
+            screen.contents().contains(text)
+        })
+        .await;
+        self.contents()
+    }
+
+    pub async fn wait_for_screen(&mut self, what: &str, done: impl Fn(&vt100::Screen) -> bool) {
         let deadline = tokio::time::Instant::now() + TIMEOUT;
         loop {
-            let contents = self.contents();
-            if contents.contains(text) {
-                return contents;
+            if done(self.screen.screen()) {
+                return;
             }
+            let contents = self.contents();
             let message = tokio::time::timeout_at(deadline, self.incoming.recv())
                 .await
-                .unwrap_or_else(|_| panic!("timed out waiting for {text:?}; screen:\n{contents}"));
+                .unwrap_or_else(|_| panic!("timed out waiting for {what}; screen:\n{contents}"));
             match message {
                 Some(ServerMessage::Output(bytes)) => self.screen.process(&bytes),
-                other => panic!("expected output while waiting for {text:?}, got {other:?}"),
+                other => panic!("expected output while waiting for {what}, got {other:?}"),
             }
         }
     }

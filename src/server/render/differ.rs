@@ -22,6 +22,7 @@ impl GridDiffer {
         }
     }
 
+    #[cfg(test)]
     pub fn client_size(&self) -> Size {
         self.client_size
     }

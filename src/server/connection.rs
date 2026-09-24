@@ -1,18 +1,24 @@
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use super::forward::{self, Host, Opening};
+use super::mouse::MouseDecoder;
+use super::render::GridDiffer;
 use super::session::Session;
-use super::{Resolved, Server};
+use super::{target_index, Resolved, Server};
 use crate::protocol::{
     AttachedSession, ClientMessage, DebugCommand, Duplex, NewSession, ServerMessage, Size,
 };
 use crate::target::{validate_session_name, Target};
 
 pub type ClientConnection = Duplex<ClientMessage, ServerMessage>;
+
+const ESCAPE_TIME: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
@@ -25,15 +31,21 @@ pub enum Route {
     Remote { host: Host, opening: Opening },
 }
 
-impl From<Resolved> for Route {
-    fn from(resolved: Resolved) -> Self {
-        match resolved {
-            Resolved::Local(session) => Self::Local(session),
-            Resolved::Remote(remote) => Self::Remote {
-                host: remote.host,
-                opening: Opening::Attach(remote.target),
-            },
+fn route_to(server: &Server, target: &Target, origin: Origin) -> Result<Route> {
+    match server.resolve(target, origin)? {
+        Resolved::Local(session) => {
+            if target.window.is_some() || target.pane.is_some() {
+                session.select(
+                    target.window.map(target_index),
+                    target.pane.map(target_index),
+                )?;
+            }
+            Ok(Route::Local(session))
         }
+        Resolved::Remote(remote) => Ok(Route::Remote {
+            host: remote.host,
+            opening: Opening::Attach(remote.target),
+        }),
     }
 }
 
@@ -61,9 +73,9 @@ pub async fn handle(
 
     let routed = match request {
         ClientMessage::NewSession(request) => new_session_route(&server, request, origin).await,
-        ClientMessage::Attach { target, size } => server
-            .resolve(&target, origin)
-            .map(|resolved| (Route::from(resolved), size)),
+        ClientMessage::Attach { target, size } => {
+            route_to(&server, &target, origin).map(|route| (route, size))
+        }
         ClientMessage::Reattach {
             incarnation,
             session_id,
@@ -171,14 +183,23 @@ async fn kill_session(
     remove_worktree: bool,
     origin: Origin,
 ) -> Result<()> {
+    let window = target.window.map(target_index);
+    let pane = target.pane.map(target_index);
     match server.resolve(target, origin)? {
+        Resolved::Local(_) if remove_worktree && (window.is_some() || pane.is_some()) => {
+            bail!("--remove-worktree kills a whole session, so the target can't name a window or pane")
+        }
         Resolved::Local(session) if remove_worktree => {
             server.kill_and_remove_worktree(&session).await
         }
-        Resolved::Local(session) => {
-            server.kill_session(&session);
-            Ok(())
-        }
+        Resolved::Local(session) => match (window, pane) {
+            (None, None) => {
+                server.kill_session(&session);
+                Ok(())
+            }
+            (Some(window), None) => session.kill_window(window),
+            (window, Some(pane)) => session.kill_pane(window, pane),
+        },
         Resolved::Remote(remote) => {
             let request = ClientMessage::KillSession {
                 target: remote.target,
@@ -227,8 +248,8 @@ async fn run_routes(
             Outcome::Detached | Outcome::Exited => return Ok(()),
             Outcome::Switch(target) => target,
         };
-        route = match server.resolve(&target, origin) {
-            Ok(resolved) => Route::from(resolved),
+        route = match route_to(server, &target, origin) {
+            Ok(route) => route,
             Err(err) => {
                 return send(&client.outgoing, ServerMessage::Error(format!("{err:#}"))).await
             }
@@ -266,8 +287,7 @@ async fn attach(
     origin: Origin,
 ) -> Result<Outcome> {
     let _client = server.track_client(session);
-    let pane = session.active_pane();
-    pane.resize(*size)?;
+    session.resize(*size);
 
     let attached = ServerMessage::Attached(AttachedSession {
         server: server.identity().name.clone(),
@@ -277,8 +297,11 @@ async fn attach(
     });
     send(&client.outgoing, attached).await?;
 
-    let mut updates = pane.subscribe();
-    let mut frames = FrameDiffer::default();
+    let mut updates = session.subscribe();
+    let mut differ = GridDiffer::new(*size);
+    let mut mouse = MouseDecoder::new();
+    let escape = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(escape);
     let mut dirty = true;
 
     loop {
@@ -288,9 +311,12 @@ async fn attach(
                     return Ok(Outcome::Detached);
                 };
                 dirty = false;
-                let frame = frames.next(pane.screen());
-                if !frame.is_empty() {
-                    permit.send(ServerMessage::Output(frame));
+                let Some(frame) = session.frame() else {
+                    continue;
+                };
+                let output = differ.diff(&frame);
+                if !output.is_empty() {
+                    permit.send(ServerMessage::Output(output));
                 }
             }
             changed = updates.changed() => {
@@ -300,22 +326,37 @@ async fn attach(
                 }
                 dirty = true;
             }
+            () = &mut escape, if mouse.has_pending() => {
+                if let Some(pending) = mouse.flush() {
+                    session.input(pending);
+                }
+            }
             message = client.incoming.recv() => match message {
                 Some(ClientMessage::Input(bytes)) => {
-                    if pane.size() != *size {
-                        pane.resize(*size)?;
-                        dirty = true;
-                    }
+                    resize_to_latest(session, *size);
                     session.record_input();
-                    pane.write_input(bytes)?;
+                    for event in mouse.decode(&bytes) {
+                        session.input(event);
+                    }
+                    if mouse.has_pending() {
+                        escape.as_mut().reset(Instant::now() + ESCAPE_TIME);
+                    }
                 }
                 Some(ClientMessage::Resize(new_size)) => {
                     *size = new_size.clamped();
-                    pane.resize(*size)?;
+                    session.resize(*size);
+                    differ.set_client_size(*size);
                     dirty = true;
                 }
+                Some(ClientMessage::Command(command)) => {
+                    resize_to_latest(session, *size);
+                    session.record_input();
+                    if let Err(err) = session.run(command) {
+                        debug!(?command, "command failed: {err:#}");
+                    }
+                }
                 Some(ClientMessage::Redraw) => {
-                    frames = FrameDiffer::default();
+                    differ.reset();
                     dirty = true;
                 }
                 Some(ClientMessage::ListCluster) => {
@@ -339,81 +380,15 @@ async fn attach(
     }
 }
 
+fn resize_to_latest(session: &Session, size: Size) {
+    if session.size() != size {
+        session.resize(size);
+    }
+}
+
 pub async fn send(outgoing: &mpsc::Sender<ServerMessage>, message: ServerMessage) -> Result<()> {
     outgoing
         .send(message)
         .await
         .map_err(|_| anyhow!("the client disconnected"))
-}
-
-#[derive(Default)]
-struct FrameDiffer {
-    previous: Option<vt100::Screen>,
-}
-
-impl FrameDiffer {
-    fn next(&mut self, screen: vt100::Screen) -> Vec<u8> {
-        let frame = match &self.previous {
-            Some(previous) if previous.size() == screen.size() => screen.state_diff(previous),
-            _ => screen.state_formatted(),
-        };
-        self.previous = Some(screen);
-        frame
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parser_with(text: &[u8]) -> vt100::Parser {
-        let mut parser = vt100::Parser::new(4, 20, 0);
-        parser.process(text);
-        parser
-    }
-
-    #[test]
-    fn the_first_frame_is_a_full_redraw() {
-        let parser = parser_with(b"hello");
-        let mut frames = FrameDiffer::default();
-        assert_eq!(
-            frames.next(parser.screen().clone()),
-            parser.screen().state_formatted()
-        );
-    }
-
-    #[test]
-    fn an_unchanged_screen_sends_nothing() {
-        let parser = parser_with(b"hello");
-        let mut frames = FrameDiffer::default();
-        frames.next(parser.screen().clone());
-        assert!(frames.next(parser.screen().clone()).is_empty());
-    }
-
-    #[test]
-    fn changes_at_the_same_size_send_a_diff_that_reproduces_the_screen() {
-        let mut parser = parser_with(b"hello");
-        let mut frames = FrameDiffer::default();
-        let mut client = vt100::Parser::new(4, 20, 0);
-        client.process(&frames.next(parser.screen().clone()));
-
-        parser.process(b" world");
-        let diff = frames.next(parser.screen().clone());
-        assert_ne!(diff, parser.screen().state_formatted());
-        client.process(&diff);
-        assert_eq!(client.screen().contents(), "hello world");
-    }
-
-    #[test]
-    fn a_size_change_resets_to_a_full_redraw() {
-        let mut parser = parser_with(b"hello");
-        let mut frames = FrameDiffer::default();
-        frames.next(parser.screen().clone());
-
-        parser.screen_mut().set_size(6, 30);
-        assert_eq!(
-            frames.next(parser.screen().clone()),
-            parser.screen().state_formatted()
-        );
-    }
 }

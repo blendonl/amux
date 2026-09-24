@@ -12,9 +12,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 pub use client::{
-    is_locale_variable, AttachedSession, ClientMessage, DebugCommand, LinkInfo, LinkState,
-    NewSession, ProjectCheckout, ProjectRef, ServerMessage, ServerStatus, ServerView, SessionId,
-    SessionInfo, Size, WindowSummary, MIN_COLS, MIN_ROWS,
+    is_locale_variable, AttachedSession, ClientMessage, DebugCommand, Direction, LinkInfo,
+    LinkState, NewSession, ProjectCheckout, ProjectRef, ServerMessage, ServerStatus, ServerView,
+    SessionCommand, SessionId, SessionInfo, Size, Split, WindowSummary, MIN_COLS, MIN_ROWS,
 };
 pub use greeting::{
     accept, greet, Greeting, IncompatibleServer, Role, Version, Welcome, MAGIC, PROTOCOL_MAJOR,

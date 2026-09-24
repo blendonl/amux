@@ -5,7 +5,7 @@ mod grid;
 mod round_trip;
 
 pub use differ::GridDiffer;
-pub use grid::{Cell, Grid, Style};
+use grid::Grid;
 
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
@@ -94,6 +94,7 @@ impl Screens for std::collections::BTreeMap<PaneId, vt100::Parser> {
 mod tests {
     use std::collections::BTreeMap;
 
+    use super::grid::Style;
     use super::*;
     use crate::server::layout::SplitDirection;
 

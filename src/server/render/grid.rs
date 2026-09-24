@@ -137,6 +137,7 @@ impl Grid {
         }
     }
 
+    #[cfg(test)]
     pub fn size(&self) -> Size {
         self.size
     }

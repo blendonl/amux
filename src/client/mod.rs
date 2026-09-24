@@ -443,6 +443,7 @@ async fn relay(
                     let message = match action {
                         Action::Forward(bytes) => ClientMessage::Input(bytes),
                         Action::Detach => ClientMessage::Detach,
+                        Action::Command(command) => ClientMessage::Command(command),
                     };
                     send(&outgoing, message).await?;
                 }

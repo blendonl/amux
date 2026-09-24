@@ -158,6 +158,33 @@ impl NewSession {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Split {
+    LeftRight,
+    TopBottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionCommand {
+    NewWindow,
+    NextWindow,
+    PreviousWindow,
+    SelectWindow(usize),
+    SplitPane(Split),
+    NextPane,
+    SelectPane(Direction),
+    KillPane,
+    KillWindow,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMessage {
     NewSession(NewSession),
@@ -194,6 +221,7 @@ pub enum ClientMessage {
     KillServer,
     Input(Vec<u8>),
     Resize(Size),
+    Command(SessionCommand),
     Switch(Target),
     Redraw,
     Detach,

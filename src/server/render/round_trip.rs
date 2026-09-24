@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use vt100::{Color, MouseProtocolEncoding, MouseProtocolMode};
 
-use super::{compose, Cell, Frame, GridDiffer, InputModes};
+use super::grid::Cell;
+use super::{compose, Frame, GridDiffer, InputModes};
 use crate::protocol::Size;
 use crate::server::layout::{Layout, PaneId, Rect, SplitDirection};
 

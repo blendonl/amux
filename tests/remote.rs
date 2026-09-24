@@ -1,8 +1,13 @@
 mod common;
 
 use amux::config::Incarnation;
-use amux::protocol::{ClientMessage, NewSession, ServerMessage, ServerView, Size};
-use common::{linked, Listing, Resume, TestClient, TestServer, DETACH, SIZE};
+use amux::protocol::{
+    ClientMessage, Direction, NewSession, ServerMessage, ServerView, SessionCommand, Size, Split,
+};
+use common::{
+    linked, screen_column, screen_region, window_summary as window, Listing, Resume, TestClient,
+    TestServer, DETACH, SIZE,
+};
 use nix::sys::signal::{kill, Signal};
 
 fn pair() -> [TestServer; 2] {
@@ -449,4 +454,152 @@ fn the_client_shows_a_reconnecting_overlay_until_the_link_is_back() {
     terminal.type_text(DETACH);
     terminal.wait_for_text("[detached (from session s@b)]");
     assert!(terminal.wait_for_exit().success());
+}
+
+fn split_at_column_40(screen: &vt100::Screen) -> bool {
+    screen_column(screen, 40) == "│".repeat(usize::from(SIZE.rows))
+}
+
+async fn wait_for_cached_windows(
+    server: &TestServer,
+    host: &str,
+    session: &str,
+    expected: &[amux::protocol::WindowSummary],
+) {
+    let deadline = std::time::Instant::now() + common::TIMEOUT;
+    loop {
+        let servers = cluster_of(&mut server.client().await).await;
+        let windows = servers
+            .iter()
+            .filter(|view| view.name == host)
+            .flat_map(|view| &view.sessions)
+            .find(|info| info.name == session)
+            .map(|info| info.windows.clone());
+        if windows.as_deref() == Some(expected) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {session}@{host} to show {expected:?}, got {windows:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+fn windows_listed(ls: &Listing, server: &str, session: &str, count: &str) -> bool {
+    ls.server(server).is_some_and(|listed| {
+        listed
+            .sessions
+            .iter()
+            .any(|listed| listed.name == session && listed.details.starts_with(count))
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn window_and_pane_commands_drive_a_session_on_a_peer() {
+    let [a, b] = pair();
+    let mut client = a.client().await;
+    let request = NewSession {
+        on: Some("b".into()),
+        ..client.session_request(Some("s"))
+    };
+    assert_eq!(client.create(request).await.server, "b");
+    client.wait_for_text("$").await;
+
+    client
+        .command(SessionCommand::SplitPane(Split::LeftRight))
+        .await;
+    client
+        .wait_for_screen("the split on b", split_at_column_40)
+        .await;
+    client.type_text("echo right-$((6*7))\r").await;
+    client
+        .wait_for_screen("output in the right pane", |screen| {
+            screen_region(screen, 41..80).contains("right-42")
+        })
+        .await;
+    client
+        .command(SessionCommand::SelectPane(Direction::Left))
+        .await;
+    client.type_text("echo left-$((6*7))\r").await;
+    client
+        .wait_for_screen("output in the left pane", |screen| {
+            screen_region(screen, 0..40).contains("left-42")
+        })
+        .await;
+
+    client.command(SessionCommand::NewWindow).await;
+    client
+        .wait_for_screen("the new window", |screen| {
+            !screen.contents().contains("left-42") && screen.contents().contains('$')
+        })
+        .await;
+    b.wait_for_windows("s", &[window(0, 2), window(1, 1)]).await;
+    blocking(|| {
+        a.wait_for_ls("both windows seen from a", |ls| {
+            windows_listed(ls, "b", "s", "2 windows")
+        })
+    });
+
+    client.command(SessionCommand::NextWindow).await;
+    client.wait_for_text("left-42").await;
+    client.command(SessionCommand::NextPane).await;
+    client.command(SessionCommand::KillPane).await;
+    client
+        .wait_for_screen("the split to close", |screen| {
+            !split_at_column_40(screen) && screen.contents().contains("left-42")
+        })
+        .await;
+    b.wait_for_windows("s", &[window(0, 1), window(1, 1)]).await;
+    client.command(SessionCommand::SelectWindow(1)).await;
+    client.command(SessionCommand::KillWindow).await;
+    b.wait_for_windows("s", &[window(0, 1)]).await;
+    client.detach().await;
+
+    blocking(|| a.run_ok(&["kill", "-t", "s@b:0.0"]));
+    blocking(|| a.wait_for_ls("s to end on b", |ls| ls.sessions("b").is_empty()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn window_and_pane_targets_reach_a_session_on_a_peer() {
+    let [a, b] = pair();
+    let mut local = b.client().await;
+    local.new_session(Some("s")).await;
+    local.wait_for_text("$").await;
+    local.command(SessionCommand::NewWindow).await;
+    local
+        .command(SessionCommand::SplitPane(Split::TopBottom))
+        .await;
+    local.detach().await;
+    wait_for_cached_windows(&a, "b", "s", &[window(0, 1), window(1, 2)]).await;
+
+    let mut client = a.client().await;
+    client.attach_to("s@b:1.0").await;
+    client.type_text("echo top-$((6*7))\r").await;
+    client
+        .wait_for_screen("output in the top pane", |screen| {
+            screen_region(screen, 0..80)
+                .lines()
+                .take(12)
+                .any(|line| line.contains("top-42"))
+        })
+        .await;
+    client.detach().await;
+
+    let mut refused = a.client().await;
+    refused
+        .send(ClientMessage::Attach {
+            target: "s@b:4".parse().unwrap(),
+            size: SIZE,
+        })
+        .await;
+    assert_eq!(
+        refused.expect_error().await,
+        "can't find window 4 in session s@b"
+    );
+
+    blocking(|| a.run_ok(&["kill", "-t", "s@b:1.1"]));
+    b.wait_for_windows("s", &[window(0, 1), window(1, 1)]).await;
+    blocking(|| a.run_ok(&["kill", "-t", "s@b:0"]));
+    b.wait_for_windows("s", &[window(1, 1)]).await;
 }

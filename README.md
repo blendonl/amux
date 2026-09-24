@@ -26,22 +26,51 @@ cargo run -- servers remove laptop
 cargo run -- kill-server                 # stop the server and all sessions
 ```
 
-Inside a session, press `Ctrl-b d` to detach and `Ctrl-b Ctrl-b` to send a literal `Ctrl-b`.
+Inside a session, press `Ctrl-b d` to detach and `Ctrl-b Ctrl-b` to send a literal `Ctrl-b`. The other keys after `Ctrl-b` manage windows and panes, as in tmux.
 
 `-L <name>` picks a named server socket in the runtime directory and `-S <path>` sets an explicit socket path. Both work like tmux's flags, so you can run an isolated dev server next to your usual one. Each `-L` name is its own cluster: a `-L dev` server only links to other `-L dev` servers.
 
+### Windows and panes
+
+A session holds numbered windows, and each window splits into panes, each running its own shell. The host lays the panes out and draws them into one screen with borders between them, and the border around the active pane is green.
+
+| Keys                    | Action                                           |
+| ----------------------- | ------------------------------------------------ |
+| `Ctrl-b c`              | New window                                       |
+| `Ctrl-b n`, `Ctrl-b p`  | Next and previous window                         |
+| `Ctrl-b 0` … `Ctrl-b 9` | The window with that number                      |
+| `Ctrl-b %`              | Split the active pane into left and right panes  |
+| `Ctrl-b "`              | Split the active pane into top and bottom panes  |
+| `Ctrl-b o`              | Next pane                                        |
+| `Ctrl-b` arrow key      | The pane in that direction                       |
+| `Ctrl-b x`              | Kill the active pane                             |
+| `Ctrl-b &`              | Kill the active window                           |
+| `Ctrl-b d`              | Detach                                           |
+| `Ctrl-b Ctrl-b`         | Send a literal `Ctrl-b`                          |
+
+- Windows are numbered from 0. A new window takes the lowest free number, and the others keep theirs when one closes. `amux ls` counts the windows of every session in the cluster.
+- A split shares the pane's space equally with its siblings, and every shell is resized to its pane. A split that leaves no room for the new pane is ignored.
+- A pane whose shell exits leaves the layout and its neighbours take over its space. A window closes with its last pane, and the session ends with its last window.
+- Every client attached to a session sees the same active window and pane. The window takes the size of the client that typed last, and a client with a smaller terminal sees the top-left part of it.
+- While a window has more than one pane, the terminal reports mouse clicks to amux, and clicking a pane makes it the active one. Most terminals still select text when you hold Shift. A program that turns on mouse reporting itself, like `vim` with `mouse=a` or `htop`, gets the clicks inside its own pane in its own coordinates.
+- These keys work the same on a session on another server: they travel over the peer link to the server that holds the session.
+
 ### Targets
 
-`-t` takes a target of the form `[session][@server]`, like tmux's `-t` with a server added:
+`-t` takes a target of the form `[session][@server][:window[.pane]]`, like tmux's `-t` with a server added:
 
-| Target        | Means                                                         |
-| ------------- | ------------------------------------------------------------- |
-| `work`        | The session named `work`, which must be unique in the cluster |
-| `work@laptop` | The session `work` on `laptop`                                |
-| `@laptop`     | The most recently active session on `laptop`                  |
-| (none)        | The most recently active session on this server               |
+| Target            | Means                                                         |
+| ----------------- | ------------------------------------------------------------- |
+| `work`            | The session named `work`, which must be unique in the cluster |
+| `work@laptop`     | The session `work` on `laptop`                                |
+| `@laptop`         | The most recently active session on `laptop`                  |
+| `work:1`          | Window 1 of `work`                                            |
+| `work@laptop:1.0` | Pane 0 of window 1 of `work` on `laptop`                      |
+| (none)            | The most recently active session on this server               |
 
-When a name matches sessions on several servers, the command fails and lists them all, for example `session work is on more than one server, pick one of: work@desktop, work@laptop`. Session names can't contain `@` or `:`, because targets use them as separators. `:window.pane` is accepted and kept for when sessions have windows.
+When a name matches sessions on several servers, the command fails and lists them all, for example `session work is on more than one server, pick one of: work@desktop, work@laptop`. Session names can't contain `@` or `:`, because targets use them as separators.
+
+Panes are numbered from 0 in layout order. `attach -t work:1.0` makes window 1 and its pane 0 active before attaching. `kill -t work:1` kills only window 1, and `kill -t work:1.0` only that pane, so a session loses nothing else. A window or pane that doesn't exist is an error that names it.
 
 ### Config
 
@@ -133,15 +162,20 @@ notes      4b825dc642cb6eb9a060e54bf8d69288fbee4904
 amux uses a client/server model like tmux. The server owns the shells and the client is only a view.
 
 ```
- terminal ── client ── unix socket ── server ─┬─ session ── pane ── PTY ── $SHELL
-  (raw mode)                            ║     └─ session ── pane ── PTY ── $SHELL
+ terminal ── client ── unix socket ── server ─┬─ session ─┬─ window ─┬─ pane ── PTY ── $SHELL
+  (raw mode)                            ║     │           │          └─ pane ── PTY ── $SHELL
+                                        ║     │           └─ window ─── pane ── PTY ── $SHELL
+                                        ║     └─ session ─── window ─── pane ── PTY ── $SHELL
                                         ║ peer link (ssh … amux bridge)
                                         ╚══════════ server on another machine
 ```
 
 - The **server** is started on demand as a detached `amux server` process. It listens on `$XDG_RUNTIME_DIR/amux-$UID/<name>` and logs to the same path with `.log` appended.
 - Each **pane** spawns the user's shell in a PTY. Output goes through a `vt100` parser, so the server always holds the full screen state. That state is how a client gets a redraw when it reattaches. The shell doesn't inherit `SSH_*` variables from the server, and a session in a directory that doesn't exist fails instead of quietly starting in `$HOME`.
-- Each attached **client** gets frames as a diff against the last screen it was sent. Frames are pulled, not pushed: a pane update only marks the client dirty, and the server renders a frame when the connection has room for one. A slow client skips intermediate screens, and its keystrokes never wait behind output. Keystrokes go back as raw bytes, and resizes are sent when `SIGWINCH` arrives.
+- A **session** holds an ordered list of windows, and each **window** holds a layout tree and its panes. The layout splits the window into rectangles with a one-cell border between siblings, and each pane's PTY is sized to its rectangle.
+- The **compositor** paints the active window into a grid of cells: every pane's cells are read straight from its `vt100` screen while that pane's parser is locked, so nothing is copied per frame, and the borders are drawn with box-drawing characters. The cursor and input modes come from the active pane.
+- Each attached **client** has its own differ, which compares the new grid with the last one that client was sent, clipped to that client's terminal size, and sends only the changed cells. It moves the cursor and clears line by line, never the whole screen. Frames are pulled, not pushed: output in a visible pane or a layout change only marks the client dirty, and the server composes a frame when the connection has room for one. A slow client skips intermediate screens, and its keystrokes never wait behind output. Keystrokes go back as raw bytes, key bindings as commands, and resizes are sent when `SIGWINCH` arrives.
+- The host decodes **mouse** reports from the client's input. A click focuses the pane under the pointer, and a report only reaches a pane whose program asked for that kind of event, re-encoded in that pane's coordinates and format. A lone `Escape` that could start a report is held for at most 25 ms, so it never gets stuck.
 - The **protocol** uses length-prefixed `postcard` frames. A connection opens with a `Greeting` and a `Welcome` whose layout never changes, then carries `ClientMessage` and `ServerMessage`. Any change to those messages bumps the major version. The server handles a connection as a `Duplex`, a pair of message channels, so it doesn't care what transport sits underneath.
 - A **peer link** carries the same frames. After the greeting both servers send a `Hello`, the lower ID decides whether the link is a duplicate, and then each side sends a snapshot of its sessions followed by events stamped with its incarnation and a sequence number, so stale or repeated updates are dropped. One writer drains a control lane (pongs, credit, goodbyes) ahead of a bulk lane (snapshots, events and channel data), and the reader never waits on anything the other side controls, so a peer that stops reading cannot stall this one.
 - A **channel** tunnels one client connection through a peer link. Each server numbers the channels it opens, and the server hosting the session runs the channel through the same connection handler as a local client, except that it only ever looks up its own sessions. The host sends at most four frames ahead and waits for the opening server to pass each one on to its client, so frames stay pulled end to end. Each channel has its own capped queue on the receiving side: a channel that overflows is closed on its own and the link stays up. The opening server forwards client messages without reading them, apart from detaching, switching sessions and listing the cluster, and reattaches by the host's incarnation and session ID when a dropped link comes back.
@@ -173,14 +207,18 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 | `src/server/connection.rs` | Per-client requests, target routing and the attach loop                  |
 | `src/server/forward.rs`    | Forwarding a client to a session on another server, reconnects           |
 | `src/server/projects.rs`   | Project registry, checkouts, clones, worktree sessions and removal       |
-| `src/server/session.rs`    | Session state                                                            |
+| `src/server/session.rs`    | Session state, its windows and the commands that change them             |
+| `src/server/window.rs`     | A window's layout, panes, active pane and mouse routing                  |
+| `src/server/layout.rs`     | The pane layout tree: splits, rectangles, borders and neighbours         |
+| `src/server/render/`       | The compositor, the per-client differ and escape sequences               |
+| `src/server/mouse.rs`      | Decoding and re-encoding mouse reports                                   |
 | `src/server/pane.rs`       | PTY, shell process, terminal emulation                                   |
 | `src/client/mod.rs`        | Commands, server bootstrap, attach relay                                 |
 | `src/client/listing.rs`    | `amux ls`, `amux projects` and `amux servers` output                     |
 | `src/client/projects.rs`   | Resolving `-p` against the projects the cluster knows                    |
 | `src/client/overlay.rs`    | The "reconnecting to …" overlay                                          |
 | `src/client/terminal.rs`   | Raw mode, alternate screen, stdin reader                                 |
-| `src/client/keys.rs`       | Prefix key handling                                                      |
+| `src/client/keys.rs`       | Prefix key handling and the window and pane bindings                     |
 | `tests/common/mod.rs`      | `TestServer`, `TestClient`, a PTY-driven client and linked test clusters |
 | `tests/common/git.rs`      | Temporary repos with a local bare `origin` for the project tests         |
 
@@ -201,8 +239,8 @@ amux is growing into a multiplexer that spans machines, following [docs/design.m
 - [x] Cluster view: peer links over SSH, `amux servers`, and `amux ls` across machines
 - [x] Remote sessions: `new --on`, `attach -t session@server`, reconnects
 - [x] Projects and worktrees: `new -p -b`, `--clone`, `amux projects`
-- [ ] Windows within a session (`Ctrl-b c`, `n`, `p`)
-- [ ] Pane splits with a layout tree and a cell-level compositor
+- [x] Windows within a session (`Ctrl-b c`, `n`, `p`)
+- [x] Pane splits with a layout tree and a cell-level compositor
 - [ ] Status bar and the `Ctrl-b s` cluster tree
 - [ ] Prefix key, shell and key bindings in the config file
 - [ ] Scrollback and copy mode

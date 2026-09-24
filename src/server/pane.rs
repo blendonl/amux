@@ -1,14 +1,13 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
-use std::time::SystemTime;
 
 use anyhow::{anyhow, bail, Context, Result};
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
-use tokio::sync::watch;
 
+use super::layout::PaneId;
 use crate::protocol::{is_locale_variable, Size};
 
 const SCROLLBACK_LINES: usize = 10_000;
@@ -16,26 +15,37 @@ const READ_BUFFER_LEN: usize = 16 * 1024;
 const PANE_TERM: &str = "screen-256color";
 const STRIPPED_ENV_PREFIX: &str = "SSH_";
 
+pub trait PaneObserver: Send + Sync {
+    fn pane_output(&self, pane: PaneId);
+    fn pane_exited(&self, pane: PaneId);
+}
+
+pub struct PaneSpec<'a> {
+    pub id: PaneId,
+    pub cwd: &'a Path,
+    pub size: Size,
+    pub env: &'a [(String, String)],
+    pub observer: Weak<dyn PaneObserver>,
+}
+
 pub struct Pane {
     master: Mutex<Box<dyn MasterPty + Send>>,
     input: mpsc::Sender<Vec<u8>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     parser: Arc<Mutex<vt100::Parser>>,
-    last_output: Arc<Mutex<SystemTime>>,
-    updates: watch::Receiver<()>,
 }
 
 impl Pane {
-    pub fn spawn(cwd: &Path, size: Size, env: &[(String, String)]) -> Result<Self> {
-        check_working_directory(cwd)?;
-        let size = size.clamped();
+    pub fn spawn(spec: PaneSpec<'_>) -> Result<Self> {
+        check_working_directory(spec.cwd)?;
+        let size = spec.size.clamped();
         let pair = native_pty_system()
             .openpty(pty_size(size))
             .context("opening a pty")?;
 
         let child = pair
             .slave
-            .spawn_command(shell_command(cwd, env))
+            .spawn_command(shell_command(spec.cwd, spec.env))
             .context("spawning the shell")?;
         drop(pair.slave);
 
@@ -47,16 +57,14 @@ impl Pane {
             size.cols,
             SCROLLBACK_LINES,
         )));
-        let last_output = Arc::new(Mutex::new(SystemTime::now()));
-        let (notifier, updates) = watch::channel(());
 
         spawn_output_pump(
             reader,
             child,
             OutputSinks {
+                pane: spec.id,
                 parser: Arc::clone(&parser),
-                last_output: Arc::clone(&last_output),
-                notifier,
+                observer: spec.observer,
             },
         );
 
@@ -65,32 +73,15 @@ impl Pane {
             input: spawn_input_pump(writer),
             killer: Mutex::new(killer),
             parser,
-            last_output,
-            updates,
         })
-    }
-
-    pub fn size(&self) -> Size {
-        let (rows, cols) = lock(&self.parser).screen().size();
-        Size { rows, cols }
-    }
-
-    pub fn last_output(&self) -> SystemTime {
-        *lock(&self.last_output)
     }
 
     pub fn kill(&self) {
         let _ = lock(&self.killer).kill();
     }
 
-    pub fn subscribe(&self) -> watch::Receiver<()> {
-        let mut updates = self.updates.clone();
-        updates.borrow_and_update();
-        updates
-    }
-
-    pub fn screen(&self) -> vt100::Screen {
-        lock(&self.parser).screen().clone()
+    pub fn with_screen<R>(&self, read: impl FnOnce(&vt100::Screen) -> R) -> R {
+        read(lock(&self.parser).screen())
     }
 
     pub fn write_input(&self, bytes: Vec<u8>) -> Result<()> {
@@ -101,6 +92,9 @@ impl Pane {
 
     pub fn resize(&self, size: Size) -> Result<()> {
         let size = size.clamped();
+        if self.with_screen(|screen| screen.size()) == (size.rows, size.cols) {
+            return Ok(());
+        }
         lock(&self.master).resize(pty_size(size))?;
         lock(&self.parser)
             .screen_mut()
@@ -144,9 +138,9 @@ fn shell_command(cwd: &Path, env: &[(String, String)]) -> CommandBuilder {
 }
 
 struct OutputSinks {
+    pane: PaneId,
     parser: Arc<Mutex<vt100::Parser>>,
-    last_output: Arc<Mutex<SystemTime>>,
-    notifier: watch::Sender<()>,
+    observer: Weak<dyn PaneObserver>,
 }
 
 fn spawn_output_pump(
@@ -161,14 +155,18 @@ fn spawn_output_pump(
                 Ok(0) => break,
                 Ok(len) => {
                     lock(&sinks.parser).process(&buffer[..len]);
-                    *lock(&sinks.last_output) = SystemTime::now();
-                    sinks.notifier.send_replace(());
+                    if let Some(observer) = sinks.observer.upgrade() {
+                        observer.pane_output(sinks.pane);
+                    }
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
         }
         let _ = child.wait();
+        if let Some(observer) = sinks.observer.upgrade() {
+            observer.pane_exited(sinks.pane);
+        }
     });
 }
 
