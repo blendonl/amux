@@ -1,5 +1,5 @@
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
@@ -8,9 +8,24 @@ use anyhow::Result;
 use tokio::sync::Notify;
 
 use super::pane::Pane;
+use crate::project::ProjectId;
 use crate::protocol::{SessionId, SessionInfo, Size, WindowSummary};
 
 const FALLBACK_WINDOW_NAME: &str = "shell";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Binding {
+    pub project: ProjectId,
+    pub branch: String,
+    pub checkout: PathBuf,
+    pub worktree: PathBuf,
+}
+
+impl Binding {
+    pub fn is_for(&self, project: &ProjectId, branch: &str) -> bool {
+        self.project == *project && self.branch == branch
+    }
+}
 
 pub struct Session {
     id: SessionId,
@@ -19,6 +34,7 @@ pub struct Session {
     last_input: Mutex<SystemTime>,
     input: Notify,
     window_name: String,
+    binding: Option<Binding>,
     pane: Pane,
 }
 
@@ -29,6 +45,7 @@ impl Session {
         cwd: &Path,
         size: Size,
         env: &[(String, String)],
+        binding: Option<Binding>,
     ) -> Result<Self> {
         Ok(Self {
             id,
@@ -37,6 +54,7 @@ impl Session {
             last_input: Mutex::new(SystemTime::now()),
             input: Notify::new(),
             window_name: shell_name(),
+            binding,
             pane: Pane::spawn(cwd, size, env)?,
         })
     }
@@ -51,6 +69,10 @@ impl Session {
 
     pub fn rename(&self, name: String) {
         *lock(&self.name) = name;
+    }
+
+    pub fn binding(&self) -> Option<&Binding> {
+        self.binding.as_ref()
     }
 
     pub fn active_pane(&self) -> &Pane {
@@ -72,8 +94,8 @@ impl Session {
             }],
             attached_clients: self.attached_clients.load(Ordering::Relaxed),
             last_activity: self.last_activity(),
-            project: None,
-            branch: None,
+            project: self.binding.as_ref().map(|binding| binding.project.clone()),
+            branch: self.binding.as_ref().map(|binding| binding.branch.clone()),
         }
     }
 

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::Version;
 use crate::config::{Incarnation, ServerConfig, ServerId};
+use crate::project::ProjectId;
 use crate::target::Target;
 
 pub const MIN_ROWS: u16 = 2;
@@ -48,7 +49,7 @@ pub struct SessionInfo {
     pub windows: Vec<WindowSummary>,
     pub attached_clients: usize,
     pub last_activity: SystemTime,
-    pub project: Option<String>,
+    pub project: Option<ProjectId>,
     pub branch: Option<String>,
 }
 
@@ -61,7 +62,7 @@ pub struct WindowSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectCheckout {
-    pub id: String,
+    pub id: ProjectId,
     pub name: String,
     pub path: PathBuf,
     pub origin: Option<String>,
@@ -125,7 +126,7 @@ pub enum DebugCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectRef {
-    pub id: String,
+    pub id: ProjectId,
     pub name: String,
     pub origin: Option<String>,
 }
@@ -186,6 +187,9 @@ pub enum ClientMessage {
     RemoveServer {
         name: String,
     },
+    AddProject {
+        path: PathBuf,
+    },
     Debug(DebugCommand),
     KillServer,
     Input(Vec<u8>),
@@ -214,6 +218,7 @@ pub enum ServerMessage {
     Attached(AttachedSession),
     Sessions(Vec<SessionInfo>),
     Cluster(Vec<ServerView>),
+    Project(ProjectCheckout),
     Links(Vec<LinkInfo>),
     Done,
     Output(Vec<u8>),

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::paths;
 
@@ -72,7 +72,13 @@ pub enum Command {
         visible_aliases = ["ls", "list-sessions"],
         about = "List the sessions on every server in the cluster"
     )]
-    List,
+    List(ListArgs),
+
+    #[command(about = "List the projects in the cluster and where they are checked out")]
+    Projects,
+
+    #[command(subcommand, about = "Register projects with this server")]
+    Project(ProjectAction),
 
     #[command(about = "List the servers in the cluster, or add and remove them")]
     Servers(ServersArgs),
@@ -101,9 +107,58 @@ pub struct NewArgs {
     #[arg(
         long,
         value_name = "SERVER",
-        help = "Server to run the session on, defaults to this one"
+        help = "Server to run the session on, defaults to the project's default_server or this one"
     )]
     pub on: Option<String>,
+
+    #[arg(
+        short = 'p',
+        long,
+        value_name = "PROJECT",
+        help = "Project to run the session in, by name or id, defaults to the repo here"
+    )]
+    pub project: Option<String>,
+
+    #[arg(
+        short = 'b',
+        long,
+        value_name = "BRANCH",
+        help = "Branch whose worktree the session runs in, created if needed"
+    )]
+    pub branch: Option<String>,
+
+    #[arg(
+        long,
+        help = "Clone the project into projects_dir when the server has no checkout of it"
+    )]
+    pub clone: bool,
+}
+
+#[derive(Debug, Default, Args)]
+pub struct ListArgs {
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = Grouping::Server,
+        help = "Group the sessions by server or by project"
+    )]
+    pub by: Grouping,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Grouping {
+    #[default]
+    Server,
+    Project,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProjectAction {
+    #[command(about = "Register the git repository at a path, defaults to the current directory")]
+    Add {
+        #[arg(help = "A directory inside the repository")]
+        path: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -126,6 +181,12 @@ pub struct KillArgs {
         help = "Session to kill, defaults to the most recent one on this server"
     )]
     pub target: Option<String>,
+
+    #[arg(
+        long,
+        help = "Also delete the session's worktree, refusing uncommitted changes and the main checkout"
+    )]
+    pub remove_worktree: bool,
 }
 
 #[derive(Debug, Args)]

@@ -38,6 +38,13 @@ impl fmt::Display for ProjectId {
     }
 }
 
+#[cfg(test)]
+impl From<&str> for ProjectId {
+    fn from(id: &str) -> Self {
+        Self(id.to_owned())
+    }
+}
+
 pub(super) fn resolve_relative_local_url(url: &str, base: &Path) -> String {
     match Remote::parse(url.trim()) {
         Remote::Local(path) if path.is_relative() => normalize_path(&base.join(path))

@@ -6,13 +6,20 @@ A terminal multiplexer written in Rust.
 
 ```sh
 cargo run --                             # start the server if needed, then attach to the most recent session or create one here
+cargo run -- new                         # create a session; inside a git repo it runs in this branch's worktree
 cargo run -- new -s work                 # create a session named "work"
 cargo run -- new -s work --on laptop     # create it on the server named laptop instead
+cargo run -- new -p amux -b feature-x    # a session in the feature-x worktree of the amux project
+cargo run -- new -p amux --on laptop --clone  # on laptop, cloning amux there first if it has no checkout
 cargo run -- attach -t work              # reattach (aliases: a, attach-session)
 cargo run -- attach -t work@laptop       # attach to a session on another server
 cargo run -- rename -t work@laptop notes # rename a session (alias: rename-session)
 cargo run -- kill -t notes@laptop        # kill a session (alias: kill-session)
+cargo run -- kill -t amux/feature-x --remove-worktree  # kill it and delete its worktree
 cargo run -- ls                          # list the sessions on every server in the cluster
+cargo run -- ls --by project             # the same sessions, grouped by project
+cargo run -- projects                    # every project and where it is checked out
+cargo run -- project add [path]          # register the repo at path (default: here) with this server
 cargo run -- servers                     # status, latency and version of every server
 cargo run -- servers add laptop ssh://laptop
 cargo run -- servers remove laptop
@@ -54,7 +61,7 @@ default_server = "desktop"
 worktrees_dir = "~/projects/amux-worktrees"
 ```
 
-`name` defaults to the hostname and `projects_dir` to `~/projects`. Each entry under `servers` is a peer to link to. The `projects` table is parsed now so the project work in [docs/design.md](docs/design.md) can use it.
+`name` defaults to the hostname and `projects_dir` to `~/projects`. Each entry under `servers` is a peer to link to. Each entry under `projects` is keyed by project name: `default_server` is where `amux new` puts that project's sessions when you don't pass `--on`, and `worktrees_dir` is where its worktrees go instead of the default `<checkout>/../<project>-worktrees`.
 
 A server's `address` is either:
 
@@ -101,6 +108,26 @@ A client only ever talks to its local server. Attaching to a session on another 
 - If that server is stopped with `kill-server`, or restarts and loses the session, the client exits as it would for a local session.
 - When several clients are attached to one session, the one that typed or resized last sets its size, like tmux's `window-size latest`.
 
+### Projects and worktrees
+
+A project is a git repository, known across the cluster by its normalized `origin` URL (`github.com/blendonl/amux`), or by its root commit when it has no remote. Its name is the checkout's directory name. Each server keeps a registry of the projects it has checked out in `$XDG_STATE_HOME/amux/<socket name>/projects.toml`, and every server sees every other server's checkouts, so `amux projects` shows where each project can run:
+
+```
+amux       github.com/blendonl/amux
+  desktop  /home/me/projects/amux
+  laptop   /home/me/src/amux
+notes      4b825dc642cb6eb9a060e54bf8d69288fbee4904
+  desktop  /home/me/notes
+```
+
+- `amux new` inside a repo turns the current directory into a project and branch and sends those, not a path, because paths differ between machines. The server resolves the project to its own checkout. The first session created inside a repo registers it, and `amux project add [path]` registers one by hand. A detached `HEAD` gives a plain session in the current directory, and so does `amux new` outside a repo.
+- `-p <name>` picks a project the cluster knows, by name or by id. When two different projects share a name, the command fails and lists their ids. `-b <branch>` picks the branch, and without it `-p` uses the project's default branch.
+- The server is `--on` if given, then the project's `default_server`, then this server.
+- There is one session per worktree. The session for the default branch runs in the main checkout. Any other branch gets a worktree in `worktrees_dir/<branch>`: an existing worktree for the branch is reused, an existing branch is checked out, a branch that only exists on `origin` is tracked, and a new branch starts from the default branch. When the branch doesn't exist locally, the server first fetches it from `origin`, with no prompts and a 30 second limit, so a branch pushed from another machine is found. `amux new` for a worktree that already has a session attaches to that session, even when several run at once.
+- The session is named `<project>/<branch>`, with `@` and `:` turned into `-` and a `-2`, `-3`… suffix if the name is taken. `ls --by project` groups sessions this way across the cluster.
+- When the server has no checkout, `amux new` fails and suggests `--clone` or running `amux project add` on that server. `--clone` makes that server clone the project from its `origin` into `projects_dir/<name>` and register it.
+- Killing a session never deletes its worktree. `amux kill --remove-worktree` kills the session and then deletes its worktree. It refuses, and leaves the session running, when the worktree has uncommitted or untracked files or is the main checkout. The branch stays.
+
 ## Architecture
 
 amux uses a client/server model like tmux. The server owns the shells and the client is only a view.
@@ -119,6 +146,7 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 - A **peer link** carries the same frames. After the greeting both servers send a `Hello`, the lower ID decides whether the link is a duplicate, and then each side sends a snapshot of its sessions followed by events stamped with its incarnation and a sequence number, so stale or repeated updates are dropped. One writer drains a control lane (pongs, credit, goodbyes) ahead of a bulk lane (snapshots, events and channel data), and the reader never waits on anything the other side controls, so a peer that stops reading cannot stall this one.
 - A **channel** tunnels one client connection through a peer link. Each server numbers the channels it opens, and the server hosting the session runs the channel through the same connection handler as a local client, except that it only ever looks up its own sessions. The host sends at most four frames ahead and waits for the opening server to pass each one on to its client, so frames stay pulled end to end. Each channel has its own capped queue on the receiving side: a channel that overflows is closed on its own and the link stays up. The opening server forwards client messages without reading them, apart from detaching, switching sessions and listing the cluster, and reattaches by the host's incarnation and session ID when a dropped link comes back.
 - A client's terminal size is clamped to at least 2 rows by 2 columns, on the client and on the server, because the terminal emulator can't handle anything smaller.
+- **Git** runs through the `git` CLI in blocking tasks, never while the server holds its sessions lock. Registry changes are serialized and saved before they are published as a `ProjectsChanged` event, and creates for the same project and branch wait on a per-worktree lock, so concurrent `amux new`s share one session.
 
 | Path                       | Responsibility                                                           |
 | -------------------------- | ------------------------------------------------------------------------ |
@@ -128,6 +156,11 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 | `src/paths.rs`             | Runtime, config and state paths                                          |
 | `src/config.rs`            | Config file, server ID and incarnation                                   |
 | `src/target.rs`            | `session@server` targets: parsing, validation and resolution             |
+| `src/project/id.rs`        | Project ids from origin URLs, local paths and root commits               |
+| `src/project/detect.rs`    | Finding the project, branch and main checkout of a directory             |
+| `src/project/registry.rs`  | The `projects.toml` registry of local checkouts                          |
+| `src/project/worktree.rs`  | Default branch, worktrees, fetch, clone and removal                      |
+| `src/project/git.rs`       | Running `git` without prompts, with an optional timeout                  |
 | `src/protocol/mod.rs`      | Framing and the `Duplex` message channels                                |
 | `src/protocol/greeting.rs` | Greeting, version constants and the version check                        |
 | `src/protocol/client.rs`   | Client and server messages                                               |
@@ -139,20 +172,23 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 | `src/server/mod.rs`        | Accept loop, session registry, state events, shutdown                    |
 | `src/server/connection.rs` | Per-client requests, target routing and the attach loop                  |
 | `src/server/forward.rs`    | Forwarding a client to a session on another server, reconnects           |
+| `src/server/projects.rs`   | Project registry, checkouts, clones, worktree sessions and removal       |
 | `src/server/session.rs`    | Session state                                                            |
 | `src/server/pane.rs`       | PTY, shell process, terminal emulation                                   |
 | `src/client/mod.rs`        | Commands, server bootstrap, attach relay                                 |
-| `src/client/listing.rs`    | `amux ls` and `amux servers` output                                      |
+| `src/client/listing.rs`    | `amux ls`, `amux projects` and `amux servers` output                     |
+| `src/client/projects.rs`   | Resolving `-p` against the projects the cluster knows                    |
 | `src/client/overlay.rs`    | The "reconnecting to …" overlay                                          |
 | `src/client/terminal.rs`   | Raw mode, alternate screen, stdin reader                                 |
 | `src/client/keys.rs`       | Prefix key handling                                                      |
 | `tests/common/mod.rs`      | `TestServer`, `TestClient`, a PTY-driven client and linked test clusters |
+| `tests/common/git.rs`      | Temporary repos with a local bare `origin` for the project tests         |
 
 Set `AMUX_LOG=debug` before the server starts to get more verbose logs.
 
 ## Tests
 
-`cargo test` runs the unit tests and the integration tests in `tests/`. Each integration test starts its own server with a temporary `HOME`, `XDG_*` directories and socket, so it never touches your real server, config or state. Some tests drive the real `amux` binary inside a PTY. Cluster tests link several such servers on one machine through `exec:` addresses that run `amux bridge` with the other server's environment.
+`cargo test` runs the unit tests and the integration tests in `tests/`. Each integration test starts its own server with a temporary `HOME`, `XDG_*` directories and socket, so it never touches your real server, config or state. Some tests drive the real `amux` binary inside a PTY. Cluster tests link several such servers on one machine through `exec:` addresses that run `amux bridge` with the other server's environment. Project tests work on temporary repos cloned from a local bare `origin`, and run git with their own identity and no user or system config.
 
 ## Roadmap
 
@@ -164,7 +200,7 @@ amux is growing into a multiplexer that spans machines, following [docs/design.m
 - [x] Integration tests driving a real PTY
 - [x] Cluster view: peer links over SSH, `amux servers`, and `amux ls` across machines
 - [x] Remote sessions: `new --on`, `attach -t session@server`, reconnects
-- [ ] Projects and worktrees: `new -p -b`, `--clone`, `amux projects`
+- [x] Projects and worktrees: `new -p -b`, `--clone`, `amux projects`
 - [ ] Windows within a session (`Ctrl-b c`, `n`, `p`)
 - [ ] Pane splits with a layout tree and a cell-level compositor
 - [ ] Status bar and the `Ctrl-b s` cluster tree

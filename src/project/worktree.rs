@@ -1,6 +1,7 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use tracing::info;
@@ -8,6 +9,7 @@ use tracing::info;
 use super::detect::current_branch;
 use super::{canonical, git};
 
+const ORIGIN: &str = "origin";
 const ORIGIN_HEAD: &str = "refs/remotes/origin/HEAD";
 const WORKTREES_DIR_SUFFIX: &str = "-worktrees";
 
@@ -91,7 +93,26 @@ pub fn ensure_worktree(checkout: &Path, branch: &str, worktrees_dir: &Path) -> R
     canonical(&dir)
 }
 
-pub fn remove_worktree(checkout: &Path, path: &Path) -> Result<()> {
+pub fn fetch_branch(checkout: &Path, branch: &str, timeout: Duration) -> Result<bool> {
+    validate_branch_name(checkout, branch)?;
+    if ref_exists(checkout, &format!("refs/heads/{branch}"))? {
+        return Ok(false);
+    }
+    let remotes = git::run(checkout, ["remote"])?;
+    if !remotes.lines().any(|remote| remote == ORIGIN) {
+        return Ok(false);
+    }
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/{ORIGIN}/{branch}");
+    git::run_with_timeout(
+        checkout,
+        ["fetch", "--quiet", "--no-tags", ORIGIN, refspec.as_str()],
+        timeout,
+    )?;
+    info!(checkout = %checkout.display(), branch, "fetched branch from origin");
+    Ok(true)
+}
+
+pub fn check_removable(checkout: &Path, path: &Path) -> Result<PathBuf> {
     let target = canonical(path)?;
     if target == canonical(checkout)? {
         bail!(
@@ -106,6 +127,11 @@ pub fn remove_worktree(checkout: &Path, path: &Path) -> Result<()> {
             target.display()
         );
     }
+    Ok(target)
+}
+
+pub fn remove_worktree(checkout: &Path, path: &Path) -> Result<()> {
+    let target = check_removable(checkout, path)?;
     git::run(
         checkout,
         [
@@ -358,6 +384,46 @@ mod tests {
             );
         }
         assert!(!project.worktrees.exists());
+    }
+
+    #[test]
+    fn fetching_finds_a_branch_pushed_after_the_clone() {
+        let project = setup();
+        let pusher = project.fixture.clone_of(&project.origin, "pusher");
+        git(&pusher, &["switch", "--quiet", "-c", "pushed-later"]);
+        let pushed = commit(&pusher, "pushed after the clone");
+        git(&pusher, &["push", "--quiet", "origin", "pushed-later"]);
+        let timeout = Duration::from_secs(30);
+
+        assert!(fetch_branch(&project.checkout, "pushed-later", timeout).unwrap());
+        let path = ensure_worktree(&project.checkout, "pushed-later", &project.worktrees).unwrap();
+
+        assert_eq!(head(&path), pushed);
+        assert_eq!(
+            upstream(&path, "pushed-later").as_deref(),
+            Some("origin/pushed-later")
+        );
+        assert!(!fetch_branch(&project.checkout, "pushed-later", timeout).unwrap());
+        assert!(fetch_branch(&project.checkout, "nowhere-yet", timeout).is_err());
+        assert!(fetch_branch(&project.checkout, "bad..name", timeout).is_err());
+    }
+
+    #[test]
+    fn fetching_without_an_origin_does_nothing() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo("notes");
+
+        assert!(!fetch_branch(&repo, "feature", Duration::from_secs(30)).unwrap());
+    }
+
+    #[test]
+    fn a_clean_worktree_is_removable_and_the_check_keeps_it() {
+        let project = setup();
+        let path = ensure_worktree(&project.checkout, "feature-x", &project.worktrees).unwrap();
+
+        assert_eq!(check_removable(&project.checkout, &path).unwrap(), path);
+        assert!(path.exists());
+        assert!(check_removable(&project.checkout, &project.checkout).is_err());
     }
 
     #[test]

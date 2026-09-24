@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod git;
+
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File};
 use std::io::{Read, Write};
@@ -151,6 +153,22 @@ pub fn linked<const N: usize>(builders: [TestServerBuilder; N]) -> [TestServer; 
     servers
 }
 
+pub fn settled_pair(first: TestServerBuilder, second: TestServerBuilder) -> [TestServer; 2] {
+    let [first, second] = linked([first, second]);
+    let (lower, higher) = if first.server_id() < second.server_id() {
+        (&first, &second)
+    } else {
+        (&second, &first)
+    };
+    lower.wait_for_links("the link dialed by the lower id", |links| {
+        links.len() == 1 && links[0].dialed && links[0].state == "up"
+    });
+    higher.wait_for_links("the link accepted by the higher id", |links| {
+        links.len() == 1 && !links[0].dialed && links[0].state == "up"
+    });
+    [first, second]
+}
+
 fn peer_entry(peer: &TestServer) -> String {
     format!(
         "\n[servers.{:?}]\naddress = {:?}\n",
@@ -260,8 +278,13 @@ impl TestServer {
     }
 
     pub fn run(&self, args: &[&str]) -> Output {
+        self.run_in(&self.home(), args)
+    }
+
+    pub fn run_in(&self, cwd: &Path, args: &[&str]) -> Output {
         let child = self
             .command()
+            .current_dir(cwd)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -272,7 +295,11 @@ impl TestServer {
     }
 
     pub fn run_ok(&self, args: &[&str]) -> String {
-        let output = self.run(args);
+        self.run_ok_in(&self.home(), args)
+    }
+
+    pub fn run_ok_in(&self, cwd: &Path, args: &[&str]) -> String {
+        let output = self.run_in(cwd, args);
         assert!(
             output.status.success(),
             "amux {args:?} failed: {}",
@@ -401,11 +428,15 @@ impl TestServer {
     }
 
     pub fn terminal(&self, args: &[&str]) -> TerminalClient {
-        TerminalClient::spawn(self, args, &[])
+        TerminalClient::spawn(self, &self.home(), args, &[])
+    }
+
+    pub fn terminal_in(&self, cwd: &Path, args: &[&str]) -> TerminalClient {
+        TerminalClient::spawn(self, cwd, args, &[])
     }
 
     pub fn terminal_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> TerminalClient {
-        TerminalClient::spawn(self, args, env)
+        TerminalClient::spawn(self, &self.home(), args, env)
     }
 
     fn wait_until_listening(&mut self) {
@@ -747,7 +778,7 @@ pub struct TerminalClient {
 }
 
 impl TerminalClient {
-    fn spawn(server: &TestServer, args: &[&str], env: &[(&str, &str)]) -> Self {
+    fn spawn(server: &TestServer, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: SIZE.rows,
@@ -766,7 +797,7 @@ impl TerminalClient {
         for (key, value) in env {
             command.env(key, value);
         }
-        command.cwd(server.home());
+        command.cwd(cwd);
         command.arg("-S");
         command.arg(server.socket());
         command.args(args);

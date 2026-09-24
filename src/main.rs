@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 
-use amux::cli::{Cli, Command, DebugAction, ServersAction};
+use amux::cli::{Cli, Command, DebugAction, ProjectAction, ServersAction};
 use amux::client::{self, Endpoint};
 use amux::cluster::ssh;
 use amux::config::ServerConfig;
@@ -17,13 +17,19 @@ async fn main() -> Result<()> {
 
     match cli.command {
         None => client::attach_or_create(&endpoint).await,
-        Some(Command::New(args)) => client::new_session(&endpoint, args.name, args.on).await,
+        Some(Command::New(args)) => client::new_session(&endpoint, args).await,
         Some(Command::Attach(args)) => client::attach_session(&endpoint, args.target).await,
-        Some(Command::Kill(args)) => client::kill_session(&endpoint, args.target).await,
+        Some(Command::Kill(args)) => {
+            client::kill_session(&endpoint, args.target, args.remove_worktree).await
+        }
         Some(Command::Rename(args)) => {
             client::rename_session(&endpoint, args.target, args.name).await
         }
-        Some(Command::List) => client::list_cluster(&endpoint).await,
+        Some(Command::List(args)) => client::list_cluster(&endpoint, args.by).await,
+        Some(Command::Projects) => client::list_projects(&endpoint).await,
+        Some(Command::Project(ProjectAction::Add { path })) => {
+            client::add_project(&endpoint, path).await
+        }
         Some(Command::Servers(args)) => match args.action {
             None => client::list_servers(&endpoint).await,
             Some(ServersAction::Add(args)) => {

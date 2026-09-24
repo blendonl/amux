@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::chrome::{self, draw_row, Key, KeyDecoder, Rect, Span, Style};
+use crate::project::ProjectId;
 use crate::protocol::{ServerStatus, ServerView, SessionInfo, WindowSummary};
 use crate::target::Target;
 
@@ -328,7 +329,7 @@ fn link(nodes: &mut [Node]) {
 fn project_groups(server: &ServerView) -> Vec<(String, Vec<&SessionInfo>)> {
     let mut groups: BTreeMap<(bool, String, Option<&str>), Vec<&SessionInfo>> = BTreeMap::new();
     for session in &server.sessions {
-        let project = session.project.as_deref();
+        let project = session.project.as_ref().map(ProjectId::as_str);
         let key = (project.is_none(), project_label(server, project), project);
         groups.entry(key).or_default().push(session);
     }
@@ -348,7 +349,7 @@ fn project_label(server: &ServerView, project: Option<&str>) -> String {
     match server
         .projects
         .iter()
-        .find(|checkout| checkout.id == project)
+        .find(|checkout| checkout.id.as_str() == project)
     {
         Some(checkout) => checkout.name.clone(),
         None => project

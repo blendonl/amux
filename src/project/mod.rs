@@ -15,7 +15,8 @@ pub use detect::{detect, Detected};
 pub use id::ProjectId;
 pub use registry::{Project, Registry};
 pub use worktree::{
-    clone, default_branch, default_worktrees_dir, ensure_worktree, remove_worktree,
+    check_removable, clone, default_branch, default_worktrees_dir, ensure_worktree, fetch_branch,
+    remove_worktree,
 };
 
 fn canonical(path: &Path) -> Result<PathBuf> {

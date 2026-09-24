@@ -1,10 +1,17 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use nix::sys::signal::{killpg, Signal};
+use nix::unistd::Pid;
 use tracing::debug;
+
+const TIMED_POLL: Duration = Duration::from_millis(20);
 
 const REPOSITORY_VARIABLES: [&str; 6] = [
     "GIT_DIR",
@@ -77,6 +84,58 @@ where
     Ok(stdout.trim().to_owned())
 }
 
+pub fn run_with_timeout<I, S>(dir: &Path, args: I, timeout: Duration) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args: Vec<OsString> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_owned())
+        .collect();
+    debug!(dir = %dir.display(), ?args, ?timeout, "running git with a timeout");
+
+    let mut child = command(dir)
+        .args(&args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .context("running git; is it installed and on PATH?")?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().context("waiting for git")? {
+            if status.success() {
+                return Ok(());
+            }
+            return Err(GitError {
+                dir: dir.to_owned(),
+                args,
+                code: status.code(),
+                stderr: String::new(),
+            }
+            .into());
+        }
+        if Instant::now() >= deadline {
+            if let Ok(group) = i32::try_from(child.id()) {
+                let _ = killpg(Pid::from_raw(group), Signal::SIGKILL);
+            }
+            let _ = child.wait();
+            let args = args
+                .iter()
+                .map(|arg| arg.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ");
+            bail!(
+                "`git {args}` in {} did not finish within {} s",
+                dir.display(),
+                timeout.as_secs_f32()
+            );
+        }
+        thread::sleep(TIMED_POLL);
+    }
+}
+
 fn command(dir: &Path) -> Command {
     let mut command = Command::new("git");
     command
@@ -141,6 +200,38 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("`git rev-parse HEAD`"), "{message}");
         assert!(message.contains("fatal: not a git repository"), "{message}");
+    }
+
+    #[test]
+    fn a_timed_run_reports_failure_and_success() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), ["init", "--quiet"]).unwrap();
+
+        run_with_timeout(dir.path(), ["status"], Duration::from_secs(30)).unwrap();
+        let err = run_with_timeout(
+            dir.path(),
+            ["rev-parse", "missing"],
+            Duration::from_secs(30),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("exit status 128"), "{err:#}");
+    }
+
+    #[test]
+    fn a_timed_run_that_hangs_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("finished");
+        let alias = format!("alias.hang=!sleep 30 && touch {}", marker.display());
+
+        let err = run_with_timeout(
+            dir.path(),
+            ["-c", alias.as_str(), "hang"],
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("did not finish"), "{err:#}");
+        assert!(!marker.exists());
     }
 
     #[test]

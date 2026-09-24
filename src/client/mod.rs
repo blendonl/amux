@@ -3,6 +3,7 @@ mod chrome;
 mod keys;
 mod listing;
 mod overlay;
+mod projects;
 mod terminal;
 #[allow(dead_code)]
 mod tree;
@@ -22,12 +23,15 @@ use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 
+use crate::cli::{Grouping, NewArgs};
 use crate::cluster::ssh::Address;
 use crate::config::{self, ServerConfig};
 use crate::paths;
+use crate::project::{self, Detected};
 use crate::protocol::{
     self, is_locale_variable, AttachedSession, ClientMessage, DebugCommand, Duplex,
-    IncompatibleServer, NewSession, Role, ServerMessage, ServerView, SessionInfo, Version,
+    IncompatibleServer, NewSession, ProjectRef, Role, ServerMessage, ServerView, SessionInfo,
+    Version,
 };
 use crate::target::{self, Target};
 use keys::{Action, PrefixRouter, DEFAULT_PREFIX};
@@ -48,28 +52,85 @@ pub struct Endpoint {
 pub async fn attach_or_create(endpoint: &Endpoint) -> Result<()> {
     let server = handshake(connect_or_start_server(endpoint).await?).await?;
     if request_sessions(server).await?.is_empty() {
-        new_session(endpoint, None, None).await
+        new_session(endpoint, NewArgs::default()).await
     } else {
         attach_session(endpoint, None).await
     }
 }
 
-pub async fn new_session(
-    endpoint: &Endpoint,
-    name: Option<String>,
-    on: Option<String>,
-) -> Result<()> {
-    if let Some(name) = &name {
+pub async fn new_session(endpoint: &Endpoint, args: NewArgs) -> Result<()> {
+    if let Some(name) = &args.name {
         target::validate_session_name(name)?;
     }
+    let cwd = env::current_dir()?;
+    let (project, branch) = binding(endpoint, &args, &cwd).await?;
     let (welcome, server) = greet_server(connect_or_start_server(endpoint).await?).await?;
     let request = ClientMessage::NewSession(NewSession {
-        on,
-        cwd: Some(env::current_dir()?),
+        on: args.on,
+        cwd: Some(cwd),
         env: locale(),
-        ..NewSession::new(name, terminal::size()?)
+        project,
+        branch,
+        clone: args.clone,
+        ..NewSession::new(args.name, terminal::size()?)
     });
     attach(server, &welcome.server_name, request).await
+}
+
+async fn binding(
+    endpoint: &Endpoint,
+    args: &NewArgs,
+    cwd: &Path,
+) -> Result<(Option<ProjectRef>, Option<String>)> {
+    if let Some(wanted) = &args.project {
+        let server = handshake(connect_or_start_server(endpoint).await?).await?;
+        if let Some(project) = projects::find(&request_cluster(server).await?, wanted)? {
+            return Ok((Some(project), args.branch.clone()));
+        }
+        let here = detect(cwd)
+            .await?
+            .filter(|detected| detected.name == *wanted || detected.id.as_str() == wanted);
+        let Some(detected) = here else {
+            bail!(
+                "unknown project: {wanted}; `amux projects` lists the projects in the cluster, \
+                 and `amux project add <path>` registers one"
+            );
+        };
+        return Ok((
+            Some(projects::from_detected(&detected)),
+            args.branch.clone(),
+        ));
+    }
+
+    let needs_project = args.branch.is_some() || args.clone;
+    let detected = match detect(cwd).await {
+        Ok(detected) => detected,
+        Err(err) if !needs_project => {
+            eprintln!("amux: starting a session without a project: {err:#}");
+            None
+        }
+        Err(err) => return Err(err),
+    };
+    let Some(detected) = detected else {
+        if needs_project {
+            bail!(
+                "-b and --clone need a project: run amux new inside a git repository, or pass -p"
+            );
+        }
+        return Ok((None, None));
+    };
+    let branch = args.branch.clone().or_else(|| detected.branch.clone());
+    if branch.is_none() && !args.clone {
+        return Ok((None, None));
+    }
+    Ok((Some(projects::from_detected(&detected)), branch))
+}
+
+async fn detect(cwd: &Path) -> Result<Option<Detected>> {
+    let cwd = cwd.to_owned();
+    tokio::task::spawn_blocking(move || project::detect(&cwd))
+        .await
+        .context("detecting the project failed")?
 }
 
 pub async fn attach_session(endpoint: &Endpoint, target: Option<String>) -> Result<()> {
@@ -82,12 +143,16 @@ pub async fn attach_session(endpoint: &Endpoint, target: Option<String>) -> Resu
     attach(server, &welcome.server_name, request).await
 }
 
-pub async fn kill_session(endpoint: &Endpoint, target: Option<String>) -> Result<()> {
+pub async fn kill_session(
+    endpoint: &Endpoint,
+    target: Option<String>,
+    remove_worktree: bool,
+) -> Result<()> {
     let target = parse_target(target)?;
     let server = connect(&endpoint.socket).await?;
     let request = ClientMessage::KillSession {
         target,
-        remove_worktree: false,
+        remove_worktree,
     };
     expect_done(request_reply(server, request).await?)
 }
@@ -114,10 +179,41 @@ fn locale() -> Vec<(String, String)> {
         .collect()
 }
 
-pub async fn list_cluster(endpoint: &Endpoint) -> Result<()> {
+pub async fn list_cluster(endpoint: &Endpoint, by: Grouping) -> Result<()> {
     let servers = request_cluster(connect(&endpoint.socket).await?).await?;
-    print!("{}", listing::sessions(&servers, SystemTime::now()));
+    let now = SystemTime::now();
+    match by {
+        Grouping::Server => print!("{}", listing::sessions(&servers, now)),
+        Grouping::Project => print!("{}", listing::sessions_by_project(&servers)),
+    }
     Ok(())
+}
+
+pub async fn list_projects(endpoint: &Endpoint) -> Result<()> {
+    let servers = request_cluster(connect(&endpoint.socket).await?).await?;
+    print!("{}", listing::projects(&servers));
+    Ok(())
+}
+
+pub async fn add_project(endpoint: &Endpoint, path: Option<PathBuf>) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let path = match path {
+        Some(path) => std::path::absolute(cwd.join(path))?,
+        None => cwd,
+    };
+    let server = handshake(connect_or_start_server(endpoint).await?).await?;
+    match request_reply(server, ClientMessage::AddProject { path }).await? {
+        ServerMessage::Project(project) => {
+            println!(
+                "registered {} ({}) at {}",
+                project.name,
+                project.id,
+                project.path.display()
+            );
+            Ok(())
+        }
+        other => bail!("unexpected reply from server: {other:?}"),
+    }
 }
 
 pub async fn list_servers(endpoint: &Endpoint) -> Result<()> {

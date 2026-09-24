@@ -5,6 +5,7 @@ mod layout;
 #[cfg_attr(not(test), allow(dead_code))]
 mod mouse;
 mod pane;
+mod projects;
 #[cfg_attr(not(test), allow(dead_code, unused_imports))]
 mod render;
 mod session;
@@ -27,14 +28,17 @@ use tracing_subscriber::EnvFilter;
 use crate::cluster::{Cluster, ClusterOptions, LinkSettings, StateSource};
 use crate::config::{Config, Incarnation, ServerId, ServerIdentity};
 use crate::paths;
+use crate::project::Registry;
 use crate::protocol::{
-    self, ClientMessage, Duplex, Event, NewSession, PeerAddress, Role, ServerMessage, ServerState,
-    ServerStatus, ServerView, SessionId, SessionInfo, Snapshot, StateEvent, Version,
+    self, ClientMessage, Duplex, Event, NewSession, PeerAddress, ProjectCheckout, Role,
+    ServerMessage, ServerState, ServerStatus, ServerView, SessionId, SessionInfo, Size, Snapshot,
+    StateEvent, Version,
 };
 use crate::target::{self, Candidate, Target};
 use connection::Origin;
 use forward::{Host, RemoteSession};
-use session::Session;
+use projects::{blocking, Projects, REGISTRY_FILE};
+use session::{Binding, Session};
 
 const LOG_FILTER_ENV: &str = "AMUX_LOG";
 const EVENT_CAPACITY: usize = 256;
@@ -62,6 +66,13 @@ pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
         "server identity"
     );
 
+    let registry_path = state_dir.join(REGISTRY_FILE);
+    let registry = blocking(move || Registry::load(&registry_path)).await?;
+    info!(
+        projects = registry.projects().len(),
+        "project registry loaded"
+    );
+
     let listener = bind(socket)?;
     let mut terminate = signal(SignalKind::terminate())?;
     let options = ClusterOptions {
@@ -72,7 +83,7 @@ pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
         state_dir: Some(state_dir),
         servers: config.servers.clone(),
     };
-    let server = Server::new(identity, config, options);
+    let server = Server::new(identity, config, registry, options);
     server.cluster.start();
     info!(socket = %socket.display(), version = %Version::current(), "server started");
 
@@ -126,6 +137,7 @@ pub struct Server {
     state: Mutex<LocalState>,
     events: broadcast::Sender<Event>,
     cluster: Arc<Cluster>,
+    projects: Projects,
     shutdown: Notify,
 }
 
@@ -135,18 +147,43 @@ struct LocalState {
     last_session_id: u64,
     seq: u64,
     peers: Vec<PeerAddress>,
+    projects: Vec<ProjectCheckout>,
+}
+
+enum SessionName {
+    Given(String),
+    Derived(String),
+    Numbered,
+}
+
+struct SessionSpec<'a> {
+    name: SessionName,
+    cwd: &'a Path,
+    size: Size,
+    env: &'a [(String, String)],
+    binding: Option<Binding>,
 }
 
 impl Server {
-    fn new(identity: ServerIdentity, config: Config, options: ClusterOptions) -> Arc<Self> {
+    fn new(
+        identity: ServerIdentity,
+        config: Config,
+        registry: Registry,
+        options: ClusterOptions,
+    ) -> Arc<Self> {
+        let state = LocalState {
+            projects: projects::checkouts(&registry),
+            ..LocalState::default()
+        };
         Arc::new_cyclic(|server: &Weak<Self>| {
             let source: Weak<dyn StateSource> = server.clone();
             Self {
                 identity,
                 config,
-                state: Mutex::default(),
+                state: Mutex::new(state),
                 events: broadcast::channel(EVENT_CAPACITY).0,
                 cluster: Cluster::new(options, source),
+                projects: Projects::new(registry),
                 shutdown: Notify::new(),
             }
         })
@@ -168,36 +205,56 @@ impl Server {
         self.identity.incarnation
     }
 
-    fn create_session(self: &Arc<Self>, request: &NewSession) -> Result<Arc<Session>> {
-        if request.project.is_some() || request.branch.is_some() || request.clone {
-            bail!("sessions bound to a project are not supported yet");
-        }
+    async fn create_session(self: &Arc<Self>, request: &NewSession) -> Result<Arc<Session>> {
         if let Some(name) = &request.name {
             target::validate_session_name(name)?;
+        }
+        if let Some(project) = &request.project {
+            return self.create_project_session(request, project).await;
+        }
+        if request.branch.is_some() || request.clone {
+            bail!("a branch or --clone needs a project");
         }
         let cwd = match &request.cwd {
             Some(cwd) => cwd.clone(),
             None => paths::home_dir()?,
         };
+        self.spawn_session(SessionSpec {
+            name: request
+                .name
+                .clone()
+                .map_or(SessionName::Numbered, SessionName::Given),
+            cwd: &cwd,
+            size: request.size,
+            env: &request.env,
+            binding: None,
+        })
+    }
+
+    fn spawn_session(self: &Arc<Self>, spec: SessionSpec<'_>) -> Result<Arc<Session>> {
         let mut state = self.state();
-        let name = match &request.name {
-            Some(name) if state.sessions.contains_key(name) => bail!("duplicate session: {name}"),
-            Some(name) => name.clone(),
-            None => next_free_name(&state.sessions),
+        let name = match spec.name {
+            SessionName::Given(name) if state.sessions.contains_key(&name) => {
+                bail!("duplicate session: {name}")
+            }
+            SessionName::Given(name) => name,
+            SessionName::Derived(base) => free_name_like(&state.sessions, base),
+            SessionName::Numbered => next_free_name(&state.sessions),
         };
         state.last_session_id += 1;
         let id = SessionId(state.last_session_id);
         let session = Arc::new(Session::spawn(
             id,
             name.clone(),
-            &cwd,
-            request.size,
-            &request.env,
+            spec.cwd,
+            spec.size,
+            spec.env,
+            spec.binding,
         )?);
         state.sessions.insert(name.clone(), Arc::clone(&session));
         self.publish(&mut state, StateEvent::SessionCreated(session.info()));
         drop(state);
-        info!(session = %name, %id, "session created");
+        info!(session = %name, %id, cwd = %spec.cwd.display(), "session created");
 
         tokio::spawn(Arc::clone(self).watch_session(Arc::clone(&session)));
         Ok(session)
@@ -286,7 +343,12 @@ impl Server {
         }))
     }
 
-    fn host_for_new_session(&self, on: Option<&str>, origin: Origin) -> Result<Option<ServerId>> {
+    fn host_for_new_session(&self, request: &NewSession, origin: Origin) -> Result<Option<Host>> {
+        let on = match (&request.on, origin) {
+            (Some(on), _) => Some(on.as_str()),
+            (None, Origin::Local) => self.default_server(request.project.as_ref()),
+            (None, Origin::Peer) => None,
+        };
         let Some(on) = on.filter(|on| *on != self.identity.name) else {
             return Ok(None);
         };
@@ -302,7 +364,11 @@ impl Server {
         if !peers.iter().any(|(name, _)| name == on) {
             bail!("unknown server: {on}");
         }
-        self.reachable_peer(on, &peers).map(Some)
+        let peer = self.reachable_peer(on, &peers)?;
+        Ok(Some(Host {
+            peer,
+            name: on.to_owned(),
+        }))
     }
 
     fn reachable_peer(&self, name: &str, peers: &[(String, Option<ServerId>)]) -> Result<ServerId> {
@@ -380,7 +446,7 @@ impl Server {
             version: Some(Version::current()),
             status: ServerStatus::Local,
             sessions: self.list_sessions(),
-            projects: Vec::new(),
+            projects: self.state().projects.clone(),
         };
         let mut servers = vec![local];
         servers.extend(self.cluster.view());
@@ -447,7 +513,7 @@ impl StateSource for Server {
                     .values()
                     .map(|session| session.info())
                     .collect(),
-                projects: Vec::new(),
+                projects: state.projects.clone(),
                 peers: state.peers.clone(),
             },
         };
@@ -489,6 +555,16 @@ fn millis(time: SystemTime) -> u64 {
         .map_or(0, |elapsed| {
             u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
         })
+}
+
+fn free_name_like(sessions: &BTreeMap<String, Arc<Session>>, base: String) -> String {
+    if !sessions.contains_key(&base) {
+        return base;
+    }
+    (2..)
+        .map(|suffix: usize| format!("{base}-{suffix}"))
+        .find(|name| !sessions.contains_key(name))
+        .expect("an unused suffix always exists")
 }
 
 fn next_free_name(sessions: &BTreeMap<String, Arc<Session>>) -> String {

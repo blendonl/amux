@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -60,7 +60,7 @@ pub async fn handle(
     }
 
     let routed = match request {
-        ClientMessage::NewSession(request) => new_session_route(&server, request, origin),
+        ClientMessage::NewSession(request) => new_session_route(&server, request, origin).await,
         ClientMessage::Attach { target, size } => server
             .resolve(&target, origin)
             .map(|resolved| (Route::from(resolved), size)),
@@ -99,6 +99,13 @@ pub async fn handle(
             let reply = server.cluster().remove_server(&name);
             return send(&client.outgoing, done_or_error(reply)).await;
         }
+        ClientMessage::AddProject { path } => {
+            let reply = match server.register_project(path).await {
+                Ok(project) => ServerMessage::Project(project),
+                Err(err) => ServerMessage::Error(format!("{err:#}")),
+            };
+            return send(&client.outgoing, reply).await;
+        }
         ClientMessage::Debug(DebugCommand::Links) => {
             let links = ServerMessage::Links(server.cluster().links());
             return send(&client.outgoing, links).await;
@@ -133,16 +140,15 @@ fn allowed_over_a_channel(request: &ClientMessage) -> bool {
     )
 }
 
-fn new_session_route(
+async fn new_session_route(
     server: &Arc<Server>,
     request: NewSession,
     origin: Origin,
 ) -> Result<(Route, Size)> {
     let size = request.size;
-    match server.host_for_new_session(request.on.as_deref(), origin)? {
-        None => Ok((Route::Local(server.create_session(&request)?), size)),
-        Some(peer) => {
-            let name = request.on.clone().unwrap_or_default();
+    match server.host_for_new_session(&request, origin)? {
+        None => Ok((Route::Local(server.create_session(&request).await?), size)),
+        Some(host) => {
             let forwarded = NewSession {
                 on: None,
                 cwd: None,
@@ -150,7 +156,7 @@ fn new_session_route(
             };
             Ok((
                 Route::Remote {
-                    host: Host { peer, name },
+                    host,
                     opening: Opening::Create(Box::new(forwarded)),
                 },
                 size,
@@ -165,10 +171,10 @@ async fn kill_session(
     remove_worktree: bool,
     origin: Origin,
 ) -> Result<()> {
-    if remove_worktree {
-        bail!("removing worktrees is not supported yet");
-    }
     match server.resolve(target, origin)? {
+        Resolved::Local(session) if remove_worktree => {
+            server.kill_and_remove_worktree(&session).await
+        }
         Resolved::Local(session) => {
             server.kill_session(&session);
             Ok(())
