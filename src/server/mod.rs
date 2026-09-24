@@ -1,5 +1,11 @@
 mod connection;
+#[cfg_attr(not(test), allow(dead_code))]
+mod layout;
+#[cfg_attr(not(test), allow(dead_code))]
+mod mouse;
 mod pane;
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
+mod render;
 mod session;
 
 use std::collections::BTreeMap;
