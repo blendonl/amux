@@ -6,7 +6,7 @@ use tracing::{debug, warn};
 
 use super::session::Session;
 use super::Server;
-use crate::protocol::{ClientMessage, Duplex, ServerMessage, Size};
+use crate::protocol::{ClientMessage, DebugCommand, Duplex, ServerMessage, Size};
 
 pub type ClientConnection = Duplex<ClientMessage, ServerMessage>;
 
@@ -27,6 +27,26 @@ pub async fn handle(server: Arc<Server>, mut client: ClientConnection) -> Result
             let sessions = ServerMessage::Sessions(server.list_sessions());
             return send(&client.outgoing, sessions).await;
         }
+        ClientMessage::ListCluster => {
+            let servers = ServerMessage::Cluster(server.cluster_view());
+            return send(&client.outgoing, servers).await;
+        }
+        ClientMessage::AddServer { name, server: peer } => {
+            let reply = server.cluster().add_server(name, peer);
+            return send(&client.outgoing, done_or_error(reply)).await;
+        }
+        ClientMessage::RemoveServer { name } => {
+            let reply = server.cluster().remove_server(&name);
+            return send(&client.outgoing, done_or_error(reply)).await;
+        }
+        ClientMessage::Debug(DebugCommand::Links) => {
+            let links = ServerMessage::Links(server.cluster().links());
+            return send(&client.outgoing, links).await;
+        }
+        ClientMessage::Debug(DebugCommand::DropLink(peer)) => {
+            let reply = server.cluster().drop_link(&peer);
+            return send(&client.outgoing, done_or_error(reply)).await;
+        }
         ClientMessage::KillServer => {
             server.shut_down();
             return Ok(());
@@ -35,17 +55,29 @@ pub async fn handle(server: Arc<Server>, mut client: ClientConnection) -> Result
     };
 
     match target {
-        Ok((session, size)) => attach(&session, size, client).await,
+        Ok((session, size)) => attach(&server, &session, size, client).await,
         Err(err) => send(&client.outgoing, ServerMessage::Error(format!("{err:#}"))).await,
     }
 }
 
-async fn attach(session: &Session, size: Size, client: ClientConnection) -> Result<()> {
+fn done_or_error(result: Result<()>) -> ServerMessage {
+    match result {
+        Ok(()) => ServerMessage::Done,
+        Err(err) => ServerMessage::Error(format!("{err:#}")),
+    }
+}
+
+async fn attach(
+    server: &Arc<Server>,
+    session: &Arc<Session>,
+    size: Size,
+    client: ClientConnection,
+) -> Result<()> {
     let Duplex {
         mut incoming,
         outgoing,
     } = client;
-    let _client = session.track_client();
+    let _client = server.track_client(session);
     let pane = session.active_pane();
     pane.resize(size)?;
 
@@ -77,7 +109,10 @@ async fn attach(session: &Session, size: Size, client: ClientConnection) -> Resu
                 dirty = true;
             }
             message = incoming.recv() => match message {
-                Some(ClientMessage::Input(bytes)) => pane.write_input(bytes)?,
+                Some(ClientMessage::Input(bytes)) => {
+                    session.record_input();
+                    pane.write_input(bytes)?;
+                }
                 Some(ClientMessage::Resize(size)) => {
                     pane.resize(size)?;
                     dirty = true;

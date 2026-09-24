@@ -1,4 +1,5 @@
 mod keys;
+mod listing;
 mod terminal;
 
 use std::env;
@@ -7,7 +8,7 @@ use std::fs::OpenOptions;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
 use nix::sys::signal::{kill, Signal};
@@ -16,9 +17,12 @@ use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 
+use crate::cluster::ssh::Address;
+use crate::config::{self, ServerConfig};
 use crate::paths;
 use crate::protocol::{
-    self, ClientMessage, Duplex, IncompatibleServer, Role, ServerMessage, SessionInfo, Version,
+    self, ClientMessage, DebugCommand, Duplex, IncompatibleServer, Role, ServerMessage, ServerView,
+    SessionInfo, Version,
 };
 use keys::{Action, PrefixRouter, DEFAULT_PREFIX};
 use terminal::RawTerminal;
@@ -63,17 +67,49 @@ pub async fn attach_session(endpoint: &Endpoint, target: Option<String>) -> Resu
     attach(server, request).await
 }
 
-pub async fn list_sessions(endpoint: &Endpoint) -> Result<()> {
+pub async fn list_cluster(endpoint: &Endpoint) -> Result<()> {
+    let servers = request_cluster(connect(&endpoint.socket).await?).await?;
+    print!("{}", listing::sessions(&servers, SystemTime::now()));
+    Ok(())
+}
+
+pub async fn list_servers(endpoint: &Endpoint) -> Result<()> {
+    let servers = request_cluster(connect(&endpoint.socket).await?).await?;
+    print!("{}", listing::servers(&servers, SystemTime::now()));
+    Ok(())
+}
+
+pub async fn add_server(endpoint: &Endpoint, name: String, server: ServerConfig) -> Result<()> {
+    server.address.parse::<Address>()?;
+    config::add_server(&config_path(endpoint)?, &name, &server)?;
+    notify_running_server(endpoint, ClientMessage::AddServer { name, server }).await
+}
+
+pub async fn remove_server(endpoint: &Endpoint, name: String) -> Result<()> {
+    config::remove_server(&config_path(endpoint)?, &name)?;
+    notify_running_server(endpoint, ClientMessage::RemoveServer { name }).await
+}
+
+pub async fn debug_links(endpoint: &Endpoint) -> Result<()> {
     let server = connect(&endpoint.socket).await?;
-    for session in request_sessions(server).await? {
-        let status = if session.attached_clients > 0 {
-            " (attached)"
-        } else {
-            ""
-        };
-        println!("{}{status}", session.name);
+    let ServerMessage::Links(links) =
+        request(server, ClientMessage::Debug(DebugCommand::Links)).await?
+    else {
+        bail!("unexpected reply from server");
+    };
+    for link in links {
+        let direction = if link.dialed { "dialed" } else { "accepted" };
+        println!(
+            "{} {} {direction} {} {}",
+            link.peer, link.name, link.incarnation, link.state
+        );
     }
     Ok(())
+}
+
+pub async fn drop_link(endpoint: &Endpoint, peer: String) -> Result<()> {
+    let server = connect(&endpoint.socket).await?;
+    expect_done(request(server, ClientMessage::Debug(DebugCommand::DropLink(peer))).await?)
 }
 
 pub async fn kill_server(endpoint: &Endpoint) -> Result<()> {
@@ -121,17 +157,52 @@ pub async fn handshake(mut stream: UnixStream) -> Result<ServerConnection> {
     Ok(into_connection(stream))
 }
 
-async fn request_sessions(server: ServerConnection) -> Result<Vec<SessionInfo>> {
+async fn request(server: ServerConnection, message: ClientMessage) -> Result<ServerMessage> {
     let Duplex {
         mut incoming,
         outgoing,
     } = server;
-    send(&outgoing, ClientMessage::ListSessions).await?;
+    send(&outgoing, message).await?;
     match incoming.recv().await {
-        Some(ServerMessage::Sessions(sessions)) => Ok(sessions),
         Some(ServerMessage::Error(message)) => bail!(message),
-        Some(other) => bail!("unexpected reply from server: {other:?}"),
+        Some(reply) => Ok(reply),
         None => bail!("server closed the connection"),
+    }
+}
+
+async fn request_sessions(server: ServerConnection) -> Result<Vec<SessionInfo>> {
+    match request(server, ClientMessage::ListSessions).await? {
+        ServerMessage::Sessions(sessions) => Ok(sessions),
+        other => bail!("unexpected reply from server: {other:?}"),
+    }
+}
+
+async fn request_cluster(server: ServerConnection) -> Result<Vec<ServerView>> {
+    match request(server, ClientMessage::ListCluster).await? {
+        ServerMessage::Cluster(servers) => Ok(servers),
+        other => bail!("unexpected reply from server: {other:?}"),
+    }
+}
+
+fn expect_done(reply: ServerMessage) -> Result<()> {
+    match reply {
+        ServerMessage::Done => Ok(()),
+        other => bail!("unexpected reply from server: {other:?}"),
+    }
+}
+
+async fn notify_running_server(endpoint: &Endpoint, message: ClientMessage) -> Result<()> {
+    let Ok(stream) = UnixStream::connect(&endpoint.socket).await else {
+        return Ok(());
+    };
+    let server = handshake(stream).await?;
+    expect_done(request(server, message).await?)
+}
+
+fn config_path(endpoint: &Endpoint) -> Result<PathBuf> {
+    match &endpoint.config {
+        Some(path) => Ok(path.clone()),
+        None => paths::config_path(),
     }
 }
 
@@ -223,7 +294,7 @@ async fn connect(socket: &Path) -> Result<ServerConnection> {
     handshake(connect_stream(socket).await?).await
 }
 
-async fn connect_stream(socket: &Path) -> Result<UnixStream> {
+pub async fn connect_stream(socket: &Path) -> Result<UnixStream> {
     UnixStream::connect(socket)
         .await
         .with_context(|| format!("no server running on {}", socket.display()))

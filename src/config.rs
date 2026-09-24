@@ -8,10 +8,12 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use toml_edit::{DocumentMut, Item, Table};
 
 use crate::paths;
 
 const DEFAULT_PROJECTS_DIR: &str = "projects";
+const SERVERS_TABLE: &str = "servers";
 const SERVER_ID_FILE: &str = "server-id";
 const SERVER_ID_FILE_MODE: u32 = 0o600;
 const SERVER_ID_HEX_DIGITS: usize = 32;
@@ -24,7 +26,7 @@ pub struct Config {
     pub projects: BTreeMap<String, ProjectConfig>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub address: String,
@@ -88,6 +90,64 @@ impl Config {
             projects,
         })
     }
+}
+
+pub fn add_server(path: &Path, name: &str, server: &ServerConfig) -> Result<()> {
+    edit(path, |document| {
+        let servers = document
+            .entry(SERVERS_TABLE)
+            .or_insert_with(implicit_table)
+            .as_table_mut()
+            .context("`servers` is not a table")?;
+        if servers.contains_key(name) {
+            bail!("{name} is already in the config");
+        }
+        let mut entry = Table::new();
+        entry.insert("address", toml_edit::value(server.address.as_str()));
+        if let Some(amux_path) = &server.amux_path {
+            entry.insert("amux_path", toml_edit::value(amux_path.as_str()));
+        }
+        if let Some(socket) = &server.socket {
+            entry.insert("socket", toml_edit::value(socket.as_str()));
+        }
+        servers.insert(name, Item::Table(entry));
+        Ok(())
+    })
+}
+
+pub fn remove_server(path: &Path, name: &str) -> Result<()> {
+    edit(path, |document| {
+        document
+            .get_mut(SERVERS_TABLE)
+            .and_then(Item::as_table_like_mut)
+            .and_then(|servers| servers.remove(name))
+            .with_context(|| format!("no server named {name} in the config"))?;
+        Ok(())
+    })
+}
+
+fn edit(path: &Path, change: impl FnOnce(&mut DocumentMut) -> Result<()>) -> Result<()> {
+    let text = read_optional(path)?.unwrap_or_default();
+    let mut document: DocumentMut = text
+        .parse()
+        .with_context(|| format!("parsing {}", path.display()))?;
+    change(&mut document).with_context(|| format!("editing {}", path.display()))?;
+    let edited = document.to_string();
+    Config::parse(&edited, &paths::home_dir()?, &hostname()?)
+        .with_context(|| format!("the edited {} would not load", path.display()))?;
+
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let temporary = path.with_extension("toml.tmp");
+    fs::write(&temporary, edited).with_context(|| format!("writing {}", temporary.display()))?;
+    fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))
+}
+
+fn implicit_table() -> Item {
+    let mut table = Table::new();
+    table.set_implicit(true);
+    Item::Table(table)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,6 +410,76 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(SERVER_ID_FILE), "not-an-id\n").unwrap();
         assert!(ServerIdentity::load(dir.path(), "a".into()).is_err());
+    }
+
+    fn laptop() -> ServerConfig {
+        ServerConfig {
+            address: "ssh://laptop".into(),
+            amux_path: None,
+            socket: None,
+        }
+    }
+
+    #[test]
+    fn adding_a_server_creates_the_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("amux").join("config.toml");
+        let server = ServerConfig {
+            amux_path: Some("~/.cargo/bin/amux".into()),
+            socket: Some("dev".into()),
+            ..laptop()
+        };
+
+        add_server(&path, "laptop", &server).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[servers.laptop]\naddress = \"ssh://laptop\"\namux_path = \"~/.cargo/bin/amux\"\nsocket = \"dev\"\n"
+        );
+    }
+
+    #[test]
+    fn adding_and_removing_servers_keeps_the_rest_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original =
+            "# my machines\nname = \"desk\"\n\n[projects.amux]\ndefault_server = \"desk\"\n";
+        fs::write(&path, original).unwrap();
+
+        add_server(&path, "laptop", &laptop()).unwrap();
+        let added = fs::read_to_string(&path).unwrap();
+        assert!(added.starts_with(original), "{added}");
+        assert!(
+            added.contains("[servers.laptop]\naddress = \"ssh://laptop\"\n"),
+            "{added}"
+        );
+
+        remove_server(&path, "laptop").unwrap();
+        let removed = fs::read_to_string(&path).unwrap();
+        assert!(removed.starts_with(original), "{removed}");
+        assert!(!removed.contains("laptop"), "{removed}");
+    }
+
+    #[test]
+    fn adding_a_known_server_or_removing_an_unknown_one_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        add_server(&path, "laptop", &laptop()).unwrap();
+
+        let duplicate = add_server(&path, "laptop", &laptop()).unwrap_err();
+        assert!(format!("{duplicate:#}").contains("already in the config"));
+        let missing = remove_server(&path, "desk").unwrap_err();
+        assert!(format!("{missing:#}").contains("no server named desk"));
+    }
+
+    #[test]
+    fn an_edit_that_breaks_the_config_is_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "servers = 3\n").unwrap();
+
+        assert!(add_server(&path, "laptop", &laptop()).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "servers = 3\n");
     }
 
     #[test]

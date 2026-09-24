@@ -2,7 +2,8 @@ mod common;
 
 use std::fs;
 
-use amux::protocol::{self, Role, Version, PROTOCOL_MAJOR};
+use amux::config::{Incarnation, ServerId};
+use amux::protocol::{self, Hello, PeerMessage, Role, Version, PROTOCOL_MAJOR};
 use common::TestServer;
 use tokio::net::UnixStream;
 
@@ -39,14 +40,32 @@ async fn a_client_with_another_major_version_is_refused_with_both_versions() {
 }
 
 #[tokio::test]
-async fn peer_greetings_are_refused_for_now() {
-    let server = TestServer::start();
+async fn a_peer_greeting_is_answered_with_a_hello() {
+    let server = TestServer::builder().name("desk").start();
     let mut stream = UnixStream::connect(server.socket()).await.unwrap();
-
     protocol::greet(&mut stream, Role::Peer, &Version::current())
         .await
         .unwrap();
-    server.wait_for_log("does not accept peer links");
+
+    let visitor = Hello {
+        id: ServerId::random().unwrap(),
+        incarnation: Incarnation::random().unwrap(),
+        name: "visitor".into(),
+        version: Version::current(),
+        peers: Vec::new(),
+    };
+    protocol::write_message(&mut stream, &PeerMessage::Hello(visitor))
+        .await
+        .unwrap();
+
+    match protocol::read_message::<_, PeerMessage>(&mut stream).await {
+        Ok(Some(PeerMessage::Hello(hello))) => {
+            assert_eq!(hello.name, "desk");
+            assert_eq!(hello.id.to_string(), server.server_id());
+            assert_eq!(hello.version, Version::current());
+        }
+        other => panic!("expected a hello, got {other:?}"),
+    }
 }
 
 #[test]

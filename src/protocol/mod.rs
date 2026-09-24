@@ -1,5 +1,6 @@
 mod client;
 mod greeting;
+mod peer;
 
 use std::io;
 
@@ -10,10 +11,16 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-pub use client::{ClientMessage, ServerMessage, SessionInfo, Size};
+pub use client::{
+    ClientMessage, DebugCommand, LinkInfo, LinkState, ProjectCheckout, ServerMessage, ServerStatus,
+    ServerView, SessionId, SessionInfo, Size, WindowSummary,
+};
 pub use greeting::{
     accept, greet, Greeting, IncompatibleServer, Role, Version, Welcome, MAGIC, PROTOCOL_MAJOR,
     PROTOCOL_MINOR, RELEASE,
+};
+pub use peer::{
+    Event, Farewell, Hello, PeerAddress, PeerMessage, Refusal, ServerState, Snapshot, StateEvent,
 };
 
 const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
@@ -47,7 +54,7 @@ where
     write_frame(writer, &encode(message)?).await
 }
 
-fn encode<T: Serialize>(message: &T) -> Result<Vec<u8>> {
+pub(crate) fn encode<T: Serialize>(message: &T) -> Result<Vec<u8>> {
     let payload = postcard::to_stdvec(message)?;
     let len = u32::try_from(payload.len())?;
     if len > MAX_FRAME_LEN {
@@ -56,7 +63,7 @@ fn encode<T: Serialize>(message: &T) -> Result<Vec<u8>> {
     Ok(payload)
 }
 
-async fn write_frame<W>(writer: &mut W, payload: &[u8]) -> Result<()>
+pub(crate) async fn write_frame<W>(writer: &mut W, payload: &[u8]) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -77,7 +84,7 @@ where
     }
 }
 
-async fn read_frame<R>(reader: &mut R) -> Result<Option<Vec<u8>>>
+pub(crate) async fn read_frame<R>(reader: &mut R) -> Result<Option<Vec<u8>>>
 where
     R: AsyncRead + Unpin,
 {

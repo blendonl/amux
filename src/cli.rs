@@ -62,14 +62,29 @@ pub enum Command {
     )]
     Attach(AttachArgs),
 
-    #[command(visible_aliases = ["ls", "list-sessions"], about = "List sessions")]
+    #[command(
+        visible_aliases = ["ls", "list-sessions"],
+        about = "List the sessions on every server in the cluster"
+    )]
     List,
+
+    #[command(about = "List the servers in the cluster, or add and remove them")]
+    Servers(ServersArgs),
 
     #[command(about = "Stop the server and every session it owns")]
     KillServer,
 
     #[command(hide = true)]
     Server,
+
+    #[command(
+        hide = true,
+        about = "Pipe stdin and stdout to the server, starting it if needed"
+    )]
+    Bridge(BridgeArgs),
+
+    #[command(hide = true, subcommand)]
+    Debug(DebugAction),
 }
 
 #[derive(Debug, Default, Args)]
@@ -86,4 +101,64 @@ pub struct AttachArgs {
         help = "Session to attach to, defaults to the most recent one"
     )]
     pub target: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ServersArgs {
+    #[command(subcommand)]
+    pub action: Option<ServersAction>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServersAction {
+    #[command(about = "Add a server to the config and link to it")]
+    Add(AddServerArgs),
+
+    #[command(visible_alias = "rm", about = "Remove a server from the config")]
+    Remove {
+        #[arg(help = "Name of the server in the config")]
+        name: String,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct AddServerArgs {
+    #[arg(help = "Name for the server")]
+    pub name: String,
+
+    #[arg(help = "ssh://[user@]host[:port] or exec:<command>")]
+    pub address: String,
+
+    #[arg(
+        long,
+        help = "Path of amux on that machine, defaults to amux on its PATH"
+    )]
+    pub amux_path: Option<String>,
+
+    #[arg(
+        long,
+        help = "Socket name of the server on that machine, defaults to this server's"
+    )]
+    pub socket: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct BridgeArgs {
+    #[arg(
+        long,
+        help = "Fail instead of starting the server when it is not running"
+    )]
+    pub no_start: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DebugAction {
+    #[command(about = "List the live peer links")]
+    Links,
+
+    #[command(about = "Drop the link to a peer, which then reconnects")]
+    DropLink {
+        #[arg(help = "Name or id of the peer")]
+        peer: String,
+    },
 }

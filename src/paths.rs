@@ -33,13 +33,17 @@ pub fn config_path() -> Result<PathBuf> {
         .join(CONFIG_FILE))
 }
 
-pub fn state_dir(socket: &Path) -> Result<PathBuf> {
-    let socket_name = socket
+pub fn socket_name(socket: &Path) -> Result<String> {
+    let name = socket
         .file_name()
         .with_context(|| format!("{} has no file name", socket.display()))?;
+    Ok(name.to_string_lossy().into_owned())
+}
+
+pub fn state_dir(socket: &Path) -> Result<PathBuf> {
     let dir = xdg_dir("XDG_STATE_HOME", ".local/state")?
         .join("amux")
-        .join(socket_name);
+        .join(socket_name(socket)?);
 
     DirBuilder::new()
         .recursive(true)

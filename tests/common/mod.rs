@@ -7,6 +7,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,7 +27,10 @@ pub const TIMEOUT: Duration = Duration::from_secs(10);
 pub const SIZE: Size = Size { rows: 24, cols: 80 };
 pub const DETACH: &str = "\x02d";
 const POLL: Duration = Duration::from_millis(10);
+const COMMAND_POLL: Duration = Duration::from_millis(50);
 const SOCKET_NAME: &str = "amux.sock";
+
+static SERVER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub struct TestServerBuilder {
     name: String,
@@ -49,6 +53,11 @@ impl TestServerBuilder {
     pub fn env(mut self, key: &str, value: &str) -> Self {
         self.env.push((key.to_owned(), value.to_owned()));
         self
+    }
+
+    pub fn peer(self, peer: &TestServer) -> Self {
+        let entry = peer_entry(peer);
+        self.config(&entry)
     }
 
     pub fn start(self) -> TestServer {
@@ -112,10 +121,40 @@ pub struct TestServer {
     process: Option<Child>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkLine {
+    pub peer: String,
+    pub name: String,
+    pub dialed: bool,
+    pub incarnation: String,
+    pub state: String,
+}
+
+pub fn linked<const N: usize>(builders: [TestServerBuilder; N]) -> [TestServer; N] {
+    let servers = builders.map(TestServerBuilder::start);
+    for (index, server) in servers.iter().enumerate() {
+        for (other, peer) in servers.iter().enumerate() {
+            if index != other {
+                server.run_ok(&["servers", "add", peer.name(), &peer.bridge_address()]);
+            }
+        }
+    }
+    servers
+}
+
+fn peer_entry(peer: &TestServer) -> String {
+    format!(
+        "\n[servers.{:?}]\naddress = {:?}\n",
+        peer.name(),
+        peer.bridge_address()
+    )
+}
+
 impl TestServer {
     pub fn builder() -> TestServerBuilder {
+        let count = SERVER_COUNT.fetch_add(1, Ordering::Relaxed);
         TestServerBuilder {
-            name: "test".into(),
+            name: format!("test-{count}"),
             config: String::new(),
             env: Vec::new(),
         }
@@ -159,6 +198,45 @@ impl TestServer {
 
     pub fn log(&self) -> String {
         fs::read_to_string(self.log_path()).unwrap_or_default()
+    }
+
+    pub fn server_id(&self) -> String {
+        fs::read_to_string(self.state_dir().join("server-id"))
+            .expect("reading the server id")
+            .trim()
+            .to_owned()
+    }
+
+    pub fn pid(&self) -> Pid {
+        let child = self.process.as_ref().expect("a server process");
+        Pid::from_raw(child.id() as i32)
+    }
+
+    pub fn bridge_address(&self) -> String {
+        let root = self.root();
+        let argv = [
+            "env".to_owned(),
+            format!("HOME={}", self.home().display()),
+            format!("XDG_RUNTIME_DIR={}", root.join("runtime").display()),
+            format!("XDG_STATE_HOME={}", root.join("state").display()),
+            format!("XDG_CONFIG_HOME={}", root.join("config").display()),
+            format!("AMUX_CONFIG={}", self.config_path().display()),
+            AMUX.to_owned(),
+            "-S".to_owned(),
+            self.socket.display().to_string(),
+            "bridge".to_owned(),
+        ];
+        format!("exec:{}", shell_words::join(argv))
+    }
+
+    pub fn add_peer(&self, peer: &TestServer) {
+        let mut config = File::options()
+            .append(true)
+            .open(self.config_path())
+            .expect("opening the config");
+        config
+            .write_all(peer_entry(peer).as_bytes())
+            .expect("adding a peer to the config");
     }
 
     pub fn command(&self) -> Command {
@@ -244,6 +322,71 @@ impl TestServer {
         }
     }
 
+    pub fn wait_for_log_count(&self, text: &str, count: usize) -> String {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let log = self.log();
+            if log.matches(text).count() >= count {
+                return log;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {count} of {text:?} in the server log:\n{log}"
+            );
+            thread::sleep(POLL);
+        }
+    }
+
+    pub fn wait_for_output(
+        &self,
+        args: &[&str],
+        what: &str,
+        done: impl Fn(&str) -> bool,
+    ) -> String {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let output = self.run(args);
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            if output.status.success() && done(&stdout) {
+                return stdout;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}; `amux {}` printed:\n{stdout}{}\nserver log:\n{}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr),
+                self.log()
+            );
+            thread::sleep(COMMAND_POLL);
+        }
+    }
+
+    pub fn wait_for_ls(&self, what: &str, done: impl Fn(&Listing) -> bool) -> Listing {
+        Listing::parse(&self.wait_for_output(&["ls"], what, |ls| done(&Listing::parse(ls))))
+    }
+
+    pub fn links(&self) -> Vec<LinkLine> {
+        parse_links(&self.run_ok(&["debug", "links"]))
+    }
+
+    pub fn wait_for_links(&self, what: &str, done: impl Fn(&[LinkLine]) -> bool) -> Vec<LinkLine> {
+        parse_links(
+            &self.wait_for_output(&["debug", "links"], what, |links| done(&parse_links(links))),
+        )
+    }
+
+    pub fn create_session(&self, name: &str) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("building a runtime");
+        runtime.block_on(async {
+            let mut client = self.client().await;
+            client.new_session(Some(name)).await;
+            client.detach().await;
+        });
+    }
+
     pub async fn client(&self) -> TestClient {
         TestClient::connect(&self.socket, &self.home()).await
     }
@@ -275,22 +418,117 @@ impl TestServer {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        match self.process.take() {
-            Some(child) => stop(child),
-            None if self.is_listening() => {
-                if let Ok(child) = self
-                    .command()
-                    .arg("kill-server")
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                {
-                    stop_after_timeout(child);
+        if let Some(child) = self.process.take() {
+            stop(child);
+        }
+        if self.is_listening() {
+            if let Ok(child) = self
+                .command()
+                .arg("kill-server")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                stop_after_timeout(child);
+            }
+        }
+    }
+}
+
+fn parse_links(output: &str) -> Vec<LinkLine> {
+    output
+        .lines()
+        .map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let [peer, name, direction, incarnation, state] = fields[..] else {
+                panic!("unexpected link line {line:?}");
+            };
+            LinkLine {
+                peer: peer.to_owned(),
+                name: name.to_owned(),
+                dialed: direction == "dialed",
+                incarnation: incarnation.to_owned(),
+                state: state.to_owned(),
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Listing {
+    pub servers: Vec<ListedServer>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListedServer {
+    pub name: String,
+    pub status: String,
+    pub sessions: Vec<ListedSession>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListedSession {
+    pub name: String,
+    pub details: String,
+}
+
+impl Listing {
+    pub fn parse(output: &str) -> Self {
+        let mut servers: Vec<ListedServer> = Vec::new();
+        for line in output.lines() {
+            match line.strip_prefix("  ") {
+                Some(session) => {
+                    let (name, details) = split_first_word(session);
+                    servers
+                        .last_mut()
+                        .expect("a session line before any server")
+                        .sessions
+                        .push(ListedSession { name, details });
+                }
+                None => {
+                    let (name, status) = split_first_word(line);
+                    servers.push(ListedServer {
+                        name,
+                        status,
+                        sessions: Vec::new(),
+                    });
                 }
             }
-            None => {}
         }
+        Self { servers }
+    }
+
+    pub fn server(&self, name: &str) -> Option<&ListedServer> {
+        self.servers.iter().find(|server| server.name == name)
+    }
+
+    pub fn status(&self, name: &str) -> Option<&str> {
+        self.server(name).map(|server| server.status.as_str())
+    }
+
+    pub fn sessions(&self, name: &str) -> Vec<&str> {
+        self.server(name)
+            .map(|server| {
+                server
+                    .sessions
+                    .iter()
+                    .map(|session| session.name.as_str())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn is_online(&self, name: &str) -> bool {
+        self.status(name)
+            .is_some_and(|status| status == "online" || status.ends_with(" ms"))
+    }
+}
+
+fn split_first_word(text: &str) -> (String, String) {
+    match text.split_once(' ') {
+        Some((first, rest)) => (first.to_owned(), rest.trim().to_owned()),
+        None => (text.to_owned(), String::new()),
     }
 }
 

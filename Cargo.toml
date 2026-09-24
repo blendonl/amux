@@ -16,8 +16,10 @@ nix = { version = "0.31.3", features = ["hostname", "process", "signal", "user"]
 portable-pty = "0.9.0"
 postcard = { version = "1.1.3", features = ["use-std"] }
 serde = { version = "1.0.229", features = ["derive"] }
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time"] }
+shell-words = "1.1.1"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time", "process", "io-std"] }
 toml = "1.0.7"
+toml_edit = "0.25.5"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 vt100 = "0.16.2"

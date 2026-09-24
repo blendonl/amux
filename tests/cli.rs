@@ -7,9 +7,22 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{TestServer, DETACH, TIMEOUT};
+use common::{Listing, TestServer, DETACH, TIMEOUT};
 
 const FAKE_OLD_SERVER_SOCKET: &str = "AMUX_TEST_FAKE_OLD_SERVER_SOCKET";
+
+fn listed_sessions(server: &TestServer, command: &str) -> Vec<String> {
+    let listing = Listing::parse(&server.run_ok(&[command]));
+    assert_eq!(listing.servers.len(), 1, "{listing:?}");
+    let local = &listing.servers[0];
+    assert_eq!(local.name, server.name());
+    assert_eq!(local.status, "(this server)");
+    local
+        .sessions
+        .iter()
+        .map(|session| session.name.clone())
+        .collect()
+}
 
 #[test]
 fn bare_amux_starts_the_server_creates_a_session_and_later_reattaches() {
@@ -21,14 +34,14 @@ fn bare_amux_starts_the_server_creates_a_session_and_later_reattaches() {
     first.type_text(DETACH);
     first.wait_for_text("[detached (from session 0)]");
     assert!(first.wait_for_exit().success());
-    assert_eq!(server.run_ok(&["ls"]), "0\n");
+    assert_eq!(listed_sessions(&server, "ls"), ["0"]);
 
     let mut second = server.terminal(&[]);
     second.wait_for_text("42");
     second.type_text(DETACH);
     second.wait_for_text("[detached (from session 0)]");
     assert!(second.wait_for_exit().success());
-    assert_eq!(server.run_ok(&["ls"]), "0\n");
+    assert_eq!(listed_sessions(&server, "ls"), ["0"]);
 }
 
 #[test]
@@ -50,8 +63,8 @@ fn the_readme_commands_work() {
         assert!(attached.wait_for_exit().success());
     }
 
-    assert_eq!(server.run_ok(&["ls"]), "work\n");
-    assert_eq!(server.run_ok(&["list-sessions"]), "work\n");
+    assert_eq!(listed_sessions(&server, "ls"), ["work"]);
+    assert_eq!(listed_sessions(&server, "list-sessions"), ["work"]);
 
     server.run_ok(&["kill-server"]);
     assert!(!server.is_listening());
