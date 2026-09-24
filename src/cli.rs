@@ -62,6 +62,12 @@ pub enum Command {
     )]
     Attach(AttachArgs),
 
+    #[command(visible_alias = "kill-session", about = "Kill a session")]
+    Kill(KillArgs),
+
+    #[command(visible_alias = "rename-session", about = "Rename a session")]
+    Rename(RenameArgs),
+
     #[command(
         visible_aliases = ["ls", "list-sessions"],
         about = "List the sessions on every server in the cluster"
@@ -91,6 +97,13 @@ pub enum Command {
 pub struct NewArgs {
     #[arg(short = 's', long = "session-name", help = "Name for the new session")]
     pub name: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "SERVER",
+        help = "Server to run the session on, defaults to this one"
+    )]
+    pub on: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -98,9 +111,35 @@ pub struct AttachArgs {
     #[arg(
         short = 't',
         long = "target",
-        help = "Session to attach to, defaults to the most recent one"
+        value_name = "SESSION[@SERVER]",
+        help = "Session to attach to, defaults to the most recent one on this server"
     )]
     pub target: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct KillArgs {
+    #[arg(
+        short = 't',
+        long = "target",
+        value_name = "SESSION[@SERVER]",
+        help = "Session to kill, defaults to the most recent one on this server"
+    )]
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct RenameArgs {
+    #[arg(
+        short = 't',
+        long = "target",
+        value_name = "SESSION[@SERVER]",
+        help = "Session to rename, defaults to the most recent one on this server"
+    )]
+    pub target: Option<String>,
+
+    #[arg(help = "New name for the session")]
+    pub name: String,
 }
 
 #[derive(Debug, Args)]

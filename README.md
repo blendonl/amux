@@ -5,19 +5,36 @@ A terminal multiplexer written in Rust.
 ## Usage
 
 ```sh
-cargo run --                     # start the server if needed, then attach to the most recent session or create one here
-cargo run -- new -s work         # create a session named "work"
-cargo run -- attach -t work      # reattach (aliases: a, attach-session)
-cargo run -- ls                  # list the sessions on every server in the cluster
-cargo run -- servers             # status, latency and version of every server
+cargo run --                             # start the server if needed, then attach to the most recent session or create one here
+cargo run -- new -s work                 # create a session named "work"
+cargo run -- new -s work --on laptop     # create it on the server named laptop instead
+cargo run -- attach -t work              # reattach (aliases: a, attach-session)
+cargo run -- attach -t work@laptop       # attach to a session on another server
+cargo run -- rename -t work@laptop notes # rename a session (alias: rename-session)
+cargo run -- kill -t notes@laptop        # kill a session (alias: kill-session)
+cargo run -- ls                          # list the sessions on every server in the cluster
+cargo run -- servers                     # status, latency and version of every server
 cargo run -- servers add laptop ssh://laptop
 cargo run -- servers remove laptop
-cargo run -- kill-server         # stop the server and all sessions
+cargo run -- kill-server                 # stop the server and all sessions
 ```
 
 Inside a session, press `Ctrl-b d` to detach and `Ctrl-b Ctrl-b` to send a literal `Ctrl-b`.
 
 `-L <name>` picks a named server socket in the runtime directory and `-S <path>` sets an explicit socket path. Both work like tmux's flags, so you can run an isolated dev server next to your usual one. Each `-L` name is its own cluster: a `-L dev` server only links to other `-L dev` servers.
+
+### Targets
+
+`-t` takes a target of the form `[session][@server]`, like tmux's `-t` with a server added:
+
+| Target        | Means                                                         |
+| ------------- | ------------------------------------------------------------- |
+| `work`        | The session named `work`, which must be unique in the cluster |
+| `work@laptop` | The session `work` on `laptop`                                |
+| `@laptop`     | The most recently active session on `laptop`                  |
+| (none)        | The most recently active session on this server               |
+
+When a name matches sessions on several servers, the command fails and lists them all, for example `session work is on more than one server, pick one of: work@desktop, work@laptop`. Session names can't contain `@` or `:`, because targets use them as separators. `:window.pane` is accepted and kept for when sessions have windows.
 
 ### Config
 
@@ -75,6 +92,15 @@ home-server              offline, last seen 3h ago
 
 A server that `amux bridge` starts over SSH inherits a non-interactive SSH environment and may be killed by logind when the SSH session ends. To keep a machine reachable, run its server from a systemd user unit (`ExecStart=%h/.cargo/bin/amux server`) and allow it to outlive your login with `loginctl enable-linger`.
 
+### Remote sessions
+
+A client only ever talks to its local server. Attaching to a session on another server opens a channel over the peer link to that server, which treats the channel like any other attached client. `amux new --on laptop`, `attach`, `rename` and `kill` all work the same way whichever server holds the session.
+
+- A session created on another server starts in that server's `$HOME`, because paths differ between machines. The client's `LANG`, `LC_*` and `COLORTERM` are applied to the new shell wherever it runs, in place of the server's own.
+- When the link drops while you are attached, the session keeps running on its server and your terminal shows "reconnecting to laptop…". Once the link is back you get a full redraw. `Ctrl-b d` still detaches in the meantime.
+- If that server is stopped with `kill-server`, or restarts and loses the session, the client exits as it would for a local session.
+- When several clients are attached to one session, the one that typed or resized last sets its size, like tmux's `window-size latest`.
+
 ## Architecture
 
 amux uses a client/server model like tmux. The server owns the shells and the client is only a view.
@@ -90,7 +116,9 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 - Each **pane** spawns the user's shell in a PTY. Output goes through a `vt100` parser, so the server always holds the full screen state. That state is how a client gets a redraw when it reattaches. The shell doesn't inherit `SSH_*` variables from the server, and a session in a directory that doesn't exist fails instead of quietly starting in `$HOME`.
 - Each attached **client** gets frames as a diff against the last screen it was sent. Frames are pulled, not pushed: a pane update only marks the client dirty, and the server renders a frame when the connection has room for one. A slow client skips intermediate screens, and its keystrokes never wait behind output. Keystrokes go back as raw bytes, and resizes are sent when `SIGWINCH` arrives.
 - The **protocol** uses length-prefixed `postcard` frames. A connection opens with a `Greeting` and a `Welcome` whose layout never changes, then carries `ClientMessage` and `ServerMessage`. Any change to those messages bumps the major version. The server handles a connection as a `Duplex`, a pair of message channels, so it doesn't care what transport sits underneath.
-- A **peer link** carries the same frames. After the greeting both servers send a `Hello`, the lower ID decides whether the link is a duplicate, and then each side sends a snapshot of its sessions followed by events stamped with its incarnation and a sequence number, so stale or repeated updates are dropped. One writer drains a control lane (pongs, goodbyes) ahead of a bulk lane (snapshots and events), and the reader never waits on anything the other side controls, so a peer that stops reading cannot stall this one.
+- A **peer link** carries the same frames. After the greeting both servers send a `Hello`, the lower ID decides whether the link is a duplicate, and then each side sends a snapshot of its sessions followed by events stamped with its incarnation and a sequence number, so stale or repeated updates are dropped. One writer drains a control lane (pongs, credit, goodbyes) ahead of a bulk lane (snapshots, events and channel data), and the reader never waits on anything the other side controls, so a peer that stops reading cannot stall this one.
+- A **channel** tunnels one client connection through a peer link. Each server numbers the channels it opens, and the server hosting the session runs the channel through the same connection handler as a local client, except that it only ever looks up its own sessions. The host sends at most four frames ahead and waits for the opening server to pass each one on to its client, so frames stay pulled end to end. Each channel has its own capped queue on the receiving side: a channel that overflows is closed on its own and the link stays up. The opening server forwards client messages without reading them, apart from detaching, switching sessions and listing the cluster, and reattaches by the host's incarnation and session ID when a dropped link comes back.
+- A client's terminal size is clamped to at least 2 rows by 2 columns, on the client and on the server, because the terminal emulator can't handle anything smaller.
 
 | Path                       | Responsibility                                                           |
 | -------------------------- | ------------------------------------------------------------------------ |
@@ -99,19 +127,23 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 | `src/cli.rs`               | Command-line interface                                                   |
 | `src/paths.rs`             | Runtime, config and state paths                                          |
 | `src/config.rs`            | Config file, server ID and incarnation                                   |
+| `src/target.rs`            | `session@server` targets: parsing, validation and resolution             |
 | `src/protocol/mod.rs`      | Framing and the `Duplex` message channels                                |
 | `src/protocol/greeting.rs` | Greeting, version constants and the version check                        |
 | `src/protocol/client.rs`   | Client and server messages                                               |
 | `src/protocol/peer.rs`     | Peer messages, snapshots and state events                                |
 | `src/cluster/mod.rs`       | Membership, dial loops, peer cache                                       |
 | `src/cluster/link.rs`      | Peer handshake, link lanes, pings                                        |
+| `src/cluster/channel.rs`   | Channels over a link: ids, credit, capped inbound queues                 |
 | `src/cluster/ssh.rs`       | Addresses, the SSH and exec transport, `amux bridge`                     |
 | `src/server/mod.rs`        | Accept loop, session registry, state events, shutdown                    |
-| `src/server/connection.rs` | Per-client request handling and the attach loop                          |
+| `src/server/connection.rs` | Per-client requests, target routing and the attach loop                  |
+| `src/server/forward.rs`    | Forwarding a client to a session on another server, reconnects           |
 | `src/server/session.rs`    | Session state                                                            |
 | `src/server/pane.rs`       | PTY, shell process, terminal emulation                                   |
 | `src/client/mod.rs`        | Commands, server bootstrap, attach relay                                 |
 | `src/client/listing.rs`    | `amux ls` and `amux servers` output                                      |
+| `src/client/overlay.rs`    | The "reconnecting to …" overlay                                          |
 | `src/client/terminal.rs`   | Raw mode, alternate screen, stdin reader                                 |
 | `src/client/keys.rs`       | Prefix key handling                                                      |
 | `tests/common/mod.rs`      | `TestServer`, `TestClient`, a PTY-driven client and linked test clusters |
@@ -131,7 +163,7 @@ amux is growing into a multiplexer that spans machines, following [docs/design.m
 - [x] Transport-agnostic connection handling
 - [x] Integration tests driving a real PTY
 - [x] Cluster view: peer links over SSH, `amux servers`, and `amux ls` across machines
-- [ ] Remote sessions: `new --on`, `attach -t session@server`, reconnects
+- [x] Remote sessions: `new --on`, `attach -t session@server`, reconnects
 - [ ] Projects and worktrees: `new -p -b`, `--clone`, `amux projects`
 - [ ] Windows within a session (`Ctrl-b c`, `n`, `p`)
 - [ ] Pane splits with a layout tree and a cell-level compositor

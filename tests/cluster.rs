@@ -6,17 +6,8 @@ use std::os::unix::net::UnixListener;
 use std::thread;
 
 use amux::protocol::{Version, Welcome, PROTOCOL_MAJOR};
-use common::{linked, Listing, TestServer};
+use common::{linked, Listing, Resume, TestServer};
 use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
-
-struct Resume(Pid);
-
-impl Drop for Resume {
-    fn drop(&mut self) {
-        let _ = kill(self.0, Signal::SIGCONT);
-    }
-}
 
 fn is_stopped(ls: &Listing, server: &str) -> bool {
     ls.status(server)

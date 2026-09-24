@@ -2,7 +2,7 @@ mod common;
 
 use std::time::Duration;
 
-use amux::protocol::{ClientMessage, ServerMessage};
+use amux::protocol::{ClientMessage, NewSession, ServerMessage};
 use common::{TestServer, SIZE, TIMEOUT};
 
 #[tokio::test]
@@ -30,8 +30,11 @@ async fn reattaching_after_a_detach_redraws_the_whole_screen() {
 #[tokio::test]
 async fn attaching_without_a_target_picks_the_most_recent_session() {
     let server = TestServer::start();
-    server.client().await.new_session(Some("older")).await;
-    server.client().await.new_session(Some("newer")).await;
+    for name in ["older", "newer"] {
+        let mut client = server.client().await;
+        client.new_session(Some(name)).await;
+        client.wait_for_text("$").await;
+    }
 
     assert_eq!(server.client().await.attach(None).await, "newer");
 }
@@ -81,13 +84,11 @@ async fn a_session_in_a_missing_directory_fails_with_the_path() {
     let server = TestServer::start();
     let missing = server.home().join("missing");
     let mut client = server.client().await;
-    client
-        .send(ClientMessage::NewSession {
-            name: None,
-            cwd: missing.clone(),
-            size: SIZE,
-        })
-        .await;
+    let request = NewSession {
+        cwd: Some(missing.clone()),
+        ..client.session_request(None)
+    };
+    client.send(ClientMessage::NewSession(request)).await;
 
     match client.recv().await {
         Some(ServerMessage::Error(message)) => {

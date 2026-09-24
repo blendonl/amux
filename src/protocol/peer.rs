@@ -2,19 +2,50 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::{ProjectCheckout, SessionId, SessionInfo, Version};
+use super::{ClientMessage, ProjectCheckout, ServerMessage, SessionId, SessionInfo, Version};
 use crate::config::{Incarnation, ServerId};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ChannelId(pub u64);
+
+impl fmt::Display for ChannelId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PeerMessage {
     Hello(Hello),
     Refused(Refusal),
-    LinkConfirmed { generation: u64 },
+    LinkConfirmed {
+        generation: u64,
+    },
     Goodbye(Farewell),
     Snapshot(Snapshot),
     Event(Event),
     Ping(u64),
     Pong(u64),
+    ChannelOpen {
+        id: ChannelId,
+        first: ClientMessage,
+    },
+    ChannelToHost {
+        id: ChannelId,
+        message: ClientMessage,
+    },
+    ChannelToClient {
+        id: ChannelId,
+        message: ServerMessage,
+    },
+    ChannelCredit {
+        id: ChannelId,
+        credit: u32,
+    },
+    ChannelClose {
+        id: ChannelId,
+        from_opener: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,5 +181,39 @@ mod tests {
         });
         let bytes = postcard::to_stdvec(&hello).unwrap();
         assert_eq!(postcard::from_bytes::<PeerMessage>(&bytes).unwrap(), hello);
+    }
+
+    #[test]
+    fn channel_messages_survive_a_round_trip() {
+        let id = ChannelId(7);
+        let messages = [
+            PeerMessage::ChannelOpen {
+                id,
+                first: ClientMessage::Attach {
+                    target: "work@desk".parse().unwrap(),
+                    size: crate::protocol::Size { rows: 24, cols: 80 },
+                },
+            },
+            PeerMessage::ChannelToHost {
+                id,
+                message: ClientMessage::Input(b"ls\r".to_vec()),
+            },
+            PeerMessage::ChannelToClient {
+                id,
+                message: ServerMessage::Output(b"hi".to_vec()),
+            },
+            PeerMessage::ChannelCredit { id, credit: 1 },
+            PeerMessage::ChannelClose {
+                id,
+                from_opener: true,
+            },
+        ];
+        for message in messages {
+            let bytes = postcard::to_stdvec(&message).unwrap();
+            assert_eq!(
+                postcard::from_bytes::<PeerMessage>(&bytes).unwrap(),
+                message
+            );
+        }
     }
 }

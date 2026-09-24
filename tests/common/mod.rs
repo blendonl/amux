@@ -13,7 +13,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use amux::protocol::{
-    self, ClientMessage, Duplex, Role, ServerMessage, SessionInfo, Size, Version, Welcome,
+    self, AttachedSession, ClientMessage, Duplex, NewSession, Role, ServerMessage, SessionInfo,
+    Size, Version, Welcome,
 };
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
@@ -31,6 +32,14 @@ const COMMAND_POLL: Duration = Duration::from_millis(50);
 const SOCKET_NAME: &str = "amux.sock";
 
 static SERVER_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+pub struct Resume(pub Pid);
+
+impl Drop for Resume {
+    fn drop(&mut self) {
+        let _ = kill(self.0, Signal::SIGCONT);
+    }
+}
 
 pub struct TestServerBuilder {
     name: String,
@@ -392,7 +401,11 @@ impl TestServer {
     }
 
     pub fn terminal(&self, args: &[&str]) -> TerminalClient {
-        TerminalClient::spawn(self, args)
+        TerminalClient::spawn(self, args, &[])
+    }
+
+    pub fn terminal_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> TerminalClient {
+        TerminalClient::spawn(self, args, env)
     }
 
     fn wait_until_listening(&mut self) {
@@ -618,23 +631,54 @@ impl TestClient {
         message
     }
 
+    pub fn session_request(&self, name: Option<&str>) -> NewSession {
+        NewSession {
+            cwd: Some(self.cwd.clone()),
+            ..NewSession::new(name.map(str::to_owned), SIZE)
+        }
+    }
+
     pub async fn new_session(&mut self, name: Option<&str>) -> String {
-        self.send(ClientMessage::NewSession {
-            name: name.map(str::to_owned),
-            cwd: self.cwd.clone(),
+        let request = self.session_request(name);
+        self.create(request).await.session
+    }
+
+    pub async fn create(&mut self, request: NewSession) -> AttachedSession {
+        self.send(ClientMessage::NewSession(request)).await;
+        self.expect_attached().await
+    }
+
+    pub async fn attach(&mut self, target: Option<&str>) -> String {
+        self.attach_to(target.unwrap_or_default()).await.session
+    }
+
+    pub async fn attach_to(&mut self, target: &str) -> AttachedSession {
+        self.send(ClientMessage::Attach {
+            target: target.parse().expect("a valid target"),
             size: SIZE,
         })
         .await;
         self.expect_attached().await
     }
 
-    pub async fn attach(&mut self, target: Option<&str>) -> String {
-        self.send(ClientMessage::Attach {
-            target: target.map(str::to_owned),
-            size: SIZE,
-        })
-        .await;
-        self.expect_attached().await
+    pub async fn expect_error(&mut self) -> String {
+        match self.recv().await {
+            Some(ServerMessage::Error(message)) => message,
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    pub async fn next_non_output(&mut self) -> Option<ServerMessage> {
+        loop {
+            match self.recv().await {
+                Some(ServerMessage::Output(_)) => {}
+                other => return other,
+            }
+        }
+    }
+
+    pub fn reset_screen(&mut self) {
+        self.screen = vt100::Parser::new(SIZE.rows, SIZE.cols, 0);
     }
 
     pub async fn list_sessions(&mut self) -> Vec<SessionInfo> {
@@ -685,9 +729,9 @@ impl TestClient {
         }
     }
 
-    async fn expect_attached(&mut self) -> String {
+    pub async fn expect_attached(&mut self) -> AttachedSession {
         match self.recv().await {
-            Some(ServerMessage::Attached { session }) => session,
+            Some(ServerMessage::Attached(attached)) => attached,
             other => panic!("expected to attach, got {other:?}"),
         }
     }
@@ -703,7 +747,7 @@ pub struct TerminalClient {
 }
 
 impl TerminalClient {
-    fn spawn(server: &TestServer, args: &[&str]) -> Self {
+    fn spawn(server: &TestServer, args: &[&str], env: &[(&str, &str)]) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: SIZE.rows,
@@ -719,6 +763,9 @@ impl TerminalClient {
             command.env(key, value);
         }
         command.env("TERM", "xterm-256color");
+        for (key, value) in env {
+            command.env(key, value);
+        }
         command.cwd(server.home());
         command.arg("-S");
         command.arg(server.socket());
@@ -764,16 +811,20 @@ impl TerminalClient {
     }
 
     pub fn wait_for_text(&mut self, text: &str) -> String {
+        self.wait_for(text, |contents| contents.contains(text))
+    }
+
+    pub fn wait_for(&mut self, what: &str, done: impl Fn(&str) -> bool) -> String {
         let deadline = Instant::now() + TIMEOUT;
         loop {
             let contents = self.contents();
-            if contents.contains(text) {
+            if done(&contents) {
                 return contents;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             match self.output.recv_timeout(remaining) {
                 Ok(bytes) => self.screen.process(&bytes),
-                Err(_) => panic!("timed out waiting for {text:?}; screen:\n{contents}"),
+                Err(_) => panic!("timed out waiting for {what}; screen:\n{contents}"),
             }
         }
     }

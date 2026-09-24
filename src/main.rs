@@ -17,8 +17,12 @@ async fn main() -> Result<()> {
 
     match cli.command {
         None => client::attach_or_create(&endpoint).await,
-        Some(Command::New(args)) => client::new_session(&endpoint, args.name).await,
+        Some(Command::New(args)) => client::new_session(&endpoint, args.name, args.on).await,
         Some(Command::Attach(args)) => client::attach_session(&endpoint, args.target).await,
+        Some(Command::Kill(args)) => client::kill_session(&endpoint, args.target).await,
+        Some(Command::Rename(args)) => {
+            client::rename_session(&endpoint, args.target, args.name).await
+        }
         Some(Command::List) => client::list_cluster(&endpoint).await,
         Some(Command::Servers(args)) => match args.action {
             None => client::list_servers(&endpoint).await,

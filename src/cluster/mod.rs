@@ -1,3 +1,4 @@
+mod channel;
 mod link;
 pub mod ssh;
 
@@ -16,9 +17,10 @@ use tracing::{debug, info, warn};
 
 use crate::config::{Incarnation, ServerConfig, ServerId, ServerIdentity};
 use crate::protocol::{
-    Event, Farewell, Hello, LinkInfo, LinkState, PeerAddress, PeerMessage, Refusal, ServerState,
-    ServerStatus, ServerView, Snapshot, StateEvent, Version,
+    ClientMessage, Duplex, Event, Farewell, Hello, LinkInfo, LinkState, PeerAddress, PeerMessage,
+    Refusal, ServerMessage, ServerState, ServerStatus, ServerView, Snapshot, StateEvent, Version,
 };
+pub use channel::{Channel, ChannelEnd, CREDIT_WINDOW};
 pub use link::LinkSettings;
 use link::{Handshake, LinkHandle};
 use ssh::Address;
@@ -35,6 +37,7 @@ const BRIDGE_EXIT_GRACE: Duration = Duration::from_secs(2);
 pub trait StateSource: Send + Sync {
     fn subscribe(&self) -> (Snapshot, broadcast::Receiver<Event>);
     fn refresh_peers(&self);
+    fn serve_channel(self: Arc<Self>, channel: Duplex<ClientMessage, ServerMessage>);
 }
 
 pub struct ClusterOptions {
@@ -380,6 +383,47 @@ impl Cluster {
                 })
             })
             .collect()
+    }
+
+    pub async fn open_channel(&self, peer: ServerId, first: ClientMessage) -> Result<Channel> {
+        let channels = {
+            let members = self.members();
+            let link = members
+                .links
+                .get(&peer)
+                .filter(|link| !link.closing && !members.stopping)
+                .ok_or_else(|| anyhow!("no link to {peer}"))?;
+            Arc::clone(&link.handle.channels)
+        };
+        channels.open(first).await
+    }
+
+    pub fn watch(&self) -> watch::Receiver<()> {
+        self.changes.subscribe()
+    }
+
+    pub fn is_linked(&self, peer: ServerId) -> bool {
+        self.members()
+            .links
+            .get(&peer)
+            .is_some_and(|link| !link.closing)
+    }
+
+    pub fn is_stopped(&self, peer: ServerId) -> bool {
+        self.members()
+            .peers
+            .get(&peer)
+            .is_some_and(|record| record.stopped)
+    }
+
+    pub fn open_channels(&self) -> (usize, usize) {
+        self.members()
+            .links
+            .values()
+            .map(|link| link.handle.channels.open_count())
+            .fold((0, 0), |(opened, hosted), (more_opened, more_hosted)| {
+                (opened + more_opened, hosted + more_hosted)
+            })
     }
 
     pub fn drop_link(&self, peer: &str) -> Result<()> {

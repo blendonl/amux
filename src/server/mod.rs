@@ -1,4 +1,5 @@
 mod connection;
+mod forward;
 #[cfg_attr(not(test), allow(dead_code))]
 mod layout;
 #[cfg_attr(not(test), allow(dead_code))]
@@ -14,7 +15,7 @@ use std::io::{self, IsTerminal};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::net::{UnixListener, UnixStream};
@@ -24,12 +25,15 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::cluster::{Cluster, ClusterOptions, LinkSettings, StateSource};
-use crate::config::{Config, ServerIdentity};
+use crate::config::{Config, Incarnation, ServerId, ServerIdentity};
 use crate::paths;
 use crate::protocol::{
-    self, Event, PeerAddress, Role, ServerState, ServerStatus, ServerView, SessionId, SessionInfo,
-    Size, Snapshot, StateEvent, Version,
+    self, ClientMessage, Duplex, Event, NewSession, PeerAddress, Role, ServerMessage, ServerState,
+    ServerStatus, ServerView, SessionId, SessionInfo, Snapshot, StateEvent, Version,
 };
+use crate::target::{self, Candidate, Target};
+use connection::Origin;
+use forward::{Host, RemoteSession};
 use session::Session;
 
 const LOG_FILTER_ENV: &str = "AMUX_LOG";
@@ -103,10 +107,17 @@ async fn serve(server: Arc<Server>, mut stream: UnixStream) -> Result<()> {
     let role = protocol::accept(&mut stream, &Version::current(), &server.identity.name).await?;
     let (reader, writer) = stream.into_split();
     match role {
-        Some(Role::Client) => connection::handle(server, protocol::duplex(reader, writer)).await,
+        Some(Role::Client) => {
+            connection::handle(server, protocol::duplex(reader, writer), Origin::Local).await
+        }
         Some(Role::Peer) => server.cluster.accept(reader, writer).await,
         None => Ok(()),
     }
+}
+
+enum Resolved {
+    Local(Arc<Session>),
+    Remote(RemoteSession),
 }
 
 pub struct Server {
@@ -153,21 +164,36 @@ impl Server {
         &self.cluster
     }
 
-    fn create_session(
-        self: &Arc<Self>,
-        name: Option<String>,
-        cwd: &Path,
-        size: Size,
-    ) -> Result<Arc<Session>> {
+    fn incarnation(&self) -> Incarnation {
+        self.identity.incarnation
+    }
+
+    fn create_session(self: &Arc<Self>, request: &NewSession) -> Result<Arc<Session>> {
+        if request.project.is_some() || request.branch.is_some() || request.clone {
+            bail!("sessions bound to a project are not supported yet");
+        }
+        if let Some(name) = &request.name {
+            target::validate_session_name(name)?;
+        }
+        let cwd = match &request.cwd {
+            Some(cwd) => cwd.clone(),
+            None => paths::home_dir()?,
+        };
         let mut state = self.state();
-        let name = match name {
-            Some(name) if state.sessions.contains_key(&name) => bail!("duplicate session: {name}"),
-            Some(name) => name,
+        let name = match &request.name {
+            Some(name) if state.sessions.contains_key(name) => bail!("duplicate session: {name}"),
+            Some(name) => name.clone(),
             None => next_free_name(&state.sessions),
         };
         state.last_session_id += 1;
         let id = SessionId(state.last_session_id);
-        let session = Arc::new(Session::spawn(id, name.clone(), cwd, size)?);
+        let session = Arc::new(Session::spawn(
+            id,
+            name.clone(),
+            &cwd,
+            request.size,
+            &request.env,
+        )?);
         state.sessions.insert(name.clone(), Arc::clone(&session));
         self.publish(&mut state, StateEvent::SessionCreated(session.info()));
         drop(state);
@@ -188,7 +214,6 @@ impl Server {
                     if changed.is_err() {
                         break;
                     }
-                    session.touch();
                     pending = true;
                 }
                 () = session.input_recorded() => pending = true,
@@ -203,20 +228,140 @@ impl Server {
         info!(session = %session.name(), "session exited");
     }
 
-    fn find_session(&self, target: Option<&str>) -> Result<Arc<Session>> {
-        let state = self.state();
-        let session = match target {
-            Some(name) => state
-                .sessions
-                .get(name)
-                .ok_or_else(|| anyhow!("can't find session: {name}"))?,
-            None => state
-                .sessions
-                .values()
-                .max_by_key(|session| session.created_at())
-                .ok_or_else(|| anyhow!("no sessions"))?,
+    fn resolve(&self, target: &Target, origin: Origin) -> Result<Resolved> {
+        let local_name = &self.identity.name;
+        let local: Vec<(String, Arc<Session>)> = self
+            .state()
+            .sessions
+            .iter()
+            .map(|(name, session)| (name.clone(), Arc::clone(session)))
+            .collect();
+        let mut servers = vec![local_name.clone()];
+        let mut candidates: Vec<Candidate> = local
+            .iter()
+            .map(|(name, session)| Candidate {
+                server: local_name.clone(),
+                session: name.clone(),
+                last_activity: millis(session.last_activity()),
+                is_local: true,
+            })
+            .collect();
+        let mut peers = Vec::new();
+        if origin == Origin::Local {
+            for view in self.cluster.view() {
+                if view.name == *local_name {
+                    continue;
+                }
+                candidates.extend(view.sessions.iter().map(|session| Candidate {
+                    server: view.name.clone(),
+                    session: session.name.clone(),
+                    last_activity: millis(session.last_activity),
+                    is_local: false,
+                }));
+                servers.push(view.name.clone());
+                peers.push((view.name, view.id));
+            }
+        }
+
+        let found = target::resolve_with_servers(target, &servers, &candidates)?;
+        if found.is_local {
+            let session = local
+                .into_iter()
+                .find(|(name, _)| *name == found.session)
+                .map(|(_, session)| session)
+                .ok_or_else(|| anyhow!("can't find session: {}", found.session))?;
+            return Ok(Resolved::Local(session));
+        }
+        let peer = self.reachable_peer(&found.server, &peers)?;
+        Ok(Resolved::Remote(RemoteSession {
+            host: Host {
+                peer,
+                name: found.server.clone(),
+            },
+            target: Target {
+                session: Some(found.session.clone()),
+                server: Some(found.server.clone()),
+                ..target.clone()
+            },
+        }))
+    }
+
+    fn host_for_new_session(&self, on: Option<&str>, origin: Origin) -> Result<Option<ServerId>> {
+        let Some(on) = on.filter(|on| *on != self.identity.name) else {
+            return Ok(None);
         };
-        Ok(Arc::clone(session))
+        if origin == Origin::Peer {
+            bail!("unknown server: {on}");
+        }
+        let peers: Vec<(String, Option<ServerId>)> = self
+            .cluster
+            .view()
+            .into_iter()
+            .map(|view| (view.name, view.id))
+            .collect();
+        if !peers.iter().any(|(name, _)| name == on) {
+            bail!("unknown server: {on}");
+        }
+        self.reachable_peer(on, &peers).map(Some)
+    }
+
+    fn reachable_peer(&self, name: &str, peers: &[(String, Option<ServerId>)]) -> Result<ServerId> {
+        peers
+            .iter()
+            .filter(|(peer, _)| peer == name)
+            .filter_map(|(_, id)| *id)
+            .find(|id| self.cluster.is_linked(*id))
+            .ok_or_else(|| anyhow!("server {name} is offline"))
+    }
+
+    fn find_by_id(&self, incarnation: Incarnation, id: SessionId) -> Option<Arc<Session>> {
+        if incarnation != self.identity.incarnation {
+            return None;
+        }
+        self.state()
+            .sessions
+            .values()
+            .find(|session| session.id() == id)
+            .cloned()
+    }
+
+    fn kill_session(&self, session: &Session) {
+        let mut state = self.state();
+        let before = state.sessions.len();
+        state.sessions.retain(|_, known| known.id() != session.id());
+        if state.sessions.len() != before {
+            self.publish(&mut state, StateEvent::SessionClosed(session.id()));
+        }
+        drop(state);
+        session.kill();
+        info!(session = %session.name(), "session killed");
+    }
+
+    fn rename_session(&self, session: &Arc<Session>, name: String) -> Result<()> {
+        target::validate_session_name(&name)?;
+        let mut state = self.state();
+        let old = state
+            .sessions
+            .iter()
+            .find(|(_, known)| known.id() == session.id())
+            .map(|(old, _)| old.clone())
+            .ok_or_else(|| anyhow!("can't find session: {}", session.name()))?;
+        if old == name {
+            return Ok(());
+        }
+        if state.sessions.contains_key(&name) {
+            bail!("duplicate session: {name}");
+        }
+        let renamed = state
+            .sessions
+            .remove(&old)
+            .expect("the session was just found");
+        renamed.rename(name.clone());
+        state.sessions.insert(name.clone(), Arc::clone(&renamed));
+        self.publish(&mut state, StateEvent::SessionChanged(renamed.info()));
+        drop(state);
+        info!(from = %old, to = %name, "session renamed");
+        Ok(())
     }
 
     fn list_sessions(&self) -> Vec<SessionInfo> {
@@ -264,8 +409,11 @@ impl Server {
 
     fn close_session(&self, session: &Session) {
         let mut state = self.state();
+        let before = state.sessions.len();
         state.sessions.retain(|_, known| known.id() != session.id());
-        self.publish(&mut state, StateEvent::SessionClosed(session.id()));
+        if state.sessions.len() != before {
+            self.publish(&mut state, StateEvent::SessionClosed(session.id()));
+        }
     }
 
     fn publish(&self, state: &mut LocalState, event: StateEvent) {
@@ -314,6 +462,14 @@ impl StateSource for Server {
             self.publish(&mut state, StateEvent::PeersChanged(peers));
         }
     }
+
+    fn serve_channel(self: Arc<Self>, channel: Duplex<ClientMessage, ServerMessage>) {
+        tokio::spawn(async move {
+            if let Err(err) = connection::handle(self, channel, Origin::Peer).await {
+                warn!("channel failed: {err:#}");
+            }
+        });
+    }
 }
 
 struct AttachedClient {
@@ -326,6 +482,13 @@ impl Drop for AttachedClient {
         self.session.client_detached();
         self.server.session_changed(&self.session);
     }
+}
+
+fn millis(time: SystemTime) -> u64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 fn next_free_name(sessions: &BTreeMap<String, Arc<Session>>) -> String {

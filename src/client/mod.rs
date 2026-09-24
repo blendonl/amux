@@ -1,5 +1,6 @@
 mod keys;
 mod listing;
+mod overlay;
 mod terminal;
 
 use std::env;
@@ -21,9 +22,10 @@ use crate::cluster::ssh::Address;
 use crate::config::{self, ServerConfig};
 use crate::paths;
 use crate::protocol::{
-    self, ClientMessage, DebugCommand, Duplex, IncompatibleServer, Role, ServerMessage, ServerView,
-    SessionInfo, Version,
+    self, is_locale_variable, AttachedSession, ClientMessage, DebugCommand, Duplex,
+    IncompatibleServer, NewSession, Role, ServerMessage, ServerView, SessionInfo, Version,
 };
+use crate::target::{self, Target};
 use keys::{Action, PrefixRouter, DEFAULT_PREFIX};
 use terminal::RawTerminal;
 
@@ -42,29 +44,70 @@ pub struct Endpoint {
 pub async fn attach_or_create(endpoint: &Endpoint) -> Result<()> {
     let server = handshake(connect_or_start_server(endpoint).await?).await?;
     if request_sessions(server).await?.is_empty() {
-        new_session(endpoint, None).await
+        new_session(endpoint, None, None).await
     } else {
         attach_session(endpoint, None).await
     }
 }
 
-pub async fn new_session(endpoint: &Endpoint, name: Option<String>) -> Result<()> {
-    let server = handshake(connect_or_start_server(endpoint).await?).await?;
-    let request = ClientMessage::NewSession {
-        name,
-        cwd: env::current_dir()?,
-        size: terminal::size()?,
-    };
-    attach(server, request).await
+pub async fn new_session(
+    endpoint: &Endpoint,
+    name: Option<String>,
+    on: Option<String>,
+) -> Result<()> {
+    if let Some(name) = &name {
+        target::validate_session_name(name)?;
+    }
+    let (welcome, server) = greet_server(connect_or_start_server(endpoint).await?).await?;
+    let request = ClientMessage::NewSession(NewSession {
+        on,
+        cwd: Some(env::current_dir()?),
+        env: locale(),
+        ..NewSession::new(name, terminal::size()?)
+    });
+    attach(server, &welcome.server_name, request).await
 }
 
 pub async fn attach_session(endpoint: &Endpoint, target: Option<String>) -> Result<()> {
-    let server = connect(&endpoint.socket).await?;
+    let target = parse_target(target)?;
+    let (welcome, server) = greet_server(connect_stream(&endpoint.socket).await?).await?;
     let request = ClientMessage::Attach {
         target,
         size: terminal::size()?,
     };
-    attach(server, request).await
+    attach(server, &welcome.server_name, request).await
+}
+
+pub async fn kill_session(endpoint: &Endpoint, target: Option<String>) -> Result<()> {
+    let target = parse_target(target)?;
+    let server = connect(&endpoint.socket).await?;
+    let request = ClientMessage::KillSession {
+        target,
+        remove_worktree: false,
+    };
+    expect_done(request_reply(server, request).await?)
+}
+
+pub async fn rename_session(
+    endpoint: &Endpoint,
+    target: Option<String>,
+    name: String,
+) -> Result<()> {
+    let target = parse_target(target)?;
+    target::validate_session_name(&name)?;
+    let server = connect(&endpoint.socket).await?;
+    expect_done(request_reply(server, ClientMessage::RenameSession { target, name }).await?)
+}
+
+fn parse_target(target: Option<String>) -> Result<Target> {
+    target.as_deref().unwrap_or_default().parse()
+}
+
+fn locale() -> Vec<(String, String)> {
+    env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(key, _)| is_locale_variable(key))
+        .collect()
 }
 
 pub async fn list_cluster(endpoint: &Endpoint) -> Result<()> {
@@ -93,7 +136,7 @@ pub async fn remove_server(endpoint: &Endpoint, name: String) -> Result<()> {
 pub async fn debug_links(endpoint: &Endpoint) -> Result<()> {
     let server = connect(&endpoint.socket).await?;
     let ServerMessage::Links(links) =
-        request(server, ClientMessage::Debug(DebugCommand::Links)).await?
+        request_reply(server, ClientMessage::Debug(DebugCommand::Links)).await?
     else {
         bail!("unexpected reply from server");
     };
@@ -109,7 +152,7 @@ pub async fn debug_links(endpoint: &Endpoint) -> Result<()> {
 
 pub async fn drop_link(endpoint: &Endpoint, peer: String) -> Result<()> {
     let server = connect(&endpoint.socket).await?;
-    expect_done(request(server, ClientMessage::Debug(DebugCommand::DropLink(peer))).await?)
+    expect_done(request_reply(server, ClientMessage::Debug(DebugCommand::DropLink(peer))).await?)
 }
 
 pub async fn kill_server(endpoint: &Endpoint) -> Result<()> {
@@ -152,12 +195,16 @@ pub async fn connect_or_start_server(endpoint: &Endpoint) -> Result<UnixStream> 
     )
 }
 
-pub async fn handshake(mut stream: UnixStream) -> Result<ServerConnection> {
-    protocol::greet(&mut stream, Role::Client, &Version::current()).await?;
-    Ok(into_connection(stream))
+pub async fn handshake(stream: UnixStream) -> Result<ServerConnection> {
+    Ok(greet_server(stream).await?.1)
 }
 
-async fn request(server: ServerConnection, message: ClientMessage) -> Result<ServerMessage> {
+async fn greet_server(mut stream: UnixStream) -> Result<(protocol::Welcome, ServerConnection)> {
+    let welcome = protocol::greet(&mut stream, Role::Client, &Version::current()).await?;
+    Ok((welcome, into_connection(stream)))
+}
+
+async fn request_reply(server: ServerConnection, message: ClientMessage) -> Result<ServerMessage> {
     let Duplex {
         mut incoming,
         outgoing,
@@ -171,14 +218,14 @@ async fn request(server: ServerConnection, message: ClientMessage) -> Result<Ser
 }
 
 async fn request_sessions(server: ServerConnection) -> Result<Vec<SessionInfo>> {
-    match request(server, ClientMessage::ListSessions).await? {
+    match request_reply(server, ClientMessage::ListSessions).await? {
         ServerMessage::Sessions(sessions) => Ok(sessions),
         other => bail!("unexpected reply from server: {other:?}"),
     }
 }
 
 async fn request_cluster(server: ServerConnection) -> Result<Vec<ServerView>> {
-    match request(server, ClientMessage::ListCluster).await? {
+    match request_reply(server, ClientMessage::ListCluster).await? {
         ServerMessage::Cluster(servers) => Ok(servers),
         other => bail!("unexpected reply from server: {other:?}"),
     }
@@ -196,7 +243,7 @@ async fn notify_running_server(endpoint: &Endpoint, message: ClientMessage) -> R
         return Ok(());
     };
     let server = handshake(stream).await?;
-    expect_done(request(server, message).await?)
+    expect_done(request_reply(server, message).await?)
 }
 
 fn config_path(endpoint: &Endpoint) -> Result<PathBuf> {
@@ -206,25 +253,44 @@ fn config_path(endpoint: &Endpoint) -> Result<PathBuf> {
     }
 }
 
-async fn attach(server: ServerConnection, request: ClientMessage) -> Result<()> {
+async fn attach(server: ServerConnection, local: &str, request: ClientMessage) -> Result<()> {
     let Duplex {
         mut incoming,
         outgoing,
     } = server;
     send(&outgoing, request).await?;
-    let session = match incoming.recv().await {
-        Some(ServerMessage::Attached { session }) => session,
+    let attached = match incoming.recv().await {
+        Some(ServerMessage::Attached(attached)) => attached,
         Some(ServerMessage::Error(message)) => bail!(message),
         Some(other) => bail!("unexpected reply from server: {other:?}"),
         None => bail!("server closed the connection"),
     };
 
+    let mut session = SessionLabel {
+        local: local.to_owned(),
+        attached,
+    };
     let outcome = {
         let _terminal = RawTerminal::enter()?;
-        relay(incoming, outgoing).await?
+        relay(incoming, outgoing, &mut session).await?
     };
     println!("[{outcome} (from session {session})]");
     Ok(())
+}
+
+struct SessionLabel {
+    local: String,
+    attached: AttachedSession,
+}
+
+impl fmt::Display for SessionLabel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.attached.server == self.local {
+            f.write_str(&self.attached.session)
+        } else {
+            self.attached.fmt(f)
+        }
+    }
 }
 
 enum Outcome {
@@ -246,6 +312,7 @@ impl fmt::Display for Outcome {
 async fn relay(
     mut incoming: mpsc::Receiver<ServerMessage>,
     outgoing: mpsc::Sender<ClientMessage>,
+    session: &mut SessionLabel,
 ) -> Result<Outcome> {
     let mut stdin = terminal::stdin_chunks();
     let mut resizes = signal(SignalKind::window_change())?;
@@ -256,6 +323,10 @@ async fn relay(
         tokio::select! {
             message = incoming.recv() => match message {
                 Some(ServerMessage::Output(bytes)) => terminal::write_output(&bytes)?,
+                Some(ServerMessage::Attached(attached)) => session.attached = attached,
+                Some(ServerMessage::Reconnecting { server }) => {
+                    terminal::write_output(&overlay::reconnecting(&server, terminal::size()?))?;
+                }
                 Some(ServerMessage::Detached) => return Ok(Outcome::Detached),
                 Some(ServerMessage::Exited) => return Ok(Outcome::Exited),
                 Some(ServerMessage::Error(message)) => bail!(message),

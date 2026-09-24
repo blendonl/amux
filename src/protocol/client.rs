@@ -6,11 +6,30 @@ use serde::{Deserialize, Serialize};
 
 use super::Version;
 use crate::config::{Incarnation, ServerConfig, ServerId};
+use crate::target::Target;
+
+pub const MIN_ROWS: u16 = 2;
+pub const MIN_COLS: u16 = 2;
+const LOCALE_ENV_PREFIX: &str = "LC_";
+const LOCALE_ENV: [&str; 2] = ["LANG", "COLORTERM"];
+
+pub fn is_locale_variable(key: &str) -> bool {
+    key.starts_with(LOCALE_ENV_PREFIX) || LOCALE_ENV.contains(&key)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Size {
     pub rows: u16,
     pub cols: u16,
+}
+
+impl Size {
+    pub fn clamped(self) -> Self {
+        Self {
+            rows: self.rows.max(MIN_ROWS),
+            cols: self.cols.max(MIN_COLS),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -105,15 +124,58 @@ pub enum DebugCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectRef {
+    pub id: String,
+    pub name: String,
+    pub origin: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewSession {
+    pub name: Option<String>,
+    pub on: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub env: Vec<(String, String)>,
+    pub size: Size,
+    pub project: Option<ProjectRef>,
+    pub branch: Option<String>,
+    pub clone: bool,
+}
+
+impl NewSession {
+    pub fn new(name: Option<String>, size: Size) -> Self {
+        Self {
+            name,
+            on: None,
+            cwd: None,
+            env: Vec::new(),
+            size,
+            project: None,
+            branch: None,
+            clone: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMessage {
-    NewSession {
-        name: Option<String>,
-        cwd: PathBuf,
+    NewSession(NewSession),
+    Attach {
+        target: Target,
         size: Size,
     },
-    Attach {
-        target: Option<String>,
+    Reattach {
+        incarnation: Incarnation,
+        session_id: SessionId,
         size: Size,
+    },
+    KillSession {
+        target: Target,
+        remove_worktree: bool,
+    },
+    RenameSession {
+        target: Target,
+        name: String,
     },
     ListSessions,
     ListCluster,
@@ -128,17 +190,34 @@ pub enum ClientMessage {
     KillServer,
     Input(Vec<u8>),
     Resize(Size),
+    Switch(Target),
+    Redraw,
     Detach,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachedSession {
+    pub server: String,
+    pub session: String,
+    pub id: SessionId,
+    pub incarnation: Incarnation,
+}
+
+impl fmt::Display for AttachedSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{}", self.session, self.server)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerMessage {
-    Attached { session: String },
+    Attached(AttachedSession),
     Sessions(Vec<SessionInfo>),
     Cluster(Vec<ServerView>),
     Links(Vec<LinkInfo>),
     Done,
     Output(Vec<u8>),
+    Reconnecting { server: String },
     Detached,
     Exited,
     Error(String),

@@ -12,6 +12,7 @@ use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
 
+use super::channel::Channels;
 use super::{Cluster, LinkGuard, Rejection, StateSource};
 use crate::config::ServerId;
 use crate::protocol::{
@@ -92,33 +93,43 @@ pub(super) struct LinkHandle {
     pub stop: Arc<Notify>,
     pub finish: watch::Sender<bool>,
     pub stats: Arc<LinkStats>,
+    pub channels: Arc<Channels>,
 }
 
 struct Lanes {
     control: mpsc::Sender<PeerMessage>,
     control_lane: mpsc::Receiver<PeerMessage>,
+    bulk: mpsc::Sender<PeerMessage>,
+    bulk_lane: mpsc::Receiver<PeerMessage>,
     stop: Arc<Notify>,
     finishing: watch::Receiver<bool>,
     stats: Arc<LinkStats>,
+    channels: Arc<Channels>,
 }
 
 fn new_lanes() -> (LinkHandle, Lanes) {
     let (control, control_lane) = mpsc::channel(CONTROL_CAPACITY);
+    let (bulk, bulk_lane) = mpsc::channel(BULK_CAPACITY);
     let (finish, finishing) = watch::channel(false);
     let stop = Arc::new(Notify::new());
     let stats = Arc::new(LinkStats::new());
+    let channels = Channels::new(bulk.clone(), control.clone(), Arc::clone(&stop));
     let handle = LinkHandle {
         control: control.clone(),
         stop: Arc::clone(&stop),
         finish,
         stats: Arc::clone(&stats),
+        channels: Arc::clone(&channels),
     };
     let lanes = Lanes {
         control,
         control_lane,
+        bulk,
+        bulk_lane,
         stop,
         finishing,
         stats,
+        channels,
     };
     (handle, lanes)
 }
@@ -308,20 +319,25 @@ where
     let Lanes {
         control,
         control_lane,
+        bulk,
+        bulk_lane,
         stop,
         finishing,
         stats,
+        channels,
     } = lanes;
-    let (bulk, bulk_lane) = mpsc::channel(BULK_CAPACITY);
 
     let mut tasks = JoinSet::new();
     tasks.spawn(write_lanes(writer, control_lane, bulk_lane, finishing));
     tasks.spawn(read_frames(
         reader,
-        Arc::clone(cluster),
-        peer.id,
-        control.clone(),
-        Arc::clone(&stats),
+        Reader {
+            cluster: Arc::clone(cluster),
+            peer: peer.id,
+            control: control.clone(),
+            stats: Arc::clone(&stats),
+            channels: Arc::clone(&channels),
+        },
     ));
     tasks.spawn(publish(cluster.source(), bulk));
     tasks.spawn(keep_alive(control, stats, cluster.settings().clone()));
@@ -332,6 +348,7 @@ where
         () = stop.notified() => LinkEnd::Stopped,
     };
     tasks.shutdown().await;
+    channels.link_down();
     drop(guard);
     end
 }
@@ -376,16 +393,25 @@ async fn finish_requested(finishing: &mut watch::Receiver<bool>) -> bool {
     finishing.wait_for(|finishing| *finishing).await.is_ok()
 }
 
-async fn read_frames<R>(
-    mut reader: R,
+struct Reader {
     cluster: Arc<Cluster>,
     peer: ServerId,
     control: mpsc::Sender<PeerMessage>,
     stats: Arc<LinkStats>,
-) -> LinkEnd
+    channels: Arc<Channels>,
+}
+
+async fn read_frames<R>(mut reader: R, state: Reader) -> LinkEnd
 where
     R: AsyncRead + Unpin,
 {
+    let Reader {
+        cluster,
+        peer,
+        control,
+        stats,
+        channels,
+    } = state;
     loop {
         let payload = match read_frame(&mut reader).await {
             Ok(Some(payload)) => payload,
@@ -393,31 +419,62 @@ where
             Err(err) => return LinkEnd::Failed(err.context("reading from the link")),
         };
         stats.heard();
+        let len = payload.len();
         let message = match postcard::from_bytes::<PeerMessage>(&payload) {
             Ok(message) => message,
             Err(err) => {
-                warn!(
-                    %peer,
-                    len = payload.len(),
-                    "dropping a peer frame that failed to decode: {err}"
-                );
+                warn!(%peer, len, "dropping a peer frame that failed to decode: {err}");
                 continue;
             }
         };
-        match message {
+        let kept_up = match message {
             PeerMessage::Ping(nonce) => match control.try_send(PeerMessage::Pong(nonce)) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => return LinkEnd::Overflow,
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) => false,
                 Err(TrySendError::Closed(_)) => return LinkEnd::Closed,
             },
-            PeerMessage::Pong(nonce) => stats.ponged(nonce),
-            PeerMessage::Snapshot(snapshot) => cluster.apply_snapshot(peer, snapshot),
-            PeerMessage::Event(event) => cluster.apply_event(peer, event),
+            PeerMessage::Pong(nonce) => {
+                stats.ponged(nonce);
+                true
+            }
+            PeerMessage::Snapshot(snapshot) => {
+                cluster.apply_snapshot(peer, snapshot);
+                true
+            }
+            PeerMessage::Event(event) => {
+                cluster.apply_event(peer, event);
+                true
+            }
             PeerMessage::Goodbye(Farewell::Stopped) => {
+                channels.host_stopped();
                 cluster.mark_stopped(peer);
                 return LinkEnd::Goodbye;
             }
-            other => warn!(%peer, "ignoring {other:?} on an established link"),
+            PeerMessage::ChannelOpen { id, first } => {
+                if let Some(channel) = channels.accept(id, first, len) {
+                    if let Some(source) = cluster.source().upgrade() {
+                        source.serve_channel(channel);
+                    }
+                }
+                true
+            }
+            PeerMessage::ChannelToHost { id, message } => channels.to_host(id, message, len),
+            PeerMessage::ChannelToClient { id, message } => channels.to_client(id, message, len),
+            PeerMessage::ChannelCredit { id, credit } => {
+                channels.credit(id, credit);
+                true
+            }
+            PeerMessage::ChannelClose { id, from_opener } => {
+                channels.closed(id, from_opener);
+                true
+            }
+            other => {
+                warn!(%peer, "ignoring {other:?} on an established link");
+                true
+            }
+        };
+        if !kept_up {
+            return LinkEnd::Overflow;
         }
     }
 }
@@ -536,12 +593,14 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::*;
-    use crate::cluster::ClusterOptions;
+    use crate::cluster::{Channel, ChannelEnd, ClusterOptions, CREDIT_WINDOW};
     use crate::config::{Incarnation, ServerIdentity};
     use crate::protocol::{
-        Event, ServerState, ServerStatus, SessionId, SessionInfo, Snapshot, StateEvent, Version,
-        WindowSummary, PROTOCOL_MAJOR,
+        ClientMessage, Duplex, Event, ServerMessage, ServerState, ServerStatus, SessionId,
+        SessionInfo, Snapshot, StateEvent, Version, WindowSummary, PROTOCOL_MAJOR,
     };
+
+    type HostEnd = Duplex<ClientMessage, ServerMessage>;
 
     type Reader = ReadHalf<DuplexStream>;
     type Writer = WriteHalf<DuplexStream>;
@@ -557,6 +616,7 @@ mod tests {
         incarnation: Incarnation,
         sessions: Vec<SessionInfo>,
         events: broadcast::Sender<Event>,
+        hosted: mpsc::UnboundedSender<HostEnd>,
     }
 
     impl StateSource for FakeServer {
@@ -573,11 +633,25 @@ mod tests {
         }
 
         fn refresh_peers(&self) {}
+
+        fn serve_channel(self: Arc<Self>, channel: HostEnd) {
+            let _ = self.hosted.send(channel);
+        }
     }
 
     struct Node {
         cluster: Arc<Cluster>,
         server: Arc<FakeServer>,
+        hosted: tokio::sync::Mutex<mpsc::UnboundedReceiver<HostEnd>>,
+    }
+
+    impl Node {
+        async fn next_hosted(&self) -> HostEnd {
+            tokio::time::timeout(PATIENCE, self.hosted.lock().await.recv())
+                .await
+                .expect("timed out waiting for a hosted channel")
+                .expect("the fake server is gone")
+        }
     }
 
     struct NodeBuilder {
@@ -612,10 +686,12 @@ mod tests {
         }
 
         fn build(self) -> Node {
+            let (hosted_sender, hosted) = mpsc::unbounded_channel();
             let server = Arc::new(FakeServer {
                 incarnation: self.incarnation,
                 sessions: self.sessions,
                 events: broadcast::channel(16).0,
+                hosted: hosted_sender,
             });
             let weak: Weak<FakeServer> = Arc::downgrade(&server);
             let options = ClusterOptions {
@@ -633,6 +709,7 @@ mod tests {
             Node {
                 cluster: Cluster::new(options, weak),
                 server,
+                hosted: tokio::sync::Mutex::new(hosted),
             }
         }
     }
@@ -1157,5 +1234,286 @@ mod tests {
             .map(|session| session.name)
             .collect();
         assert_eq!(cached, ["remote"]);
+    }
+
+    type LinkRun = tokio::task::JoinHandle<LinkEnd>;
+
+    async fn running(dialer: &Node, acceptor: &Node) -> (LinkRun, LinkRun) {
+        let (dialed, accepted) = connect(dialer, acceptor).await;
+        let spawn_run = |cluster: &Arc<Cluster>, link: Link<Reader, Writer>| {
+            let cluster = Arc::clone(cluster);
+            tokio::spawn(async move { run(link, &cluster).await })
+        };
+        (
+            spawn_run(&dialer.cluster, linked(dialed)),
+            spawn_run(&acceptor.cluster, linked(accepted)),
+        )
+    }
+
+    async fn open(opener: &Node, host: &Node, first: ClientMessage) -> Channel {
+        let peer = host.cluster.identity.id;
+        opener.cluster.open_channel(peer, first).await.unwrap()
+    }
+
+    async fn received<T>(receiver: &mut mpsc::Receiver<T>) -> Option<T> {
+        tokio::time::timeout(PATIENCE, receiver.recv())
+            .await
+            .expect("timed out waiting on a channel")
+    }
+
+    async fn from_host(channel: &mut Channel) -> Option<ServerMessage> {
+        tokio::time::timeout(PATIENCE, channel.recv())
+            .await
+            .expect("timed out waiting for the host")
+    }
+
+    fn output(index: usize) -> ServerMessage {
+        ServerMessage::Output(format!("frame {index}").into_bytes())
+    }
+
+    async fn all_channels_closed(nodes: &[&Node]) {
+        eventually("every channel to close", || {
+            nodes
+                .iter()
+                .all(|node| node.cluster.open_channels() == (0, 0))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_channel_carries_client_messages_to_the_host_and_replies_back() {
+        let lower = node(LOWER, "low").build();
+        let higher = node(HIGHER, "high").build();
+        let _runs = running(&lower, &higher).await;
+
+        let mut channel = open(&lower, &higher, ClientMessage::ListSessions).await;
+        let mut host = higher.next_hosted().await;
+        assert_eq!(
+            received(&mut host.incoming).await,
+            Some(ClientMessage::ListSessions)
+        );
+
+        channel
+            .send(ClientMessage::Input(b"ls\r".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            received(&mut host.incoming).await,
+            Some(ClientMessage::Input(b"ls\r".to_vec()))
+        );
+
+        host.outgoing
+            .send(ServerMessage::Sessions(Vec::new()))
+            .await
+            .unwrap();
+        assert_eq!(
+            from_host(&mut channel).await,
+            Some(ServerMessage::Sessions(Vec::new()))
+        );
+
+        drop(host);
+        assert_eq!(from_host(&mut channel).await, None);
+        assert_eq!(channel.end(), ChannelEnd::ClosedByHost);
+        drop(channel);
+        all_channels_closed(&[&lower, &higher]).await;
+    }
+
+    #[tokio::test]
+    async fn both_servers_can_open_channels_to_each_other_over_one_link() {
+        let lower = node(LOWER, "low").build();
+        let higher = node(HIGHER, "high").build();
+        let _runs = running(&lower, &higher).await;
+
+        let mut up = open(&lower, &higher, ClientMessage::ListSessions).await;
+        let mut down = open(&higher, &lower, ClientMessage::ListCluster).await;
+        assert_eq!(up.id(), down.id());
+
+        let mut on_higher = higher.next_hosted().await;
+        let mut on_lower = lower.next_hosted().await;
+        assert_eq!(
+            received(&mut on_higher.incoming).await,
+            Some(ClientMessage::ListSessions)
+        );
+        assert_eq!(
+            received(&mut on_lower.incoming).await,
+            Some(ClientMessage::ListCluster)
+        );
+        on_higher.outgoing.send(output(1)).await.unwrap();
+        on_lower.outgoing.send(output(2)).await.unwrap();
+        assert_eq!(from_host(&mut up).await, Some(output(1)));
+        assert_eq!(from_host(&mut down).await, Some(output(2)));
+    }
+
+    #[tokio::test]
+    async fn the_host_sends_only_as_many_messages_as_the_opener_has_delivered() {
+        let lower = node(LOWER, "low").build();
+        let higher = node(HIGHER, "high").build();
+        let _runs = running(&lower, &higher).await;
+        let mut channel = open(&lower, &higher, ClientMessage::ListSessions).await;
+        let host = higher.next_hosted().await;
+
+        let window = CREDIT_WINDOW as usize;
+        for index in 0..window {
+            host.outgoing.send(output(index)).await.unwrap();
+        }
+        for index in 0..window {
+            assert_eq!(from_host(&mut channel).await, Some(output(index)));
+        }
+        host.outgoing.send(output(window)).await.unwrap();
+        assert!(
+            host.outgoing.try_send(output(window + 1)).is_err(),
+            "the host rendered past its credit"
+        );
+
+        channel.delivered();
+        assert_eq!(from_host(&mut channel).await, Some(output(window)));
+        host.outgoing.send(output(window + 1)).await.unwrap();
+        channel.delivered();
+        assert_eq!(from_host(&mut channel).await, Some(output(window + 1)));
+    }
+
+    #[tokio::test]
+    async fn a_channel_whose_host_falls_behind_closes_without_the_link() {
+        let lower = node(LOWER, "low").build();
+        let higher = node(HIGHER, "high").build();
+        let _runs = running(&lower, &higher).await;
+        let mut flooded = open(&lower, &higher, ClientMessage::ListSessions).await;
+        let _unread = higher.next_hosted().await;
+
+        let paste = vec![b'x'; 1024 * 1024];
+        let flood = async {
+            while flooded
+                .send(ClientMessage::Input(paste.clone()))
+                .await
+                .is_ok()
+            {
+                tokio::task::yield_now().await;
+                if lower.cluster.open_channels().0 == 0 {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(PATIENCE, flood)
+            .await
+            .expect("the flooded channel never closed");
+        assert_eq!(from_host(&mut flooded).await, None);
+        assert_eq!(flooded.end(), ChannelEnd::ClosedByHost);
+
+        let mut healthy = open(&lower, &higher, ClientMessage::ListCluster).await;
+        let mut host = higher.next_hosted().await;
+        assert_eq!(
+            received(&mut host.incoming).await,
+            Some(ClientMessage::ListCluster)
+        );
+        host.outgoing.send(output(1)).await.unwrap();
+        assert_eq!(from_host(&mut healthy).await, Some(output(1)));
+        assert_eq!(links(&lower).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn closing_a_channel_ends_the_hosted_side() {
+        let lower = node(LOWER, "low").build();
+        let higher = node(HIGHER, "high").build();
+        let _runs = running(&lower, &higher).await;
+        let channel = open(&lower, &higher, ClientMessage::ListSessions).await;
+        let mut host = higher.next_hosted().await;
+        assert!(received(&mut host.incoming).await.is_some());
+
+        drop(channel);
+
+        assert_eq!(received(&mut host.incoming).await, None);
+        drop(host);
+        all_channels_closed(&[&lower, &higher]).await;
+    }
+
+    #[tokio::test]
+    async fn a_dropped_link_ends_its_channels_on_both_sides() {
+        let lower = node(LOWER, "low").build();
+        let higher = node(HIGHER, "high").build();
+        let _runs = running(&lower, &higher).await;
+        let mut channel = open(&lower, &higher, ClientMessage::ListSessions).await;
+        let mut host = higher.next_hosted().await;
+        assert!(received(&mut host.incoming).await.is_some());
+
+        lower.cluster.drop_link("high").unwrap();
+
+        assert_eq!(from_host(&mut channel).await, None);
+        assert_eq!(channel.end(), ChannelEnd::LinkDown);
+        assert_eq!(received(&mut host.incoming).await, None);
+        assert!(lower
+            .cluster
+            .open_channel(higher.cluster.identity.id, ClientMessage::ListSessions)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_stopping_host_ends_the_channels_opened_to_it() {
+        let lower = node(LOWER, "low").build();
+        let higher = node(HIGHER, "high").build();
+        let _runs = running(&lower, &higher).await;
+        let mut channel = open(&lower, &higher, ClientMessage::ListSessions).await;
+        let _host = higher.next_hosted().await;
+
+        higher.cluster.shutdown().await;
+
+        assert_eq!(from_host(&mut channel).await, None);
+        assert_eq!(channel.end(), ChannelEnd::HostStopped);
+    }
+
+    #[tokio::test]
+    async fn a_host_that_ignores_its_credit_loses_the_channel_but_not_the_link() {
+        let ours = node(LOWER, "ours").build();
+        let (raw, link) = raw_peer(&ours, PIPE_CAPACITY).await;
+        let _run = tokio::spawn({
+            let cluster = Arc::clone(&ours.cluster);
+            async move { run(link, &cluster).await }
+        });
+        let (mut raw_reader, mut raw_writer) = split(raw);
+        let peer: ServerId = HIGHEST.parse().unwrap();
+
+        let mut channel = ours
+            .cluster
+            .open_channel(peer, ClientMessage::ListSessions)
+            .await
+            .unwrap();
+        let id = loop {
+            let payload = read_frame(&mut raw_reader).await.unwrap().unwrap();
+            if let PeerMessage::ChannelOpen { id, .. } = postcard::from_bytes(&payload).unwrap() {
+                break id;
+            }
+        };
+        let frame = ServerMessage::Output(vec![b'y'; 1024 * 1024]);
+        let flood = tokio::spawn(async move {
+            for _ in 0..32 {
+                let message = PeerMessage::ChannelToClient {
+                    id,
+                    message: frame.clone(),
+                };
+                write_message(&mut raw_writer, &message).await.unwrap();
+            }
+            raw_writer
+        });
+        let _raw_writer = tokio::time::timeout(PATIENCE, flood)
+            .await
+            .expect("the flood stalled")
+            .unwrap();
+
+        let mut delivered = 0;
+        while from_host(&mut channel).await.is_some() {
+            delivered += 1;
+        }
+        assert!(delivered < 32, "{delivered}");
+        assert_eq!(channel.end(), ChannelEnd::Overflow);
+        let closed = loop {
+            let payload = read_frame(&mut raw_reader).await.unwrap().unwrap();
+            if let PeerMessage::ChannelClose { id, from_opener } =
+                postcard::from_bytes(&payload).unwrap()
+            {
+                break (id, from_opener);
+            }
+        };
+        assert_eq!(closed, (id, true));
+        assert_eq!(links(&ours).len(), 1);
     }
 }

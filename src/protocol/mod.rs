@@ -12,15 +12,17 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 pub use client::{
-    ClientMessage, DebugCommand, LinkInfo, LinkState, ProjectCheckout, ServerMessage, ServerStatus,
-    ServerView, SessionId, SessionInfo, Size, WindowSummary,
+    is_locale_variable, AttachedSession, ClientMessage, DebugCommand, LinkInfo, LinkState,
+    NewSession, ProjectCheckout, ProjectRef, ServerMessage, ServerStatus, ServerView, SessionId,
+    SessionInfo, Size, WindowSummary, MIN_COLS, MIN_ROWS,
 };
 pub use greeting::{
     accept, greet, Greeting, IncompatibleServer, Role, Version, Welcome, MAGIC, PROTOCOL_MAJOR,
     PROTOCOL_MINOR, RELEASE,
 };
 pub use peer::{
-    Event, Farewell, Hello, PeerAddress, PeerMessage, Refusal, ServerState, Snapshot, StateEvent,
+    ChannelId, Event, Farewell, Hello, PeerAddress, PeerMessage, Refusal, ServerState, Snapshot,
+    StateEvent,
 };
 
 const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
@@ -166,11 +168,17 @@ mod tests {
     async fn messages_survive_a_round_trip() {
         let (mut client, mut server) = byte_pipe(1024);
         let sent = vec![
-            ClientMessage::NewSession {
-                name: Some("work".into()),
-                cwd: PathBuf::from("/tmp"),
+            ClientMessage::NewSession(NewSession {
+                on: Some("desk".into()),
+                cwd: Some(PathBuf::from("/tmp")),
+                env: vec![("LANG".into(), "C.UTF-8".into())],
+                ..NewSession::new(Some("work".into()), Size { rows: 24, cols: 80 })
+            }),
+            ClientMessage::Attach {
+                target: "work@desk:1.2".parse().unwrap(),
                 size: Size { rows: 24, cols: 80 },
             },
+            ClientMessage::Switch("@laptop".parse().unwrap()),
             ClientMessage::Input(b"ls\r".to_vec()),
             ClientMessage::Detach,
         ];
@@ -185,6 +193,20 @@ mod tests {
             received.push(message);
         }
         assert_eq!(received, sent);
+    }
+
+    #[test]
+    fn sizes_are_clamped_to_what_the_terminal_emulator_supports() {
+        let tiny = Size { rows: 0, cols: 1 }.clamped();
+        assert_eq!(
+            tiny,
+            Size {
+                rows: MIN_ROWS,
+                cols: MIN_COLS
+            }
+        );
+        let normal = Size { rows: 24, cols: 80 };
+        assert_eq!(normal.clamped(), normal);
     }
 
     #[tokio::test]

@@ -15,10 +15,7 @@ const RESET_INPUT_MODES: &[u8] =
 
 pub fn size() -> Result<Size> {
     let (cols, rows) = terminal::size()?;
-    Ok(Size {
-        rows: rows.max(1),
-        cols: cols.max(1),
-    })
+    Ok(Size { rows, cols }.clamped())
 }
 
 pub struct RawTerminal;

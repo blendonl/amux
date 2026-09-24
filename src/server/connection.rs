@@ -1,28 +1,88 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+use super::forward::{self, Host, Opening};
 use super::session::Session;
-use super::Server;
-use crate::protocol::{ClientMessage, DebugCommand, Duplex, ServerMessage, Size};
+use super::{Resolved, Server};
+use crate::protocol::{
+    AttachedSession, ClientMessage, DebugCommand, Duplex, NewSession, ServerMessage, Size,
+};
+use crate::target::{validate_session_name, Target};
 
 pub type ClientConnection = Duplex<ClientMessage, ServerMessage>;
 
-pub async fn handle(server: Arc<Server>, mut client: ClientConnection) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Local,
+    Peer,
+}
+
+pub enum Route {
+    Local(Arc<Session>),
+    Remote { host: Host, opening: Opening },
+}
+
+impl From<Resolved> for Route {
+    fn from(resolved: Resolved) -> Self {
+        match resolved {
+            Resolved::Local(session) => Self::Local(session),
+            Resolved::Remote(remote) => Self::Remote {
+                host: remote.host,
+                opening: Opening::Attach(remote.target),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    Detached,
+    Exited,
+    Switch(Target),
+}
+
+pub async fn handle(
+    server: Arc<Server>,
+    mut client: ClientConnection,
+    origin: Origin,
+) -> Result<()> {
     let Some(request) = client.incoming.recv().await else {
         return Ok(());
     };
-    debug!(?request, "client request");
+    debug!(?request, ?origin, "client request");
 
-    let target = match request {
-        ClientMessage::NewSession { name, cwd, size } => server
-            .create_session(name, &cwd, size)
-            .map(|session| (session, size)),
+    if origin == Origin::Peer && !allowed_over_a_channel(&request) {
+        let refusal = ServerMessage::Error("not allowed over a peer link".into());
+        return send(&client.outgoing, refusal).await;
+    }
+
+    let routed = match request {
+        ClientMessage::NewSession(request) => new_session_route(&server, request, origin),
         ClientMessage::Attach { target, size } => server
-            .find_session(target.as_deref())
-            .map(|session| (session, size)),
+            .resolve(&target, origin)
+            .map(|resolved| (Route::from(resolved), size)),
+        ClientMessage::Reattach {
+            incarnation,
+            session_id,
+            size,
+        } => match server.find_by_id(incarnation, session_id) {
+            Some(session) => Ok((Route::Local(session), size)),
+            None => return send(&client.outgoing, ServerMessage::Exited).await,
+        },
+        ClientMessage::KillSession {
+            target,
+            remove_worktree,
+        } => {
+            let reply = kill_session(&server, &target, remove_worktree, origin).await;
+            return send(&client.outgoing, done_or_error(reply)).await;
+        }
+        ClientMessage::RenameSession { target, name } => {
+            let reply = rename_session(&server, &target, name, origin).await;
+            return send(&client.outgoing, done_or_error(reply)).await;
+        }
         ClientMessage::ListSessions => {
             let sessions = ServerMessage::Sessions(server.list_sessions());
             return send(&client.outgoing, sessions).await;
@@ -54,9 +114,134 @@ pub async fn handle(server: Arc<Server>, mut client: ClientConnection) -> Result
         other => Err(anyhow!("{other:?} is only valid while attached")),
     };
 
-    match target {
-        Ok((session, size)) => attach(&server, &session, size, client).await,
+    match routed {
+        Ok((route, size)) => run_routes(&server, &mut client, route, size, origin).await,
         Err(err) => send(&client.outgoing, ServerMessage::Error(format!("{err:#}"))).await,
+    }
+}
+
+fn allowed_over_a_channel(request: &ClientMessage) -> bool {
+    matches!(
+        request,
+        ClientMessage::NewSession(_)
+            | ClientMessage::Attach { .. }
+            | ClientMessage::Reattach { .. }
+            | ClientMessage::KillSession { .. }
+            | ClientMessage::RenameSession { .. }
+            | ClientMessage::ListSessions
+            | ClientMessage::ListCluster
+    )
+}
+
+fn new_session_route(
+    server: &Arc<Server>,
+    request: NewSession,
+    origin: Origin,
+) -> Result<(Route, Size)> {
+    let size = request.size;
+    match server.host_for_new_session(request.on.as_deref(), origin)? {
+        None => Ok((Route::Local(server.create_session(&request)?), size)),
+        Some(peer) => {
+            let name = request.on.clone().unwrap_or_default();
+            let forwarded = NewSession {
+                on: None,
+                cwd: None,
+                ..request
+            };
+            Ok((
+                Route::Remote {
+                    host: Host { peer, name },
+                    opening: Opening::Create(Box::new(forwarded)),
+                },
+                size,
+            ))
+        }
+    }
+}
+
+async fn kill_session(
+    server: &Arc<Server>,
+    target: &Target,
+    remove_worktree: bool,
+    origin: Origin,
+) -> Result<()> {
+    if remove_worktree {
+        bail!("removing worktrees is not supported yet");
+    }
+    match server.resolve(target, origin)? {
+        Resolved::Local(session) => {
+            server.kill_session(&session);
+            Ok(())
+        }
+        Resolved::Remote(remote) => {
+            let request = ClientMessage::KillSession {
+                target: remote.target,
+                remove_worktree,
+            };
+            forward::request(server, &remote.host, request).await
+        }
+    }
+}
+
+async fn rename_session(
+    server: &Arc<Server>,
+    target: &Target,
+    name: String,
+    origin: Origin,
+) -> Result<()> {
+    match server.resolve(target, origin)? {
+        Resolved::Local(session) => server.rename_session(&session, name),
+        Resolved::Remote(remote) => {
+            validate_session_name(&name)?;
+            let request = ClientMessage::RenameSession {
+                target: remote.target,
+                name,
+            };
+            forward::request(server, &remote.host, request).await
+        }
+    }
+}
+
+async fn run_routes(
+    server: &Arc<Server>,
+    client: &mut ClientConnection,
+    mut route: Route,
+    size: Size,
+    origin: Origin,
+) -> Result<()> {
+    let mut size = size.clamped();
+    loop {
+        let outcome = match route {
+            Route::Local(session) => attach(server, &session, &mut size, client, origin).await?,
+            Route::Remote { host, opening } => {
+                forward::run(server, client, &host, opening, &mut size).await?
+            }
+        };
+        let target = match outcome {
+            Outcome::Detached | Outcome::Exited => return Ok(()),
+            Outcome::Switch(target) => target,
+        };
+        route = match server.resolve(&target, origin) {
+            Ok(resolved) => Route::from(resolved),
+            Err(err) => {
+                return send(&client.outgoing, ServerMessage::Error(format!("{err:#}"))).await
+            }
+        };
+    }
+}
+
+pub async fn switch_or_refuse(
+    server: &Server,
+    outgoing: &mpsc::Sender<ServerMessage>,
+    target: Target,
+    origin: Origin,
+) -> Result<Option<Outcome>> {
+    match server.resolve(&target, origin) {
+        Ok(_) => Ok(Some(Outcome::Switch(target))),
+        Err(err) => {
+            send(outgoing, ServerMessage::Error(format!("{err:#}"))).await?;
+            Ok(None)
+        }
     }
 }
 
@@ -70,21 +255,21 @@ fn done_or_error(result: Result<()>) -> ServerMessage {
 async fn attach(
     server: &Arc<Server>,
     session: &Arc<Session>,
-    size: Size,
-    client: ClientConnection,
-) -> Result<()> {
-    let Duplex {
-        mut incoming,
-        outgoing,
-    } = client;
+    size: &mut Size,
+    client: &mut ClientConnection,
+    origin: Origin,
+) -> Result<Outcome> {
     let _client = server.track_client(session);
     let pane = session.active_pane();
-    pane.resize(size)?;
+    pane.resize(*size)?;
 
-    let attached = ServerMessage::Attached {
-        session: session.name().to_owned(),
-    };
-    send(&outgoing, attached).await?;
+    let attached = ServerMessage::Attached(AttachedSession {
+        server: server.identity().name.clone(),
+        session: session.name(),
+        id: session.id(),
+        incarnation: server.incarnation(),
+    });
+    send(&client.outgoing, attached).await?;
 
     let mut updates = pane.subscribe();
     let mut frames = FrameDiffer::default();
@@ -92,9 +277,9 @@ async fn attach(
 
     loop {
         tokio::select! {
-            permit = outgoing.reserve(), if dirty => {
+            permit = client.outgoing.reserve(), if dirty => {
                 let Ok(permit) = permit else {
-                    return Ok(());
+                    return Ok(Outcome::Detached);
                 };
                 dirty = false;
                 let frame = frames.next(pane.screen());
@@ -104,30 +289,51 @@ async fn attach(
             }
             changed = updates.changed() => {
                 if changed.is_err() {
-                    return send(&outgoing, ServerMessage::Exited).await;
+                    send(&client.outgoing, ServerMessage::Exited).await?;
+                    return Ok(Outcome::Exited);
                 }
                 dirty = true;
             }
-            message = incoming.recv() => match message {
+            message = client.incoming.recv() => match message {
                 Some(ClientMessage::Input(bytes)) => {
+                    if pane.size() != *size {
+                        pane.resize(*size)?;
+                        dirty = true;
+                    }
                     session.record_input();
                     pane.write_input(bytes)?;
                 }
-                Some(ClientMessage::Resize(size)) => {
-                    pane.resize(size)?;
+                Some(ClientMessage::Resize(new_size)) => {
+                    *size = new_size.clamped();
+                    pane.resize(*size)?;
                     dirty = true;
                 }
+                Some(ClientMessage::Redraw) => {
+                    frames = FrameDiffer::default();
+                    dirty = true;
+                }
+                Some(ClientMessage::ListCluster) => {
+                    send(&client.outgoing, ServerMessage::Cluster(server.cluster_view())).await?;
+                }
+                Some(ClientMessage::Switch(target)) => {
+                    if let Some(outcome) =
+                        switch_or_refuse(server, &client.outgoing, target, origin).await?
+                    {
+                        return Ok(outcome);
+                    }
+                }
                 Some(ClientMessage::Detach) => {
-                    return send(&outgoing, ServerMessage::Detached).await;
+                    send(&client.outgoing, ServerMessage::Detached).await?;
+                    return Ok(Outcome::Detached);
                 }
                 Some(other) => warn!(?other, "ignoring message from attached client"),
-                None => return Ok(()),
+                None => return Ok(Outcome::Detached),
             },
         }
     }
 }
 
-async fn send(outgoing: &mpsc::Sender<ServerMessage>, message: ServerMessage) -> Result<()> {
+pub async fn send(outgoing: &mpsc::Sender<ServerMessage>, message: ServerMessage) -> Result<()> {
     outgoing
         .send(message)
         .await

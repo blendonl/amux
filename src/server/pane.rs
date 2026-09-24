@@ -3,12 +3,13 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
+use std::time::SystemTime;
 
 use anyhow::{anyhow, bail, Context, Result};
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::watch;
 
-use crate::protocol::Size;
+use crate::protocol::{is_locale_variable, Size};
 
 const SCROLLBACK_LINES: usize = 10_000;
 const READ_BUFFER_LEN: usize = 16 * 1024;
@@ -18,21 +19,23 @@ const STRIPPED_ENV_PREFIX: &str = "SSH_";
 pub struct Pane {
     master: Mutex<Box<dyn MasterPty + Send>>,
     input: mpsc::Sender<Vec<u8>>,
-    killer: Box<dyn ChildKiller + Send + Sync>,
+    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     parser: Arc<Mutex<vt100::Parser>>,
+    last_output: Arc<Mutex<SystemTime>>,
     updates: watch::Receiver<()>,
 }
 
 impl Pane {
-    pub fn spawn(cwd: &Path, size: Size) -> Result<Self> {
+    pub fn spawn(cwd: &Path, size: Size, env: &[(String, String)]) -> Result<Self> {
         check_working_directory(cwd)?;
+        let size = size.clamped();
         let pair = native_pty_system()
             .openpty(pty_size(size))
             .context("opening a pty")?;
 
         let child = pair
             .slave
-            .spawn_command(shell_command(cwd))
+            .spawn_command(shell_command(cwd, env))
             .context("spawning the shell")?;
         drop(pair.slave);
 
@@ -44,17 +47,40 @@ impl Pane {
             size.cols,
             SCROLLBACK_LINES,
         )));
+        let last_output = Arc::new(Mutex::new(SystemTime::now()));
         let (notifier, updates) = watch::channel(());
 
-        spawn_output_pump(reader, child, Arc::clone(&parser), notifier);
+        spawn_output_pump(
+            reader,
+            child,
+            OutputSinks {
+                parser: Arc::clone(&parser),
+                last_output: Arc::clone(&last_output),
+                notifier,
+            },
+        );
 
         Ok(Self {
             master: Mutex::new(pair.master),
             input: spawn_input_pump(writer),
-            killer,
+            killer: Mutex::new(killer),
             parser,
+            last_output,
             updates,
         })
+    }
+
+    pub fn size(&self) -> Size {
+        let (rows, cols) = lock(&self.parser).screen().size();
+        Size { rows, cols }
+    }
+
+    pub fn last_output(&self) -> SystemTime {
+        *lock(&self.last_output)
+    }
+
+    pub fn kill(&self) {
+        let _ = lock(&self.killer).kill();
     }
 
     pub fn subscribe(&self) -> watch::Receiver<()> {
@@ -74,6 +100,7 @@ impl Pane {
     }
 
     pub fn resize(&self, size: Size) -> Result<()> {
+        let size = size.clamped();
         lock(&self.master).resize(pty_size(size))?;
         lock(&self.parser)
             .screen_mut()
@@ -84,7 +111,7 @@ impl Pane {
 
 impl Drop for Pane {
     fn drop(&mut self) {
-        let _ = self.killer.kill();
+        self.kill();
     }
 }
 
@@ -97,27 +124,35 @@ fn check_working_directory(cwd: &Path) -> Result<()> {
     Ok(())
 }
 
-fn shell_command(cwd: &Path) -> CommandBuilder {
+fn shell_command(cwd: &Path, env: &[(String, String)]) -> CommandBuilder {
     let mut command = CommandBuilder::new_default_prog();
     let stripped: Vec<String> = command
         .iter_full_env_as_str()
         .map(|(key, _)| key)
-        .filter(|key| key.starts_with(STRIPPED_ENV_PREFIX))
+        .filter(|key| key.starts_with(STRIPPED_ENV_PREFIX) || is_locale_variable(key))
         .map(str::to_owned)
         .collect();
     for key in stripped {
         command.env_remove(key);
+    }
+    for (key, value) in env.iter().filter(|(key, _)| is_locale_variable(key)) {
+        command.env(key, value);
     }
     command.cwd(cwd);
     command.env("TERM", PANE_TERM);
     command
 }
 
+struct OutputSinks {
+    parser: Arc<Mutex<vt100::Parser>>,
+    last_output: Arc<Mutex<SystemTime>>,
+    notifier: watch::Sender<()>,
+}
+
 fn spawn_output_pump(
     mut reader: Box<dyn Read + Send>,
     mut child: Box<dyn Child + Send + Sync>,
-    parser: Arc<Mutex<vt100::Parser>>,
-    notifier: watch::Sender<()>,
+    sinks: OutputSinks,
 ) {
     thread::spawn(move || {
         let mut buffer = vec![0; READ_BUFFER_LEN];
@@ -125,8 +160,9 @@ fn spawn_output_pump(
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(len) => {
-                    lock(&parser).process(&buffer[..len]);
-                    notifier.send_replace(());
+                    lock(&sinks.parser).process(&buffer[..len]);
+                    *lock(&sinks.last_output) = SystemTime::now();
+                    sinks.notifier.send_replace(());
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
