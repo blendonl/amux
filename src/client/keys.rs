@@ -62,7 +62,10 @@ mod tests {
 
     #[test]
     fn plain_input_is_forwarded_untouched() {
-        assert_eq!(router().route(b"ls -la\r"), vec![Action::Forward(b"ls -la\r".to_vec())]);
+        assert_eq!(
+            router().route(b"ls -la\r"),
+            vec![Action::Forward(b"ls -la\r".to_vec())]
+        );
     }
 
     #[test]
@@ -75,7 +78,10 @@ mod tests {
 
     #[test]
     fn double_prefix_sends_a_literal_prefix() {
-        assert_eq!(router().route(b"\x02\x02"), vec![Action::Forward(vec![DEFAULT_PREFIX])]);
+        assert_eq!(
+            router().route(b"\x02\x02"),
+            vec![Action::Forward(vec![DEFAULT_PREFIX])]
+        );
     }
 
     #[test]
@@ -87,6 +93,9 @@ mod tests {
 
     #[test]
     fn unbound_keys_after_prefix_are_swallowed() {
-        assert_eq!(router().route(b"\x02zx"), vec![Action::Forward(b"x".to_vec())]);
+        assert_eq!(
+            router().route(b"\x02zx"),
+            vec![Action::Forward(b"x".to_vec())]
+        );
     }
 }

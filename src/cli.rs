@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
+use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+
+use crate::paths;
 
 #[derive(Debug, Parser)]
 #[command(name = "amux", version, about = "A terminal multiplexer")]
@@ -23,8 +26,26 @@ pub struct Cli {
     )]
     pub socket_path: Option<PathBuf>,
 
+    #[arg(
+        long,
+        global = true,
+        env = "AMUX_CONFIG",
+        value_name = "PATH",
+        help = "Config file, defaults to $XDG_CONFIG_HOME/amux/config.toml"
+    )]
+    pub config: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+impl Cli {
+    pub fn socket(&self) -> Result<PathBuf> {
+        match &self.socket_path {
+            Some(path) => Ok(path.clone()),
+            None => paths::default_socket(&self.socket_name),
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]

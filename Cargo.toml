@@ -11,11 +11,16 @@ license = "MIT"
 anyhow = "1.0.104"
 clap = { version = "4.5.61", features = ["derive", "env"] }
 crossterm = "0.29.0"
-nix = { version = "0.31.3", features = ["process", "user"] }
+getrandom = "0.3.4"
+nix = { version = "0.31.3", features = ["hostname", "process", "signal", "user"] }
 portable-pty = "0.9.0"
 postcard = { version = "1.1.3", features = ["use-std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time"] }
+toml = "1.0.7"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 vt100 = "0.16.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"

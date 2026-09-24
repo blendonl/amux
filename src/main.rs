@@ -1,31 +1,24 @@
-mod cli;
-mod client;
-mod paths;
-mod protocol;
-mod server;
-
 use anyhow::Result;
 use clap::Parser;
 
-use crate::cli::{Cli, Command, NewArgs};
+use amux::cli::{Cli, Command};
+use amux::client::{self, Endpoint};
+use amux::server;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let Cli {
-        socket_name,
-        socket_path,
-        command,
-    } = Cli::parse();
-    let socket = match socket_path {
-        Some(path) => path,
-        None => paths::default_socket(&socket_name)?,
+    let cli = Cli::parse();
+    let endpoint = Endpoint {
+        socket: cli.socket()?,
+        config: cli.config,
     };
 
-    match command.unwrap_or_else(|| Command::New(NewArgs::default())) {
-        Command::New(args) => client::new_session(&socket, args.name).await,
-        Command::Attach(args) => client::attach_session(&socket, args.target).await,
-        Command::List => client::list_sessions(&socket).await,
-        Command::KillServer => client::kill_server(&socket).await,
-        Command::Server => server::run(&socket).await,
+    match cli.command {
+        None => client::attach_or_create(&endpoint).await,
+        Some(Command::New(args)) => client::new_session(&endpoint, args.name).await,
+        Some(Command::Attach(args)) => client::attach_session(&endpoint, args.target).await,
+        Some(Command::List) => client::list_sessions(&endpoint).await,
+        Some(Command::KillServer) => client::kill_server(&endpoint).await,
+        Some(Command::Server) => server::run(&endpoint.socket, endpoint.config.as_deref()).await,
     }
 }

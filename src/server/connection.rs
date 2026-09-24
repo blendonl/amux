@@ -1,17 +1,17 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::UnixStream;
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use super::session::Session;
 use super::Server;
-use crate::protocol::{self, ClientMessage, ServerMessage, Size};
+use crate::protocol::{ClientMessage, Duplex, ServerMessage, Size};
 
-pub async fn handle(server: Arc<Server>, stream: UnixStream) -> Result<()> {
-    let (mut reader, mut writer) = stream.into_split();
-    let Some(request) = protocol::read_message(&mut reader).await? else {
+pub type ClientConnection = Duplex<ClientMessage, ServerMessage>;
+
+pub async fn handle(server: Arc<Server>, mut client: ClientConnection) -> Result<()> {
+    let Some(request) = client.incoming.recv().await else {
         return Ok(());
     };
     debug!(?request, "client request");
@@ -25,7 +25,7 @@ pub async fn handle(server: Arc<Server>, stream: UnixStream) -> Result<()> {
             .map(|session| (session, size)),
         ClientMessage::ListSessions => {
             let sessions = ServerMessage::Sessions(server.list_sessions());
-            return protocol::write_message(&mut writer, &sessions).await;
+            return send(&client.outgoing, sessions).await;
         }
         ClientMessage::KillServer => {
             server.shut_down();
@@ -35,20 +35,16 @@ pub async fn handle(server: Arc<Server>, stream: UnixStream) -> Result<()> {
     };
 
     match target {
-        Ok((session, size)) => attach(&session, size, reader, writer).await,
-        Err(err) => {
-            let reply = ServerMessage::Error(format!("{err:#}"));
-            protocol::write_message(&mut writer, &reply).await
-        }
+        Ok((session, size)) => attach(&session, size, client).await,
+        Err(err) => send(&client.outgoing, ServerMessage::Error(format!("{err:#}"))).await,
     }
 }
 
-async fn attach(
-    session: &Session,
-    size: Size,
-    reader: OwnedReadHalf,
-    mut writer: OwnedWriteHalf,
-) -> Result<()> {
+async fn attach(session: &Session, size: Size, client: ClientConnection) -> Result<()> {
+    let Duplex {
+        mut incoming,
+        outgoing,
+    } = client;
     let _client = session.track_client();
     let pane = session.active_pane();
     pane.resize(size)?;
@@ -56,30 +52,38 @@ async fn attach(
     let attached = ServerMessage::Attached {
         session: session.name().to_owned(),
     };
-    protocol::write_message(&mut writer, &attached).await?;
+    send(&outgoing, attached).await?;
 
-    let mut incoming = protocol::incoming::<_, ClientMessage>(reader);
     let mut updates = pane.subscribe();
     let mut frames = FrameDiffer::default();
-    send_frame(&mut writer, frames.next(pane.screen())).await?;
+    let mut dirty = true;
 
     loop {
         tokio::select! {
+            permit = outgoing.reserve(), if dirty => {
+                let Ok(permit) = permit else {
+                    return Ok(());
+                };
+                dirty = false;
+                let frame = frames.next(pane.screen());
+                if !frame.is_empty() {
+                    permit.send(ServerMessage::Output(frame));
+                }
+            }
             changed = updates.changed() => {
                 if changed.is_err() {
-                    return protocol::write_message(&mut writer, &ServerMessage::Exited).await;
+                    return send(&outgoing, ServerMessage::Exited).await;
                 }
-                send_frame(&mut writer, frames.next(pane.screen())).await?;
+                dirty = true;
             }
             message = incoming.recv() => match message {
                 Some(ClientMessage::Input(bytes)) => pane.write_input(bytes)?,
                 Some(ClientMessage::Resize(size)) => {
                     pane.resize(size)?;
-                    frames.reset();
-                    send_frame(&mut writer, frames.next(pane.screen())).await?;
+                    dirty = true;
                 }
                 Some(ClientMessage::Detach) => {
-                    return protocol::write_message(&mut writer, &ServerMessage::Detached).await;
+                    return send(&outgoing, ServerMessage::Detached).await;
                 }
                 Some(other) => warn!(?other, "ignoring message from attached client"),
                 None => return Ok(()),
@@ -88,11 +92,11 @@ async fn attach(
     }
 }
 
-async fn send_frame(writer: &mut OwnedWriteHalf, frame: Vec<u8>) -> Result<()> {
-    if frame.is_empty() {
-        return Ok(());
-    }
-    protocol::write_message(writer, &ServerMessage::Output(frame)).await
+async fn send(outgoing: &mpsc::Sender<ServerMessage>, message: ServerMessage) -> Result<()> {
+    outgoing
+        .send(message)
+        .await
+        .map_err(|_| anyhow!("the client disconnected"))
 }
 
 #[derive(Default)]
@@ -103,14 +107,66 @@ struct FrameDiffer {
 impl FrameDiffer {
     fn next(&mut self, screen: vt100::Screen) -> Vec<u8> {
         let frame = match &self.previous {
-            Some(previous) => screen.state_diff(previous),
-            None => screen.state_formatted(),
+            Some(previous) if previous.size() == screen.size() => screen.state_diff(previous),
+            _ => screen.state_formatted(),
         };
         self.previous = Some(screen);
         frame
     }
+}
 
-    fn reset(&mut self) {
-        self.previous = None;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parser_with(text: &[u8]) -> vt100::Parser {
+        let mut parser = vt100::Parser::new(4, 20, 0);
+        parser.process(text);
+        parser
+    }
+
+    #[test]
+    fn the_first_frame_is_a_full_redraw() {
+        let parser = parser_with(b"hello");
+        let mut frames = FrameDiffer::default();
+        assert_eq!(
+            frames.next(parser.screen().clone()),
+            parser.screen().state_formatted()
+        );
+    }
+
+    #[test]
+    fn an_unchanged_screen_sends_nothing() {
+        let parser = parser_with(b"hello");
+        let mut frames = FrameDiffer::default();
+        frames.next(parser.screen().clone());
+        assert!(frames.next(parser.screen().clone()).is_empty());
+    }
+
+    #[test]
+    fn changes_at_the_same_size_send_a_diff_that_reproduces_the_screen() {
+        let mut parser = parser_with(b"hello");
+        let mut frames = FrameDiffer::default();
+        let mut client = vt100::Parser::new(4, 20, 0);
+        client.process(&frames.next(parser.screen().clone()));
+
+        parser.process(b" world");
+        let diff = frames.next(parser.screen().clone());
+        assert_ne!(diff, parser.screen().state_formatted());
+        client.process(&diff);
+        assert_eq!(client.screen().contents(), "hello world");
+    }
+
+    #[test]
+    fn a_size_change_resets_to_a_full_redraw() {
+        let mut parser = parser_with(b"hello");
+        let mut frames = FrameDiffer::default();
+        frames.next(parser.screen().clone());
+
+        parser.screen_mut().set_size(6, 30);
+        assert_eq!(
+            frames.next(parser.screen().clone()),
+            parser.screen().state_formatted()
+        );
     }
 }
