@@ -1,7 +1,11 @@
+#[allow(dead_code, unused_imports)]
+mod chrome;
 mod keys;
 mod listing;
 mod overlay;
 mod terminal;
+#[allow(dead_code)]
+mod tree;
 
 use std::env;
 use std::fmt;
