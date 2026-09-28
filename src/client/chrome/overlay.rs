@@ -1,14 +1,21 @@
 use super::draw::{self, Span, Style};
+use crate::keys::Key;
 use crate::protocol::Size;
+use crate::settings::{Binding, Keymap};
 
-const DETACH_HINT: &str = "Ctrl-b d detaches";
 const TEXT: Style = Style::PLAIN.bold();
 const BORDER: Style = Style::PLAIN;
 const PADDING: usize = 1;
 const FRAME_COLUMNS: usize = 2 * (1 + PADDING);
 const FRAME_ROWS: usize = 2;
 
-pub fn render_reconnecting(server: &str, size: Size) -> Vec<u8> {
+pub fn detach_hint(keymap: &Keymap, prefix: &Key) -> Option<String> {
+    keymap
+        .hint_for(&Binding::Detach, prefix)
+        .map(|keys| format!("{keys} detaches"))
+}
+
+pub fn render_reconnecting(server: &str, hint: Option<&str>, size: Size) -> Vec<u8> {
     let title = format!("reconnecting to {server}…");
     let rows = usize::from(size.rows);
     let cols = usize::from(size.cols);
@@ -19,10 +26,9 @@ pub fn render_reconnecting(server: &str, size: Size) -> Vec<u8> {
 
     out.extend_from_slice(draw::SAVE_CURSOR);
     out.extend_from_slice(draw::HIDE_CURSOR);
-    let lines: Vec<&str> = if rows >= 2 + FRAME_ROWS {
-        vec![&title, DETACH_HINT]
-    } else {
-        vec![&title]
+    let lines: Vec<&str> = match hint {
+        Some(hint) if rows >= 2 + FRAME_ROWS => vec![&title, hint],
+        _ => vec![&title],
     };
     if rows >= lines.len() + FRAME_ROWS && cols > FRAME_COLUMNS {
         draw_box(&mut out, &lines, rows, cols);
@@ -88,11 +94,20 @@ fn draw_centered_line(out: &mut Vec<u8>, text: &str, rows: usize, cols: usize) {
 mod tests {
     use super::*;
     use crate::client::chrome::testing::{screen_text, terminal};
+    use crate::settings::Settings;
+
+    fn default_hint() -> Option<String> {
+        detach_hint(&Keymap::default(), &Settings::default().prefix)
+    }
 
     fn draw(server: &str, rows: u16, cols: u16) -> vt100::Parser {
         let mut parser = terminal(rows, cols);
         parser.process(b"shell$\x1b[1;4H");
-        parser.process(&render_reconnecting(server, Size { rows, cols }));
+        parser.process(&render_reconnecting(
+            server,
+            default_hint().as_deref(),
+            Size { rows, cols },
+        ));
         parser
     }
 
@@ -159,9 +174,18 @@ mod tests {
             vec!["shell$", "reconnect…"]
         );
         let mut single_cell = terminal(1, 1);
-        single_cell.process(&render_reconnecting("desktop", Size { rows: 1, cols: 1 }));
+        single_cell.process(&render_reconnecting(
+            "desktop",
+            default_hint().as_deref(),
+            Size { rows: 1, cols: 1 },
+        ));
         assert_eq!(screen_text(&single_cell), vec!["…"]);
-        assert!(render_reconnecting("desktop", Size { rows: 0, cols: 0 }).is_empty());
+        assert!(render_reconnecting(
+            "desktop",
+            default_hint().as_deref(),
+            Size { rows: 0, cols: 0 }
+        )
+        .is_empty());
     }
 
     #[test]
@@ -172,5 +196,32 @@ mod tests {
         let rows = screen_text(&draw("東京", 4, 22));
         assert_eq!(rows[1], "│ reconnecting to …  │");
         assert_eq!(rows[2], "│ Ctrl-b d detaches  │");
+    }
+
+    #[test]
+    fn the_hint_follows_the_prefix_and_the_detach_binding() {
+        let prefix: Key = "M-a".parse().unwrap();
+        assert_eq!(
+            detach_hint(&Keymap::default(), &prefix).as_deref(),
+            Some("Alt-a d detaches")
+        );
+
+        let mut keymap = Keymap::default();
+        keymap.prefix = keymap
+            .prefix
+            .iter()
+            .filter(|(_, binding)| **binding != Binding::Detach)
+            .map(|(key, binding)| (*key, binding.clone()))
+            .collect();
+        assert_eq!(detach_hint(&keymap, &prefix), None);
+
+        let size = Size { rows: 24, cols: 80 };
+        let mut parser = terminal(size.rows, size.cols);
+        parser.process(&render_reconnecting("desktop", None, size));
+        let rows = screen_text(&parser);
+        let pad = " ".repeat(26);
+        assert_eq!(rows[10], format!("{pad}┌{}┐", "─".repeat(26)));
+        assert_eq!(rows[11], format!("{pad}│ reconnecting to desktop… │"));
+        assert_eq!(rows[12], format!("{pad}└{}┘", "─".repeat(26)));
     }
 }

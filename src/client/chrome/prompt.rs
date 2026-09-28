@@ -1,5 +1,6 @@
 use super::draw::{self, Color, Span, Style};
-use super::input::{Key, KeyDecoder};
+use crate::keys::{Decoded, Key, KeyDecoder};
+use crate::settings::{PromptAction, Table};
 
 const PROMPT: Style = Style::PLAIN.fg(Color::Black).bg(Color::Yellow);
 const LABEL: Style = PROMPT.bold();
@@ -19,10 +20,11 @@ pub struct Prompt {
     text: Vec<char>,
     cursor: usize,
     keys: KeyDecoder,
+    bindings: Table<PromptAction>,
 }
 
 impl Prompt {
-    pub fn new(label: impl Into<String>, initial: &str) -> Self {
+    pub fn new(label: impl Into<String>, initial: &str, bindings: Table<PromptAction>) -> Self {
         let text: Vec<char> = initial
             .chars()
             .filter(|character| !character.is_control())
@@ -32,6 +34,7 @@ impl Prompt {
             cursor: text.len(),
             text,
             keys: KeyDecoder::default(),
+            bindings,
         }
     }
 
@@ -40,8 +43,8 @@ impl Prompt {
     }
 
     pub fn handle(&mut self, input: &[u8]) -> PromptEvent {
-        for key in self.keys.feed(input) {
-            if let Some(event) = self.apply(key) {
+        for decoded in self.keys.feed(input) {
+            if let Some(event) = self.press(&decoded) {
                 return event;
             }
         }
@@ -55,7 +58,7 @@ impl Prompt {
     pub fn time_out(&mut self) -> PromptEvent {
         self.keys
             .time_out()
-            .and_then(|key| self.apply(key))
+            .and_then(|decoded| self.press(&decoded))
             .unwrap_or(PromptEvent::Pending)
     }
 
@@ -110,29 +113,40 @@ impl Prompt {
         (visible, cursor_column)
     }
 
-    fn apply(&mut self, key: Key) -> Option<PromptEvent> {
-        match key {
-            Key::Enter => return Some(PromptEvent::Submit(self.text())),
-            Key::Escape | Key::Ctrl('c') => return Some(PromptEvent::Cancel),
-            Key::Char(character) => {
-                self.text.insert(self.cursor, character);
-                self.cursor += 1;
-            }
-            Key::Backspace if self.cursor > 0 => {
+    fn press(&mut self, decoded: &Decoded) -> Option<PromptEvent> {
+        self.bindings
+            .resolve(decoded)
+            .into_iter()
+            .find_map(|(key, action)| self.apply(key, action))
+    }
+
+    fn apply(&mut self, key: Key, action: Option<PromptAction>) -> Option<PromptEvent> {
+        match action {
+            Some(PromptAction::Submit) => return Some(PromptEvent::Submit(self.text())),
+            Some(PromptAction::Cancel) => return Some(PromptEvent::Cancel),
+            Some(PromptAction::DeleteBackward) if self.cursor > 0 => {
                 self.cursor -= 1;
                 self.text.remove(self.cursor);
             }
-            Key::Delete if self.cursor < self.text.len() => {
+            Some(PromptAction::DeleteForward) if self.cursor < self.text.len() => {
                 self.text.remove(self.cursor);
             }
-            Key::Ctrl('u') => {
+            Some(PromptAction::DeleteLine) => {
                 self.text.clear();
                 self.cursor = 0;
             }
-            Key::Left => self.cursor = self.cursor.saturating_sub(1),
-            Key::Right => self.cursor = (self.cursor + 1).min(self.text.len()),
-            Key::Home | Key::Ctrl('a') => self.cursor = 0,
-            Key::End | Key::Ctrl('e') => self.cursor = self.text.len(),
+            Some(PromptAction::CursorLeft) => self.cursor = self.cursor.saturating_sub(1),
+            Some(PromptAction::CursorRight) => {
+                self.cursor = (self.cursor + 1).min(self.text.len());
+            }
+            Some(PromptAction::CursorStart) => self.cursor = 0,
+            Some(PromptAction::CursorEnd) => self.cursor = self.text.len(),
+            None => {
+                if let Some(character) = key.printable() {
+                    self.text.insert(self.cursor, character);
+                    self.cursor += 1;
+                }
+            }
             _ => {}
         }
         None
@@ -143,9 +157,14 @@ impl Prompt {
 mod tests {
     use super::*;
     use crate::client::chrome::testing::{row_text, terminal};
+    use crate::settings::Keymap;
+
+    fn new_prompt(label: &str, initial: &str) -> Prompt {
+        Prompt::new(label, initial, Keymap::default().prompt)
+    }
 
     fn edited(initial: &str, chunks: &[&[u8]]) -> Prompt {
-        let mut prompt = Prompt::new("name", initial);
+        let mut prompt = new_prompt("name", initial);
         for chunk in chunks {
             assert_eq!(prompt.handle(chunk), PromptEvent::Pending);
         }
@@ -193,19 +212,19 @@ mod tests {
     #[test]
     fn enter_submits_and_escape_cancels() {
         assert_eq!(
-            Prompt::new("name", "sh").handle(b"ell\r"),
+            new_prompt("name", "sh").handle(b"ell\r"),
             PromptEvent::Submit("shell".into())
         );
         assert_eq!(
-            Prompt::new("name", "").handle(b"a\nb"),
+            new_prompt("name", "").handle(b"a\nb"),
             PromptEvent::Submit("a".into())
         );
         assert_eq!(
-            Prompt::new("name", "sh").handle(b"\x1bx"),
+            new_prompt("name", "sh").handle(b"\x1bx"),
             PromptEvent::Cancel
         );
         assert_eq!(
-            Prompt::new("name", "sh").handle(b"\x03"),
+            new_prompt("name", "sh").handle(b"\x03"),
             PromptEvent::Cancel
         );
     }
@@ -227,12 +246,12 @@ mod tests {
 
     #[test]
     fn a_lone_escape_cancels_once_the_timeout_expires() {
-        let mut prompt = Prompt::new("name", "sh");
+        let mut prompt = new_prompt("name", "sh");
         assert_eq!(prompt.handle(b"\x1b"), PromptEvent::Pending);
         assert!(prompt.is_partial());
         assert_eq!(prompt.time_out(), PromptEvent::Cancel);
 
-        let mut prompt = Prompt::new("name", "sh");
+        let mut prompt = new_prompt("name", "sh");
         assert_eq!(prompt.time_out(), PromptEvent::Pending);
         assert_eq!(prompt.handle(b"\x1b[D"), PromptEvent::Pending);
         assert!(!prompt.is_partial());
@@ -242,12 +261,12 @@ mod tests {
     fn unknown_keys_do_not_change_the_text() {
         let prompt = edited("sh", &[b"\x1b[15~\x1b[<0;3;4M\t\x1b[A\x02"]);
         assert_eq!((prompt.text().as_str(), prompt.cursor), ("sh", 2));
-        assert_eq!(Prompt::new("name", "a\x1bb").text(), "ab");
+        assert_eq!(new_prompt("name", "a\x1bb").text(), "ab");
     }
 
     #[test]
     fn rendering_draws_the_label_and_text_and_places_the_cursor() {
-        let parser = draw(&Prompt::new("rename window", "sh"), 40);
+        let parser = draw(&new_prompt("rename window", "sh"), 40);
         let screen = parser.screen();
 
         assert_eq!(row_text(&parser, 2), "rename window: sh");
@@ -260,7 +279,7 @@ mod tests {
 
     #[test]
     fn rendering_leaves_default_attributes() {
-        let mut parser = draw(&Prompt::new("name", ""), 20);
+        let mut parser = draw(&new_prompt("name", ""), 20);
         parser.process(b"x");
         let cell = parser.screen().cell(2, 6).unwrap();
         assert_eq!(cell.contents(), "x");
@@ -270,7 +289,7 @@ mod tests {
 
     #[test]
     fn long_text_scrolls_to_keep_the_cursor_visible() {
-        let mut prompt = Prompt::new("name", "abcdefghijklmnopqrstuvwxyz");
+        let mut prompt = new_prompt("name", "abcdefghijklmnopqrstuvwxyz");
         let parser = draw(&prompt, 20);
         assert_eq!(row_text(&parser, 2), "name: nopqrstuvwxyz");
         assert_eq!(parser.screen().cursor_position(), (2, 19));
@@ -283,7 +302,7 @@ mod tests {
 
     #[test]
     fn wide_characters_scroll_by_whole_characters() {
-        let mut prompt = Prompt::new("n", "日本語");
+        let mut prompt = new_prompt("n", "日本語");
         let parser = draw(&prompt, 12);
         assert_eq!(row_text(&parser, 2), "n: 日本語");
         assert_eq!(parser.screen().cursor_position(), (2, 9));
@@ -300,7 +319,7 @@ mod tests {
 
     #[test]
     fn a_narrow_row_shortens_the_label_first() {
-        let prompt = Prompt::new("rename window", "sh");
+        let prompt = new_prompt("rename window", "sh");
         let parser = draw(&prompt, 12);
         assert_eq!(row_text(&parser, 2), "renam…sh");
         assert_eq!(parser.screen().cursor_position(), (2, 8));

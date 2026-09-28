@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 
-use super::chrome::{self, draw_row, Key, KeyDecoder, Rect, Span, Style};
+use super::chrome::{self, draw_row, Rect, Span, Style};
+use crate::keys::{Decoded, KeyDecoder};
 use crate::project::ProjectId;
 use crate::protocol::{ServerStatus, ServerView, SessionInfo, WindowSummary};
+use crate::settings::{Table, TreeAction};
 use crate::target::Target;
 
 const INDENT: &str = "  ";
@@ -77,10 +79,15 @@ pub struct ClusterTree {
     cursor: usize,
     scroll: usize,
     keys: KeyDecoder,
+    bindings: Table<TreeAction>,
 }
 
 impl ClusterTree {
-    pub fn new(servers: &[ServerView], attached: Option<&Target>) -> Self {
+    pub fn new(
+        servers: &[ServerView],
+        attached: Option<&Target>,
+        bindings: Table<TreeAction>,
+    ) -> Self {
         let nodes = build(servers);
         let cursor = attached
             .and_then(|attached| {
@@ -94,12 +101,13 @@ impl ClusterTree {
             cursor,
             scroll: 0,
             keys: KeyDecoder::default(),
+            bindings,
         }
     }
 
     pub fn handle(&mut self, input: &[u8]) -> TreeEvent {
-        for key in self.keys.feed(input) {
-            if let Some(event) = self.apply(key) {
+        for decoded in self.keys.feed(input) {
+            if let Some(event) = self.press(&decoded) {
                 return event;
             }
         }
@@ -113,7 +121,7 @@ impl ClusterTree {
     pub fn time_out(&mut self) -> TreeEvent {
         self.keys
             .time_out()
-            .and_then(|key| self.apply(key))
+            .and_then(|decoded| self.press(&decoded))
             .unwrap_or(TreeEvent::Pending)
     }
 
@@ -145,17 +153,23 @@ impl ClusterTree {
         out
     }
 
-    fn apply(&mut self, key: Key) -> Option<TreeEvent> {
-        match key {
-            Key::Char('j') | Key::Down => self.move_by(1),
-            Key::Char('k') | Key::Up => self.move_by(-1),
-            Key::Char('g') | Key::Home => self.move_by(isize::MIN),
-            Key::Char('G') | Key::End => self.move_by(isize::MAX),
-            Key::Char('h') | Key::Left => self.collapse(),
-            Key::Char('l') | Key::Right => self.expand(),
-            Key::Enter => return self.pick(),
-            Key::Escape | Key::Char('q') | Key::Ctrl('c') => return Some(TreeEvent::Cancel),
-            _ => {}
+    fn press(&mut self, decoded: &Decoded) -> Option<TreeEvent> {
+        self.bindings
+            .resolve(decoded)
+            .into_iter()
+            .find_map(|(_, action)| action.and_then(|action| self.apply(action)))
+    }
+
+    fn apply(&mut self, action: TreeAction) -> Option<TreeEvent> {
+        match action {
+            TreeAction::Down => self.move_by(1),
+            TreeAction::Up => self.move_by(-1),
+            TreeAction::Top => self.move_by(isize::MIN),
+            TreeAction::Bottom => self.move_by(isize::MAX),
+            TreeAction::Collapse => self.collapse(),
+            TreeAction::Expand => self.expand(),
+            TreeAction::Pick => return self.pick(),
+            TreeAction::Cancel => return Some(TreeEvent::Cancel),
         }
         None
     }
@@ -413,6 +427,7 @@ mod tests {
     use super::*;
     use crate::client::chrome::testing::{screen_text, terminal};
     use crate::protocol::{ProjectCheckout, SessionId, Version};
+    use crate::settings::Keymap;
 
     const AMUX: &str = "github.com/blendonl/amux";
 
@@ -523,7 +538,7 @@ mod tests {
 
     fn attached_tree() -> ClusterTree {
         let attached: Target = "amux/main@desktop".parse().unwrap();
-        ClusterTree::new(&cluster(), Some(&attached))
+        ClusterTree::new(&cluster(), Some(&attached), Keymap::default().tree)
     }
 
     fn lines(tree: &mut ClusterTree, rows: u16, cols: u16) -> Vec<String> {
@@ -602,15 +617,26 @@ mod tests {
 
     #[test]
     fn without_an_attached_session_the_cursor_starts_at_the_top() {
-        assert_eq!(current(&ClusterTree::new(&cluster(), None)), "desktop");
+        assert_eq!(
+            current(&ClusterTree::new(&cluster(), None, Keymap::default().tree)),
+            "desktop"
+        );
         let elsewhere: Target = "amux/main@laptop".parse().unwrap();
         assert_eq!(
-            current(&ClusterTree::new(&cluster(), Some(&elsewhere))),
+            current(&ClusterTree::new(
+                &cluster(),
+                Some(&elsewhere),
+                Keymap::default().tree
+            )),
             "desktop"
         );
         let unqualified: Target = "notes/main".parse().unwrap();
         assert_eq!(
-            current(&ClusterTree::new(&cluster(), Some(&unqualified))),
+            current(&ClusterTree::new(
+                &cluster(),
+                Some(&unqualified),
+                Keymap::default().tree
+            )),
             "notes/main"
         );
     }
@@ -817,7 +843,7 @@ mod tests {
 
     #[test]
     fn an_empty_cluster_renders_blank_and_ignores_keys() {
-        let mut tree = ClusterTree::new(&[], None);
+        let mut tree = ClusterTree::new(&[], None, Keymap::default().tree);
         assert_eq!(lines(&mut tree, 2, 10), vec!["", ""]);
         assert_eq!(tree.handle(b"jkhl\r"), TreeEvent::Pending);
         assert_eq!(tree.handle(b"q"), TreeEvent::Cancel);

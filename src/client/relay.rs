@@ -8,16 +8,17 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Instant};
 
 use super::chrome::{
-    draw_row, render_reconnecting, Prompt, PromptEvent, Rect, StatusLine, Style, WindowTab,
+    detach_hint, draw_row, render_reconnecting, Prompt, PromptEvent, Rect, StatusLine, Style,
+    WindowTab,
 };
-use super::keys::{Action, Panel, PrefixRouter, DEFAULT_PREFIX};
+use super::router::{Action, KeyRouter, Panel};
 use super::terminal;
 use super::tree::{ClusterTree, TreeEvent};
 use crate::protocol::{
     AttachedSession, ClientMessage, ClusterStatus, ServerMessage, ServerView, SessionCommand,
     SessionState, Size,
 };
-use crate::settings::Settings;
+use crate::settings::{Keymap, Settings};
 use crate::target::Target;
 
 const DRAIN_LIMIT: usize = 64;
@@ -58,7 +59,9 @@ pub struct Relay {
     attached: AttachedSession,
     size: Size,
     settings: Arc<Settings>,
-    router: PrefixRouter,
+    keymap: Arc<Keymap>,
+    router: KeyRouter,
+    detach_hint: Option<String>,
     session: Option<SessionState>,
     cluster: Option<ClusterStatus>,
     notice: Option<(String, Instant)>,
@@ -78,13 +81,18 @@ impl Relay {
         attached: AttachedSession,
         size: Size,
         settings: Arc<Settings>,
+        keymap: Arc<Keymap>,
     ) -> Self {
+        let router = KeyRouter::new(settings.prefix, Arc::clone(&keymap), settings.escape_time());
+        let detach_hint = detach_hint(&keymap, &settings.prefix);
         Self {
             local,
             attached,
             size,
             settings,
-            router: PrefixRouter::new(DEFAULT_PREFIX),
+            keymap,
+            router,
+            detach_hint,
             session: None,
             cluster: None,
             notice: None,
@@ -143,25 +151,23 @@ impl Relay {
     }
 
     pub fn input(&mut self, chunk: &[u8]) {
-        if self.overlay.is_some() {
-            self.overlay_input(chunk);
-            return;
-        }
-        let (actions, rest) = self.router.route(chunk);
-        for action in actions {
-            match action {
-                Action::Forward(bytes) => self.messages.push(ClientMessage::Input(bytes)),
-                Action::Detach => self.messages.push(ClientMessage::Detach),
-                Action::Command(command) => self.messages.push(ClientMessage::Command(command)),
-                Action::Open(panel) => self.open(panel),
+        let mut input = chunk.to_vec();
+        while !input.is_empty() {
+            if self.overlay.is_some() {
+                self.overlay_input(&input);
+                return;
             }
-        }
-        if !rest.is_empty() {
-            self.overlay_input(rest);
+            let (actions, rest) = self.router.route(&input);
+            self.act(actions);
+            input = rest;
         }
     }
 
     pub fn stdin_closed(&mut self) {
+        let held = self.router.flush();
+        if !held.is_empty() {
+            self.messages.push(ClientMessage::Input(held));
+        }
         self.messages.push(ClientMessage::Detach);
     }
 
@@ -179,10 +185,19 @@ impl Relay {
     }
 
     pub fn escape_deadline(&self) -> Option<Instant> {
-        self.escape_at
+        [self.router.escape_deadline(), self.escape_at]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     pub fn escape_timeout(&mut self) {
+        if self.router.escape_deadline().is_some() {
+            let (actions, rest) = self.router.time_out();
+            self.act(actions);
+            self.input(&rest);
+            return;
+        }
         self.escape_at = None;
         match &mut self.overlay {
             Some(Overlay::Prompt(prompt, rename)) => {
@@ -225,6 +240,17 @@ impl Relay {
         self.end.take()
     }
 
+    fn act(&mut self, actions: Vec<Action>) {
+        for action in actions {
+            match action {
+                Action::Forward(bytes) => self.messages.push(ClientMessage::Input(bytes)),
+                Action::Detach => self.messages.push(ClientMessage::Detach),
+                Action::Command(command) => self.messages.push(ClientMessage::Command(command)),
+                Action::Open(panel) => self.open(panel),
+            }
+        }
+    }
+
     fn host_output(&mut self, bytes: &[u8]) {
         if matches!(self.overlay, Some(Overlay::Tree(_) | Overlay::Loading(_))) {
             return;
@@ -243,11 +269,19 @@ impl Relay {
     fn open(&mut self, panel: Panel) {
         let overlay = match panel {
             Panel::RenameWindow => Overlay::Prompt(
-                Prompt::new(RENAME_WINDOW, &self.active_window_name()),
+                Prompt::new(
+                    RENAME_WINDOW,
+                    &self.active_window_name(),
+                    self.keymap.prompt.clone(),
+                ),
                 Rename::Window,
             ),
             Panel::RenameSession => Overlay::Prompt(
-                Prompt::new(RENAME_SESSION, self.session_name()),
+                Prompt::new(
+                    RENAME_SESSION,
+                    self.session_name(),
+                    self.keymap.prompt.clone(),
+                ),
                 Rename::Session,
             ),
             Panel::ClusterTree => {
@@ -265,7 +299,11 @@ impl Relay {
         };
         let pending = mem::take(pending);
         let attached = self.attached_target();
-        self.overlay = Some(Overlay::Tree(ClusterTree::new(servers, Some(&attached))));
+        self.overlay = Some(Overlay::Tree(ClusterTree::new(
+            servers,
+            Some(&attached),
+            self.keymap.tree.clone(),
+        )));
         self.chrome_dirty = true;
         self.overlay_input(&pending);
     }
@@ -347,7 +385,11 @@ impl Relay {
                         rows: above.rows,
                         cols: above.cols,
                     };
-                    self.output.extend(render_reconnecting(server, area));
+                    self.output.extend(render_reconnecting(
+                        server,
+                        self.detach_hint.as_deref(),
+                        area,
+                    ));
                 }
             }
         }
@@ -495,7 +537,8 @@ mod tests {
     use super::*;
     use crate::client::chrome::testing::{row_text, screen_text, terminal};
     use crate::config::Incarnation;
-    use crate::protocol::{ServerStatus, SessionId, SessionInfo, WindowSummary};
+    use crate::protocol::{Direction, ServerStatus, SessionId, SessionInfo, WindowSummary};
+    use crate::settings::Binding;
 
     const SIZE: Size = Size { rows: 10, cols: 40 };
     const BOTTOM: u16 = SIZE.rows - 1;
@@ -515,6 +558,7 @@ mod tests {
             attached("work", server),
             SIZE,
             Arc::new(Settings::default()),
+            Arc::new(Keymap::default()),
         );
         (relay, terminal(SIZE.rows, SIZE.cols))
     }
@@ -602,6 +646,7 @@ mod tests {
             attached("work", "desktop"),
             size,
             Arc::new(Settings::default()),
+            Arc::new(Keymap::default()),
         );
         let mut parser = terminal(size.rows, size.cols);
         relay.server_message(Some(state("work", 0)));
@@ -874,5 +919,120 @@ mod tests {
                 ClientMessage::Redraw,
             ]
         );
+    }
+
+    fn relay_with(settings: Settings, keymap: Keymap) -> Relay {
+        Relay::new(
+            "laptop".into(),
+            attached("work", "laptop"),
+            SIZE,
+            Arc::new(settings),
+            Arc::new(keymap),
+        )
+    }
+
+    fn ctrl_a() -> Settings {
+        Settings {
+            prefix: "C-a".parse().unwrap(),
+            ..Settings::default()
+        }
+    }
+
+    fn with_root(notation: &str, binding: Binding) -> Keymap {
+        let mut keymap = Keymap::default();
+        keymap.root.insert(notation.parse().unwrap(), binding);
+        keymap
+    }
+
+    #[test]
+    fn the_prefix_setting_replaces_ctrl_b() {
+        let mut relay = relay_with(ctrl_a(), Keymap::default());
+        relay.input(b"\x02n\x01n\x01\x01\x01d");
+        assert_eq!(
+            relay.take_messages(),
+            vec![
+                ClientMessage::Input(b"\x02n".to_vec()),
+                ClientMessage::Command(SessionCommand::NextWindow),
+                ClientMessage::Input(b"\x01".to_vec()),
+                ClientMessage::Detach,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_root_binding_opens_a_panel_that_takes_the_rest_of_the_chunk() {
+        let mut relay = relay_with(
+            Settings::default(),
+            with_root("M-r", Binding::RenameSession),
+        );
+        relay.input(b"a\x1br\x15notes\rignored");
+        assert_eq!(
+            relay.take_messages(),
+            vec![
+                ClientMessage::Input(b"a".to_vec()),
+                ClientMessage::RenameSession {
+                    target: "work@laptop".parse().unwrap(),
+                    name: "notes".into(),
+                },
+                ClientMessage::Redraw,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_held_escape_reaches_the_session_when_the_timeout_expires() {
+        let mut relay = relay_with(
+            Settings::default(),
+            with_root("M-h", Binding::SelectPane(Direction::Left)),
+        );
+        relay.input(b"ls\x1b");
+        assert_eq!(
+            relay.take_messages(),
+            vec![ClientMessage::Input(b"ls".to_vec())]
+        );
+        assert!(relay.escape_deadline().is_some());
+        relay.escape_timeout();
+        assert_eq!(
+            relay.take_messages(),
+            vec![ClientMessage::Input(b"\x1b".to_vec())]
+        );
+        assert_eq!(relay.escape_deadline(), None);
+
+        relay.input(b"\x1b");
+        relay.input(b"h");
+        assert_eq!(
+            relay.take_messages(),
+            vec![ClientMessage::Command(SessionCommand::SelectPane(
+                Direction::Left
+            ))]
+        );
+    }
+
+    #[test]
+    fn closing_stdin_sends_held_bytes_before_detaching() {
+        let mut relay = relay_with(
+            Settings::default(),
+            with_root("M-h", Binding::SelectPane(Direction::Left)),
+        );
+        relay.input(b"\x1b");
+        relay.stdin_closed();
+        assert_eq!(
+            relay.take_messages(),
+            vec![
+                ClientMessage::Input(b"\x1b".to_vec()),
+                ClientMessage::Detach
+            ]
+        );
+    }
+
+    #[test]
+    fn the_reconnecting_hint_names_the_configured_prefix() {
+        let mut relay = relay_with(ctrl_a(), Keymap::default());
+        let mut parser = terminal(SIZE.rows, SIZE.cols);
+        relay.server_message(Some(ServerMessage::Reconnecting {
+            server: "laptop".into(),
+        }));
+        draw(&mut relay, &mut parser);
+        assert!(parser.screen().contents().contains("Ctrl-a d detaches"));
     }
 }

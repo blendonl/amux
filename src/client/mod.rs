@@ -1,8 +1,8 @@
 mod chrome;
-mod keys;
 mod listing;
 mod projects;
 mod relay;
+mod router;
 mod terminal;
 mod tree;
 
@@ -29,7 +29,7 @@ use crate::protocol::{
     self, is_locale_variable, ClientMessage, DebugCommand, Duplex, IncompatibleServer, NewSession,
     ProjectRef, Role, ServerMessage, ServerView, SessionInfo, Version,
 };
-use crate::settings::Settings;
+use crate::settings::{Keymap, Settings};
 use crate::target::{self, Target};
 use relay::Relay;
 use terminal::RawTerminal;
@@ -370,7 +370,13 @@ async fn attach(
         None => bail!("server closed the connection"),
     };
 
-    let mut relay = Relay::new(local.to_owned(), attached, terminal::size()?, settings);
+    let mut relay = Relay::new(
+        local.to_owned(),
+        attached,
+        terminal::size()?,
+        settings,
+        Arc::new(Keymap::default()),
+    );
     let outcome = {
         let _terminal = RawTerminal::enter()?;
         relay::run(incoming, outgoing, &mut relay).await?
