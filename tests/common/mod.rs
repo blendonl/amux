@@ -90,6 +90,7 @@ pub struct TestServerBuilder {
     tailscale: bool,
     lan: bool,
     tailscale_tags: Vec<String>,
+    tailscale_port: Option<u16>,
 }
 
 impl TestServerBuilder {
@@ -129,6 +130,11 @@ impl TestServerBuilder {
         self
     }
 
+    pub fn tailscale_port(mut self, port: u16) -> Self {
+        self.tailscale_port = Some(port);
+        self
+    }
+
     pub fn lan(mut self, lan: &FakeLan) -> Self {
         self.lan = true;
         self.env("AMUX_LAN_DIR", &lan.path().display().to_string())
@@ -161,10 +167,13 @@ impl TestServerBuilder {
         let state = dir("state");
         let config = dir("config");
         fs::create_dir_all(config.join("amux")).expect("creating the config dir");
-        let discovery = format!(
+        let mut discovery = format!(
             "[discovery]\ntailscale = {}\nlan = {}\ntailscale_tags = {:?}\n",
             self.tailscale, self.lan, self.tailscale_tags
         );
+        if let Some(port) = self.tailscale_port {
+            discovery.push_str(&format!("tailscale_port = {port}\n"));
+        }
         fs::write(
             config.join("amux").join("config.toml"),
             format!("name = {:?}\n{}\n{discovery}", self.name, self.config),
@@ -265,6 +274,7 @@ impl TestServer {
             tailscale: false,
             lan: false,
             tailscale_tags: Vec::new(),
+            tailscale_port: None,
         }
     }
 

@@ -8,9 +8,10 @@ pub mod transport;
 pub mod trust;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
+use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -21,6 +22,7 @@ use tokio::sync::{broadcast, watch, Notify, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::config::{DiscoveryConfig, Incarnation, ServerConfig, ServerId, ServerIdentity};
+use crate::discovery::tailscale::Tailnet;
 use crate::protocol::{
     self, ClientMessage, DiscoveryStatus, DiscoveryView, Duplex, Event, Farewell, Hello, LinkInfo,
     LinkState, LinkTransport, PeerAddress, PeerMessage, PublicKey, Refusal, Role, ServerMessage,
@@ -75,6 +77,7 @@ pub struct Cluster {
     trust_path: Option<PathBuf>,
     key: Mutex<NoiseKey>,
     handshakes: Arc<Semaphore>,
+    tailnet: OnceLock<Arc<Tailnet>>,
     source: Weak<dyn StateSource>,
     members: Mutex<Members>,
     changes: watch::Sender<()>,
@@ -421,6 +424,7 @@ impl Cluster {
             trust_path,
             key: Mutex::new(options.key),
             handshakes: Arc::new(Semaphore::new(listener::MAX_PENDING_HANDSHAKES)),
+            tailnet: OnceLock::new(),
             source,
             members: Mutex::new(members),
             changes: watch::channel(()).0,
@@ -616,11 +620,20 @@ impl Cluster {
         Ok(public)
     }
 
-    pub fn voucher(&self, key: &PublicKey) -> Voucher {
-        if self.members().trust.is_trusted(key) {
-            Voucher::TrustStore
-        } else {
-            Voucher::Nobody
+    pub async fn voucher(&self, key: &PublicKey, remote: IpAddr) -> Voucher {
+        let trusted = self.members().trust.is_trusted(key);
+        if trusted {
+            return Voucher::TrustStore;
+        }
+        match self.tailnet.get() {
+            Some(tailnet) if tailnet.vouches_for(remote).await => Voucher::Tailnet,
+            _ => Voucher::Nobody,
+        }
+    }
+
+    pub fn use_tailnet(&self, tailnet: Arc<Tailnet>) {
+        if self.tailnet.set(tailnet).is_err() {
+            warn!("ignoring a second tailnet");
         }
     }
 
@@ -1562,8 +1575,7 @@ impl Cluster {
         let mut failure = "there is no endpoint to dial".to_owned();
         for endpoint in endpoints {
             debug!(%address, %endpoint, "dialing");
-            let connected =
-                tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(endpoint.as_str())).await;
+            let connected = tokio::time::timeout(CONNECT_TIMEOUT, self.connect(endpoint)).await;
             match connected {
                 Ok(Ok(stream)) => return self.dial_noise(address, stream).await,
                 Ok(Err(err)) => failure = format!("connecting to {endpoint}: {err}"),
@@ -1575,10 +1587,18 @@ impl Cluster {
         false
     }
 
+    async fn connect(&self, endpoint: &str) -> io::Result<TcpStream> {
+        match self.tailnet.get() {
+            Some(tailnet) => tailnet.connect(endpoint).await,
+            None => TcpStream::connect(endpoint).await,
+        }
+    }
+
     async fn dial_noise(self: &Arc<Self>, address: &str, stream: TcpStream) -> bool {
         let _ = stream.set_nodelay(true);
         let key = self.noise_key();
         let handshake = tokio::time::timeout(self.settings.handshake_timeout, async {
+            let dialed = stream.peer_addr().context("reading the dialed address")?;
             let Secured {
                 remote,
                 stream,
@@ -1587,7 +1607,7 @@ impl Cluster {
             } = noise::initiate(stream, &key, TcpKind::Link).await?;
             let auth = TransportAuth::Noise {
                 key: remote,
-                vouched_by: self.voucher(&remote),
+                vouched_by: self.voucher(&remote, dialed.ip()).await,
             };
             let (reader, writer) = tokio::io::split(stream);
             let handshake = link::dial(self, reader, writer, auth).await?;
@@ -2575,8 +2595,12 @@ mod tests {
             ]
         );
         assert!(cluster.trusts_anyone());
-        assert_eq!(cluster.voucher(&rotated), Voucher::TrustStore);
-        assert_eq!(cluster.voucher(&first), Voucher::Nobody);
+        let tailnet_ip = IpAddr::from([100, 64, 0, 2]);
+        assert_eq!(
+            cluster.voucher(&rotated, tailnet_ip).await,
+            Voucher::TrustStore
+        );
+        assert_eq!(cluster.voucher(&first, tailnet_ip).await, Voucher::Nobody);
     }
 
     #[tokio::test]

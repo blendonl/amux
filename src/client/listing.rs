@@ -675,6 +675,27 @@ lan        running
     }
 
     #[test]
+    fn discover_counts_the_machines_a_source_found() {
+        let report = |machines| DiscoveryReport {
+            sources: vec![SourceView {
+                via: Via::Tailscale,
+                state: SourceState::RunningWith { machines },
+            }],
+            peers: Vec::new(),
+        };
+
+        assert_eq!(
+            discovery(&report(0)),
+            "tailscale  running with 0 machines\n"
+        );
+        assert_eq!(discovery(&report(1)), "tailscale  running with 1 machine\n");
+        assert_eq!(
+            discovery(&report(2)),
+            "tailscale  running with 2 machines\n"
+        );
+    }
+
+    #[test]
     fn durations_round_up_to_whole_minutes() {
         assert_eq!(duration(1), "1 second");
         assert_eq!(duration(45), "45 seconds");

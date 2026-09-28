@@ -168,6 +168,7 @@ pub enum SourceState {
     NotRunning,
     Running,
     Unavailable(String),
+    RunningWith { machines: usize },
 }
 
 impl fmt::Display for SourceState {
@@ -177,6 +178,8 @@ impl fmt::Display for SourceState {
             Self::NotRunning => f.write_str("not running"),
             Self::Running => f.write_str("running"),
             Self::Unavailable(reason) => f.write_str(reason),
+            Self::RunningWith { machines: 1 } => f.write_str("running with 1 machine"),
+            Self::RunningWith { machines } => write!(f, "running with {machines} machines"),
         }
     }
 }

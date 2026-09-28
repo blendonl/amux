@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::num::NonZeroU16;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -50,6 +51,7 @@ pub struct DiscoveryConfig {
     pub tailscale: bool,
     pub lan: bool,
     pub tailscale_tags: Vec<String>,
+    pub tailscale_port: Option<NonZeroU16>,
 }
 
 impl Default for DiscoveryConfig {
@@ -58,6 +60,7 @@ impl Default for DiscoveryConfig {
             tailscale: true,
             lan: true,
             tailscale_tags: Vec::new(),
+            tailscale_port: None,
         }
     }
 }
@@ -348,6 +351,7 @@ mod tests {
                     tailscale: true,
                     lan: true,
                     tailscale_tags: Vec::new(),
+                    tailscale_port: None,
                 },
                 lan: LanConfig { port: 0 },
             }
@@ -374,9 +378,18 @@ mod tests {
                 tailscale: false,
                 lan: true,
                 tailscale_tags: vec!["tag:amux".into()],
+                tailscale_port: None,
             }
         );
         assert_eq!(config.lan, LanConfig { port: 7448 });
+    }
+
+    #[test]
+    fn the_tailnet_port_can_be_chosen_but_not_zero() {
+        let config = parse("[discovery]\ntailscale_port = 7500").unwrap();
+        assert_eq!(config.discovery.tailscale_port, NonZeroU16::new(7500));
+        assert!(parse("[discovery]\ntailscale_port = 0").is_err());
+        assert!(parse("[discovery]\ntailscale_port = 70000").is_err());
     }
 
     #[test]

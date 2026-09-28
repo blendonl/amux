@@ -107,7 +107,7 @@ async fn handshake(
         ..
     } = noise::respond(stream, &cluster.noise_key(), kind).await?;
     debug!(%remote, %key, "accepted a noise connection");
-    let vouched_by = cluster.voucher(&key);
+    let vouched_by = cluster.voucher(&key, remote.ip()).await;
     let handshake = cluster.noise_handshake(stream, key, vouched_by).await?;
     Ok(Some((handshake, flushed)))
 }
