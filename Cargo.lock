@@ -55,6 +55,7 @@ dependencies = [
  "crossterm",
  "getrandom 0.3.4",
  "hmac",
+ "if-addrs",
  "mdns-sd",
  "mlua",
  "nix 0.31.3",

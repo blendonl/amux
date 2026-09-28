@@ -9,7 +9,7 @@ use super::{read_frame, write_message};
 
 pub const MAGIC: [u8; 4] = *b"AMUX";
 pub const TCP_MAGIC: [u8; 4] = *b"AMXT";
-pub const PROTOCOL_MAJOR: u16 = 7;
+pub const PROTOCOL_MAJOR: u16 = 8;
 pub const PROTOCOL_MINOR: u16 = 0;
 pub const RELEASE: &str = env!("CARGO_PKG_VERSION");
 

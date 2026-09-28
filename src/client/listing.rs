@@ -303,6 +303,10 @@ pub fn pairing_instructions(code: &str, expires_in_secs: u64, port: Option<u16>)
     )
 }
 
+pub fn pairing_step(elapsed: Duration, step: &str) -> String {
+    format!("[{:>7.3}s] {step}", elapsed.as_secs_f64())
+}
+
 pub fn pairing_attempt(reason: &str, attempts_left: u8) -> String {
     match attempts_left {
         1 => format!("{reason}, 1 attempt left"),
@@ -789,6 +793,21 @@ waiting for the other machine...
         assert_eq!(
             pairing_attempt("a wrong code was tried", 1),
             "a wrong code was tried, 1 attempt left"
+        );
+    }
+
+    #[test]
+    fn pairing_steps_show_the_time_since_the_pair_started() {
+        assert_eq!(
+            pairing_step(
+                Duration::from_millis(1204),
+                "connecting to 192.168.0.10:40123"
+            ),
+            "[  1.204s] connecting to 192.168.0.10:40123"
+        );
+        assert_eq!(
+            pairing_step(Duration::from_secs(125), "pairing timed out"),
+            "[125.000s] pairing timed out"
         );
     }
 

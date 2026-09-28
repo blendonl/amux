@@ -59,7 +59,16 @@ async fn listen(cluster: Arc<Cluster>, listener: TcpListener) {
                 continue;
             }
         };
+        let local = stream
+            .local_addr()
+            .map_or_else(|_| "this machine".to_owned(), |local| local.to_string());
+        cluster.pairing().narrate(format!(
+            "accepted a tcp connection from {remote} on {local}"
+        ));
         let Ok(permit) = Arc::clone(&cluster.handshakes).try_acquire_owned() else {
+            cluster.pairing().narrate(format!(
+                "dropping the connection from {remote}, {MAX_PENDING_HANDSHAKES} handshakes are running"
+            ));
             debug!(%remote, "dropping a tcp connection, too many handshakes are running");
             continue;
         };
@@ -85,7 +94,13 @@ async fn serve(
         }
         Ok(Ok(None)) => {}
         Ok(Err(err)) => info!(%remote, "a tcp connection failed: {err:#}"),
-        Err(_) => info!(%remote, "a tcp connection did not finish its handshake in time"),
+        Err(_) => {
+            cluster.pairing().narrate(format!(
+                "the connection from {remote} did not finish its handshake within {} seconds",
+                PRE_AUTH_TIMEOUT.as_secs()
+            ));
+            info!(%remote, "a tcp connection did not finish its handshake in time");
+        }
     }
 }
 
@@ -94,8 +109,20 @@ async fn handshake(
     mut stream: TcpStream,
     remote: SocketAddr,
 ) -> Result<Option<(NoiseHandshake, oneshot::Receiver<()>)>> {
-    let Some(kind) = noise::read_opening(&mut stream).await? else {
-        return Ok(None);
+    let kind = match noise::read_opening(&mut stream).await {
+        Ok(Some(kind)) => kind,
+        Ok(None) => {
+            cluster.pairing().narrate(format!(
+                "{remote} closed the connection before it said what it is for"
+            ));
+            return Ok(None);
+        }
+        Err(err) => {
+            cluster.pairing().narrate(format!(
+                "the connection from {remote} did not open like amux: {err:#}"
+            ));
+            return Err(err);
+        }
     };
     if kind == TcpKind::Pair {
         let Some(paired) = pairing::host(cluster, stream, remote).await? else {

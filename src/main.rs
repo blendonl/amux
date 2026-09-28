@@ -49,9 +49,7 @@ async fn main() -> Result<()> {
             }
         },
         Some(Command::Discover) => client::discover(&endpoint).await,
-        Some(Command::Pair(args)) => {
-            client::pair(&endpoint, args.code, args.host, args.new_key).await
-        }
+        Some(Command::Pair(args)) => client::pair(&endpoint, args).await,
         Some(Command::Config(action)) => run_config(action, endpoint.config.as_deref()),
         Some(Command::KillServer) => client::kill_server(&endpoint).await,
         Some(Command::Server) => server::run(&endpoint.socket, endpoint.config.as_deref()).await,

@@ -123,8 +123,8 @@ pub async fn handle(
             let report = ServerMessage::Discovery(server.discovery().report());
             return send(&client.outgoing, report).await;
         }
-        ClientMessage::OpenPairing { new_key } => {
-            let paired = pairing::open(server.discovery(), new_key, &mut client).await;
+        ClientMessage::OpenPairing { new_key, verbose } => {
+            let paired = pairing::open(server.discovery(), new_key, verbose, &mut client).await;
             return match paired {
                 Ok(()) => Ok(()),
                 Err(err) => send(&client.outgoing, ServerMessage::Error(format!("{err:#}"))).await,
@@ -134,8 +134,15 @@ pub async fn handle(
             code,
             host,
             new_key,
+            verbose,
         } => {
-            let paired = pairing::join(server.discovery(), code, host, new_key, &mut client).await;
+            let joining = pairing::Joining {
+                code,
+                host,
+                new_key,
+                verbose,
+            };
+            let paired = pairing::join(server.discovery(), joining, &mut client).await;
             return match paired {
                 Ok(()) => Ok(()),
                 Err(err) => send(&client.outgoing, ServerMessage::Error(format!("{err:#}"))).await,

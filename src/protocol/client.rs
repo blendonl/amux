@@ -332,11 +332,13 @@ pub enum ClientMessage {
     },
     OpenPairing {
         new_key: bool,
+        verbose: bool,
     },
     JoinPairing {
         code: String,
         host: Option<String>,
         new_key: bool,
+        verbose: bool,
     },
 }
 
@@ -403,5 +405,6 @@ pub enum ServerMessage {
         reason: String,
         attempts_left: u8,
     },
+    PairingStep(String),
     Notice(String),
 }

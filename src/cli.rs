@@ -298,6 +298,13 @@ pub struct PairArgs {
         help = "Give this server a new key first, so that a server that was forgotten can pair again"
     )]
     pub new_key: bool,
+
+    #[arg(
+        short,
+        long,
+        help = "Print each step of the pairing as it happens, to see where it stops"
+    )]
+    pub verbose: bool,
 }
 
 #[derive(Debug, Args)]

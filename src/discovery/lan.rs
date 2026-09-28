@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use if_addrs::Interface;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
@@ -111,6 +112,20 @@ pub fn endpoints(advertisement: &Advertisement) -> Vec<SocketAddr> {
         .into_iter()
         .map(|ip| SocketAddr::new(ip, advertisement.port))
         .collect()
+}
+
+pub fn lan_interfaces() -> Vec<Interface> {
+    let mut interfaces: Vec<Interface> = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|interface| {
+            !interface.is_loopback()
+                && !mdns::is_skipped_interface(&interface.name)
+                && is_dialable(&interface.ip())
+        })
+        .collect();
+    interfaces.sort_by_key(|interface| interface.ip().is_ipv6());
+    interfaces
 }
 
 async fn follow(context: &SourceContext, backend: &dyn LanDiscovery, lan: &Lan) -> bool {

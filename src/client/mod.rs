@@ -13,7 +13,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
 use nix::sys::signal::{kill, Signal};
@@ -21,7 +21,7 @@ use nix::unistd::Pid;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
-use crate::cli::{Grouping, NewArgs};
+use crate::cli::{Grouping, NewArgs, PairArgs};
 use crate::cluster::{Address, LAN_PORT_FILE};
 use crate::config;
 use crate::lua::{self, ConfigPaths, LuaScripting, Process};
@@ -286,20 +286,23 @@ pub async fn discover(endpoint: &Endpoint) -> Result<()> {
     }
 }
 
-pub async fn pair(
-    endpoint: &Endpoint,
-    code: Option<String>,
-    host: Option<String>,
-    new_key: bool,
-) -> Result<()> {
+pub async fn pair(endpoint: &Endpoint, args: PairArgs) -> Result<()> {
+    let PairArgs {
+        code,
+        host,
+        new_key,
+        verbose,
+    } = args;
     let request = match code {
         Some(code) => ClientMessage::JoinPairing {
             code,
             host,
             new_key,
+            verbose,
         },
-        None => ClientMessage::OpenPairing { new_key },
+        None => ClientMessage::OpenPairing { new_key, verbose },
     };
+    let started = Instant::now();
     let Duplex {
         mut incoming,
         outgoing,
@@ -319,6 +322,9 @@ pub async fn pair(
                 reason,
                 attempts_left,
             }) => println!("{}", listing::pairing_attempt(&reason, attempts_left)),
+            Some(ServerMessage::PairingStep(step)) => {
+                println!("{}", listing::pairing_step(started.elapsed(), &step));
+            }
             Some(ServerMessage::Paired {
                 name,
                 id,

@@ -191,11 +191,15 @@ mod tests {
             ClientMessage::ForgetServer {
                 name: "laptop".into(),
             },
-            ClientMessage::OpenPairing { new_key: true },
+            ClientMessage::OpenPairing {
+                new_key: true,
+                verbose: false,
+            },
             ClientMessage::JoinPairing {
                 code: "k7-4821-9930".into(),
                 host: Some("192.168.0.10".into()),
                 new_key: false,
+                verbose: true,
             },
         ];
 
@@ -280,6 +284,7 @@ mod tests {
             ServerMessage::PairingClosed {
                 reason: "the code expired".into(),
             },
+            ServerMessage::PairingStep("connected to 192.168.0.10:40123".into()),
         ];
         for message in &sent {
             write_message(&mut server, message).await.unwrap();

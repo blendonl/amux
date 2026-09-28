@@ -1,5 +1,5 @@
 use std::fmt;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -118,9 +118,32 @@ struct Window {
 
 #[derive(Debug)]
 enum HostEvent {
+    Step(String),
     Paired(Peer),
     Failed { reason: String, attempts_left: u8 },
     Closed(String),
+}
+
+pub struct Joining {
+    pub code: String,
+    pub host: Option<String>,
+    pub new_key: bool,
+    pub verbose: bool,
+}
+
+struct Narrator(Option<mpsc::Sender<ServerMessage>>);
+
+impl Narrator {
+    fn new(verbose: bool, client: &PairingClient) -> Self {
+        Self(verbose.then(|| client.outgoing.clone()))
+    }
+
+    async fn step(&self, step: String) {
+        info!("{step}");
+        if let Some(outgoing) = &self.0 {
+            let _ = outgoing.send(ServerMessage::PairingStep(step)).await;
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +236,20 @@ impl Pairing {
         }
     }
 
+    pub fn narrate(&self, step: String) {
+        let window = self.window();
+        if let Some(window) = window.as_ref().filter(|window| !window.is_expired()) {
+            let _ = window.host.send(HostEvent::Step(step));
+        }
+    }
+
+    fn abandoned(&self, remote: SocketAddr, err: anyhow::Error) -> anyhow::Error {
+        self.narrate(format!(
+            "the pairing connection from {remote} failed: {err:#}"
+        ));
+        err
+    }
+
     fn window(&self) -> MutexGuard<'_, Option<Window>> {
         self.window.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -237,7 +274,13 @@ impl Drop for OpenWindow<'_> {
     }
 }
 
-pub async fn open(discovery: &Discovery, new_key: bool, client: &mut PairingClient) -> Result<()> {
+pub async fn open(
+    discovery: &Discovery,
+    new_key: bool,
+    verbose: bool,
+    client: &mut PairingClient,
+) -> Result<()> {
+    let narrator = Narrator::new(verbose, client);
     let context = discovery.context();
     if !context.options.settings.lan {
         bail!("pairing needs LAN discovery, which is off in the config");
@@ -261,6 +304,13 @@ pub async fn open(discovery: &Discovery, new_key: bool, client: &mut PairingClie
         port = address.port(),
         "opened a pairing window"
     );
+    narrator
+        .step(format!(
+            "listening for the other machine on {address}, advertising window {} over mDNS",
+            code.window()
+        ))
+        .await;
+    narrator.step(lan_addresses()).await;
     let opened = ServerMessage::PairingOpen {
         code: code.to_string(),
         expires_in_secs: lifetime.as_secs(),
@@ -272,6 +322,7 @@ pub async fn open(discovery: &Discovery, new_key: bool, client: &mut PairingClie
     loop {
         tokio::select! {
             event = happened.recv() => match event {
+                Some(HostEvent::Step(step)) => narrator.step(step).await,
                 Some(HostEvent::Paired(peer)) => {
                     let paired = ServerMessage::Paired {
                         name: peer.name,
@@ -320,15 +371,31 @@ where
         info!(%remote, "closing a pairing connection, no pairing window is open");
         return Ok(None);
     }
+    pairing.narrate(format!("{remote} opened a pairing connection"));
     let Ok(_connection) = pairing.connection.try_lock() else {
+        pairing.narrate(format!(
+            "closing the pairing connection from {remote}, another one is running"
+        ));
         info!(%remote, "closing a pairing connection, another one is running");
         return Ok(None);
     };
     let key = cluster.noise_key();
-    let mut secured = noise::respond(stream, &key, TcpKind::Pair).await?;
-    let theirs = match receive(&mut secured.stream).await? {
+    let mut secured = noise::respond(stream, &key, TcpKind::Pair)
+        .await
+        .map_err(|err| pairing.abandoned(remote, err))?;
+    pairing.narrate(format!(
+        "finished the noise handshake with {remote}, its key fingerprint is {}",
+        secured.remote.fingerprint()
+    ));
+    let theirs = match receive(&mut secured.stream)
+        .await
+        .map_err(|err| pairing.abandoned(remote, err))?
+    {
         PairMessage::Spake(theirs) => theirs,
-        other => bail!("expected a SPAKE2 message, got {}", other.kind()),
+        other => {
+            let unexpected = anyhow!("expected a SPAKE2 message, got {}", other.kind());
+            return Err(pairing.abandoned(remote, unexpected));
+        }
     };
     let Some(attempt) = pairing.attempt() else {
         let _ = send(&mut secured.stream, &PairMessage::Closed).await;
@@ -341,6 +408,9 @@ where
         attempts_left = attempt.attempts_left,
         "a machine is trying the pairing code"
     );
+    pairing.narrate(format!(
+        "received the SPAKE2 message from {remote}, checking the code"
+    ));
     let peer = match confirm_joiner(cluster, &key, &mut secured, &attempt.code, &theirs).await {
         Ok(Some(peer)) => peer,
         Ok(None) => {
@@ -372,28 +442,47 @@ where
 
 pub async fn join(
     discovery: &Discovery,
-    code: String,
-    host: Option<String>,
-    new_key: bool,
+    joining: Joining,
     client: &mut PairingClient,
 ) -> Result<()> {
-    let code: Code = code.parse()?;
+    let code: Code = joining.code.parse()?;
+    let narrator = Narrator::new(joining.verbose, client);
     let cluster = Arc::clone(&discovery.context().cluster);
-    if new_key {
+    if joining.new_key {
         cluster.rotate_key()?;
     }
-    let endpoints = match &host {
-        Some(host) => vec![host_endpoint(discovery, host)?],
-        None => advertised_endpoints(discovery, &code).await?,
+    let endpoints = match &joining.host {
+        Some(host) => {
+            let endpoint = host_endpoint(discovery, host)?;
+            narrator
+                .step(format!(
+                    "dialing {endpoint}, the address --host {host} names"
+                ))
+                .await;
+            vec![endpoint]
+        }
+        None => advertised_endpoints(discovery, &code, &narrator).await?,
     };
+    narrator.step(lan_addresses()).await;
     let key = cluster.noise_key();
     let (secured, peer) = tokio::time::timeout(
         EXCHANGE_TIMEOUT,
-        pair_with(&cluster, &key, &code, &endpoints),
+        pair_with(&cluster, &key, &code, &endpoints, &narrator),
     )
     .await
-    .context("pairing timed out")??;
+    .with_context(|| {
+        format!(
+            "pairing timed out, it did not finish within {} seconds",
+            EXCHANGE_TIMEOUT.as_secs()
+        )
+    })??;
     info!(peer = %peer.name, id = %peer.id, key = %peer.key, "paired");
+    narrator
+        .step(format!(
+            "linking to {} over the pairing connection",
+            peer.name
+        ))
+        .await;
     let paired = ServerMessage::Paired {
         name: peer.name.clone(),
         id: peer.id,
@@ -411,16 +500,23 @@ async fn pair_with(
     cluster: &Cluster,
     key: &NoiseKey,
     code: &Code,
-    endpoints: &[String],
+    endpoints: &[SocketAddr],
+    narrator: &Narrator,
 ) -> Result<(Secured, Peer)> {
-    let stream = connect(endpoints).await?;
+    let stream = connect(endpoints, narrator).await?;
     let mut secured = noise::initiate(stream, key, TcpKind::Pair).await.context(
         "the other machine refused the pairing connection, is `amux pair` still waiting there",
     )?;
+    narrator
+        .step(format!(
+            "finished the noise handshake, the other machine's key fingerprint is {}",
+            secured.remote.fingerprint()
+        ))
+        .await;
     if cluster.forgot(&secured.remote) {
         bail!("the other machine's key was forgotten here, run `amux pair --new-key` there");
     }
-    let peer = confirm_host(cluster, key, &mut secured, code).await?;
+    let peer = confirm_host(cluster, key, &mut secured, code, narrator).await?;
     trust(cluster, &peer)?;
     Ok((secured, peer))
 }
@@ -430,6 +526,7 @@ async fn confirm_host(
     key: &NoiseKey,
     secured: &mut Secured,
     code: &Code,
+    narrator: &Narrator,
 ) -> Result<Peer> {
     let exchange = Exchange::start(
         Side::Joiner,
@@ -440,6 +537,9 @@ async fn confirm_host(
     );
     let stream = &mut secured.stream;
     send(stream, &PairMessage::Spake(exchange.message().to_vec())).await?;
+    narrator
+        .step("sent the SPAKE2 message, waiting for the other machine's".into())
+        .await;
     let theirs = match receive(stream).await? {
         PairMessage::Spake(theirs) => theirs,
         PairMessage::Closed => bail!("the pairing window on the other machine is closed"),
@@ -447,6 +547,9 @@ async fn confirm_host(
     };
     let confirmed = exchange.finish(&theirs)?;
     send(stream, &PairMessage::Confirm(confirmed.mac(Side::Joiner))).await?;
+    narrator
+        .step("sent the key confirmation, waiting for the other machine's".into())
+        .await;
     let (mac, id, name) = match receive(stream).await? {
         PairMessage::WrongCode => bail!(WRONG_CODE),
         PairMessage::Confirmed { mac, id, name } => (mac, id, name),
@@ -455,6 +558,11 @@ async fn confirm_host(
     if !confirmed.verify(Side::Host, &mac) {
         bail!("the other machine could not prove that it knows the code");
     }
+    narrator
+        .step(format!(
+            "the other machine knows the code, it is {name} ({id}), waiting for its verdict"
+        ))
+        .await;
     let identity = cluster.identity();
     let introduction = PairMessage::Identity {
         id: identity.id,
@@ -498,6 +606,8 @@ async fn confirm_joiner(
         let _ = send(stream, &PairMessage::WrongCode).await;
         return Ok(None);
     }
+    let pairing = cluster.pairing();
+    pairing.narrate("the other machine knows the code, sending this machine's confirmation".into());
     let identity = cluster.identity();
     let confirmation = PairMessage::Confirmed {
         mac: confirmed.mac(Side::Host),
@@ -506,11 +616,14 @@ async fn confirm_joiner(
     };
     send(stream, &confirmation).await?;
     match receive(stream).await? {
-        PairMessage::Identity { id, name } => Ok(Some(Peer {
-            id,
-            name,
-            key: secured.remote,
-        })),
+        PairMessage::Identity { id, name } => {
+            pairing.narrate(format!("the other machine is {name} ({id})"));
+            Ok(Some(Peer {
+                id,
+                name,
+                key: secured.remote,
+            }))
+        }
         other => bail!(
             "expected the other machine's identity, got {}",
             other.kind()
@@ -536,7 +649,11 @@ fn trust(cluster: &Cluster, peer: &Peer) -> Result<()> {
     Ok(())
 }
 
-async fn advertised_endpoints(discovery: &Discovery, code: &Code) -> Result<Vec<String>> {
+async fn advertised_endpoints(
+    discovery: &Discovery,
+    code: &Code,
+    narrator: &Narrator,
+) -> Result<Vec<SocketAddr>> {
     let context = discovery.context();
     if !context.options.settings.lan {
         bail!(
@@ -547,6 +664,13 @@ async fn advertised_endpoints(discovery: &Discovery, code: &Code) -> Result<Vec<
         bail!("LAN discovery is not running ({reason}), so pass --host with the other machine's address");
     }
     let own = context.cluster.identity().id;
+    narrator
+        .step(format!(
+            "looking over mDNS for a server waiting with window {}, for up to {} seconds",
+            code.window(),
+            LOOKUP_PATIENCE.as_secs()
+        ))
+        .await;
     let found = discovery
         .lan()
         .find(LOOKUP_PATIENCE, |advertisement| {
@@ -563,15 +687,31 @@ async fn advertised_endpoints(discovery: &Discovery, code: &Code) -> Result<Vec<
             )
         })?;
     let endpoints = lan::endpoints(&found);
+    narrator
+        .step(format!(
+            "found {} ({}) waiting with window {}, it advertises port {} on {}",
+            found.name,
+            found.id,
+            code.window(),
+            found.port,
+            summarized(
+                found
+                    .addresses
+                    .iter()
+                    .map(|ip| (*ip, ip.to_string()))
+                    .collect()
+            )
+        ))
+        .await;
     if endpoints.is_empty() {
         bail!("{} advertises no address this machine can dial", found.name);
     }
-    Ok(endpoints.iter().map(ToString::to_string).collect())
+    Ok(endpoints)
 }
 
-fn host_endpoint(discovery: &Discovery, host: &str) -> Result<String> {
+fn host_endpoint(discovery: &Discovery, host: &str) -> Result<SocketAddr> {
     if let Ok(address) = host.parse::<SocketAddr>() {
-        return Ok(address.to_string());
+        return Ok(address);
     }
     let ip: IpAddr = host
         .trim_start_matches('[')
@@ -588,29 +728,98 @@ fn host_endpoint(discovery: &Discovery, host: &str) -> Result<String> {
         .with_context(|| {
             format!("--host {host} names no port, pass {host}:<port> with the port `amux pair` printed there")
         })?;
-    Ok(SocketAddr::new(ip, port).to_string())
+    Ok(SocketAddr::new(ip, port))
 }
 
-async fn connect(endpoints: &[String]) -> Result<TcpStream> {
+async fn connect(endpoints: &[SocketAddr], narrator: &Narrator) -> Result<TcpStream> {
     let mut failure = anyhow!("there is no address to connect to");
-    for endpoint in endpoints {
-        debug!(%endpoint, "connecting to pair");
-        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(endpoint.as_str())).await {
+    for &endpoint in endpoints {
+        let source = route_source(endpoint)
+            .map(|source| format!(" from {source}"))
+            .unwrap_or_default();
+        narrator
+            .step(format!("connecting to {endpoint}{source}"))
+            .await;
+        let started = Instant::now();
+        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(endpoint)).await {
             Ok(Ok(stream)) => {
                 let _ = stream.set_nodelay(true);
+                narrator
+                    .step(format!(
+                        "connected to {endpoint} in {} ms",
+                        started.elapsed().as_millis()
+                    ))
+                    .await;
                 return Ok(stream);
             }
-            Ok(Err(err)) => failure = anyhow!("connecting to {endpoint}: {err}"),
+            Ok(Err(err)) => {
+                failure = anyhow!(
+                    "connecting to {endpoint} failed after {} ms: {err}",
+                    started.elapsed().as_millis()
+                );
+                narrator.step(format!("{failure}")).await;
+            }
             Err(_) => {
                 failure = anyhow!(
-                    "connecting to {endpoint} timed out, a firewall on the other machine is \
-                     likely dropping the port, so set amux.opt.lan.port there to a fixed port \
-                     and allow it in that firewall"
-                )
+                    "connecting to {endpoint} timed out after {} seconds with no answer at all, \
+                     so something on the way drops the connection or {} is not the machine \
+                     waiting in `amux pair`, and --verbose on both machines shows how far each \
+                     side gets",
+                    CONNECT_TIMEOUT.as_secs(),
+                    endpoint.ip()
+                );
+                narrator.step(format!("{failure}")).await;
             }
         }
     }
     Err(failure)
+}
+
+fn route_source(endpoint: SocketAddr) -> Option<String> {
+    let unspecified = match endpoint {
+        SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    let probe = UdpSocket::bind((unspecified, 0)).ok()?;
+    probe.connect(endpoint).ok()?;
+    let source = probe.local_addr().ok()?.ip();
+    let interface = if_addrs::get_if_addrs()
+        .ok()?
+        .into_iter()
+        .find(|interface| interface.ip() == source);
+    Some(match interface {
+        Some(interface) => format!("{source} on {}", interface.name),
+        None => source.to_string(),
+    })
+}
+
+fn lan_addresses() -> String {
+    let interfaces = lan::lan_interfaces();
+    if interfaces.is_empty() {
+        return "this machine has no LAN address that mDNS would advertise".to_owned();
+    }
+    let addresses = interfaces
+        .iter()
+        .map(|interface| {
+            let ip = interface.ip();
+            (ip, format!("{ip} on {}", interface.name))
+        })
+        .collect();
+    format!("this machine's LAN addresses are {}", summarized(addresses))
+}
+
+fn summarized(addresses: Vec<(IpAddr, String)>) -> String {
+    let (v4, v6): (Vec<_>, Vec<_>) = addresses.into_iter().partition(|(ip, _)| ip.is_ipv4());
+    let mut shown: Vec<String> = v4.into_iter().map(|(_, text)| text).collect();
+    match v6.len() {
+        0 | 1 => shown.extend(v6.into_iter().map(|(_, text)| text)),
+        count => shown.push(format!("{count} IPv6 addresses")),
+    }
+    if shown.is_empty() {
+        "no address".to_owned()
+    } else {
+        shown.join(", ")
+    }
 }
 
 async fn reply(client: &PairingClient, message: ServerMessage) -> Result<()> {
@@ -943,6 +1152,28 @@ mod tests {
     fn a_bad_spake2_message_is_an_error() {
         let exchange = Exchange::start(Side::Host, &parsed(CODE), &key(2), &key(1), &HASH);
         assert!(exchange.finish(b"short").is_err());
+    }
+
+    #[test]
+    fn addresses_show_every_ipv4_and_count_the_ipv6_ones() {
+        let entry = |ip: &str| {
+            let ip: IpAddr = ip.parse().unwrap();
+            (ip, format!("{ip} on eth0"))
+        };
+        assert_eq!(summarized(Vec::new()), "no address");
+        assert_eq!(
+            summarized(vec![entry("2a03::1"), entry("192.168.0.24")]),
+            "192.168.0.24 on eth0, 2a03::1 on eth0"
+        );
+        assert_eq!(
+            summarized(vec![
+                entry("192.168.0.24"),
+                entry("2a03::1"),
+                entry("192.168.0.240"),
+                entry("2a03::2"),
+            ]),
+            "192.168.0.24 on eth0, 192.168.0.240 on eth0, 2 IPv6 addresses"
+        );
     }
 
     #[test]

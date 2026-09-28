@@ -2,6 +2,7 @@ mod common;
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
+use std::net::TcpListener;
 use std::process::{Child, ChildStderr, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -345,6 +346,74 @@ fn a_joiner_without_lan_discovery_pairs_through_host() {
     wait_for_trust(&b, "a's key, seen first hand", |trust| {
         trusts_directly(trust, &a)
     });
+}
+
+#[test]
+fn verbose_pairing_prints_each_step_on_both_machines() {
+    let lan = FakeLan::new();
+    let a = lan_server("a", &lan);
+    let b = TestServer::builder().name("b").start();
+    let mut pairing = PairingHost::start(&a, &["--verbose"]);
+    let code = pairing.code();
+    let port = a.wait_for_lan_port();
+    let host = format!("127.0.0.1:{port}");
+
+    let joined = b.run_ok(&["pair", &code, "--host", &host, "--verbose"]);
+
+    for step in [
+        format!("] dialing {host}, the address --host {host} names"),
+        format!("] connecting to {host} from 127.0.0.1"),
+        format!("] connected to {host} in "),
+        format!(
+            "] finished the noise handshake, the other machine's key fingerprint is {}",
+            key_of(&a).fingerprint()
+        ),
+        format!(
+            "] the other machine knows the code, it is a ({})",
+            id_of(&a)
+        ),
+        "] linking to a over the pairing connection".to_owned(),
+    ] {
+        assert!(joined.contains(&step), "missing {step:?} in:\n{joined}");
+    }
+    assert!(joined.contains(&paired_line(&a)), "{joined}");
+    let (hosted, printed, stderr) = pairing.finish();
+    assert!(hosted, "{stderr}");
+    for step in [
+        format!("] listening for the other machine on 0.0.0.0:{port}"),
+        "] accepted a tcp connection from 127.0.0.1:".to_owned(),
+        " opened a pairing connection".to_owned(),
+        "] the other machine is b (".to_owned(),
+    ] {
+        assert!(printed.contains(&step), "missing {step:?} in:\n{printed}");
+    }
+    assert!(printed.contains(&paired_line(&b)), "{printed}");
+}
+
+#[test]
+fn verbose_pairing_shows_the_connection_that_failed() {
+    let b = TestServer::builder().name("b").start();
+    let closed = TcpListener::bind("127.0.0.1:0").expect("binding a free port");
+    let host = closed.local_addr().expect("the free port").to_string();
+    drop(closed);
+
+    let output = b.run(&["pair", "k7-4821-9930", "--host", &host, "--verbose"]);
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains(&format!("] connecting to {host} from 127.0.0.1")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("] connecting to {host} failed after ")),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains(&format!("connecting to {host} failed after ")),
+        "{stderr}"
+    );
 }
 
 #[test]
