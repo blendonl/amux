@@ -355,3 +355,31 @@ fn new_inside_a_repo_binds_the_session_and_registers_the_checkout() {
     let projects = server.run_ok(&["projects"]);
     assert!(projects.contains(path_str(&moved)), "{projects}");
 }
+
+#[test]
+fn a_machine_without_git_starts_sessions_quietly_and_still_refuses_project_flags() {
+    let server = TestServer::builder().prepare();
+    let no_git = server.root().join("no-git");
+    fs::create_dir(&no_git).unwrap();
+    let without_git = [("PATH", path_str(&no_git))];
+
+    let mut started = server.terminal_with_env(&[], &without_git);
+    started.type_text("echo $((6*7))\r");
+    started.wait_for_text("42");
+    started.type_text(DETACH);
+    let screen = started.wait_for_text("[detached (from session 0)]");
+    assert!(started.wait_for_exit().success());
+    assert!(!screen.contains("amux:"), "{screen}");
+
+    let mut branch = server.terminal_with_env(&["new", "-b", "feature"], &without_git);
+    branch.wait_for_text("-b and --clone need a project");
+    assert!(!branch.wait_for_exit().success());
+
+    let mut cloned = server.terminal_with_env(&["new", "--clone"], &without_git);
+    cloned.wait_for_text("-b and --clone need a project");
+    assert!(!cloned.wait_for_exit().success());
+
+    let mut unknown = server.terminal_with_env(&["new", "-p", "missing"], &without_git);
+    unknown.wait_for_text("unknown project: missing");
+    assert!(!unknown.wait_for_exit().success());
+}

@@ -1,5 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -54,6 +55,11 @@ impl fmt::Display for GitError {
 }
 
 impl std::error::Error for GitError {}
+
+pub fn is_not_installed(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<io::Error>()
+        .is_some_and(|err| err.kind() == io::ErrorKind::NotFound)
+}
 
 pub fn run<I, S>(dir: &Path, args: I) -> Result<String>
 where

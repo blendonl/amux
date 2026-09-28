@@ -68,6 +68,7 @@ pub(super) fn current_branch(worktree: &Path) -> Result<Option<String>> {
 fn inside_work_tree(cwd: &Path) -> Result<bool> {
     match git::run(cwd, ["rev-parse", "--is-inside-work-tree"]) {
         Ok(answer) => Ok(answer == "true"),
+        Err(err) if git::is_not_installed(&err) => Ok(false),
         Err(err)
             if err
                 .downcast_ref::<GitError>()
