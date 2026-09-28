@@ -1,7 +1,3 @@
-use std::time::Duration;
-
-pub const ESCAPE_TIMEOUT: Duration = Duration::from_millis(50);
-
 const ESC: u8 = 0x1b;
 const MAX_SEQUENCE_LEN: usize = 32;
 const X10_MOUSE_LEN: usize = 3;

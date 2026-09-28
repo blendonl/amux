@@ -1,6 +1,6 @@
 use std::fmt;
 use std::mem;
-use std::time::Duration;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use tokio::signal::unix::{signal, SignalKind};
@@ -9,7 +9,6 @@ use tokio::time::{sleep_until, Instant};
 
 use super::chrome::{
     draw_row, render_reconnecting, Prompt, PromptEvent, Rect, StatusLine, Style, WindowTab,
-    ESCAPE_TIMEOUT,
 };
 use super::keys::{Action, Panel, PrefixRouter, DEFAULT_PREFIX};
 use super::terminal;
@@ -18,9 +17,9 @@ use crate::protocol::{
     AttachedSession, ClientMessage, ClusterStatus, ServerMessage, ServerView, SessionCommand,
     SessionState, Size,
 };
+use crate::settings::Settings;
 use crate::target::Target;
 
-const NOTICE_TIME: Duration = Duration::from_secs(3);
 const DRAIN_LIMIT: usize = 64;
 const RENAME_WINDOW: &str = "rename window";
 const RENAME_SESSION: &str = "rename session";
@@ -58,6 +57,7 @@ pub struct Relay {
     local: String,
     attached: AttachedSession,
     size: Size,
+    settings: Arc<Settings>,
     router: PrefixRouter,
     session: Option<SessionState>,
     cluster: Option<ClusterStatus>,
@@ -73,11 +73,17 @@ pub struct Relay {
 }
 
 impl Relay {
-    pub fn new(local: String, attached: AttachedSession, size: Size) -> Self {
+    pub fn new(
+        local: String,
+        attached: AttachedSession,
+        size: Size,
+        settings: Arc<Settings>,
+    ) -> Self {
         Self {
             local,
             attached,
             size,
+            settings,
             router: PrefixRouter::new(DEFAULT_PREFIX),
             session: None,
             cluster: None,
@@ -122,7 +128,10 @@ impl Relay {
             Some(ServerMessage::Detached) => self.end = Some(Ok(Outcome::Detached)),
             Some(ServerMessage::Exited) => self.end = Some(Ok(Outcome::Exited)),
             Some(ServerMessage::Error(message)) => {
-                self.notice = Some((message.clone(), Instant::now() + NOTICE_TIME));
+                self.notice = Some((
+                    message.clone(),
+                    Instant::now() + self.settings.notice_time(),
+                ));
                 self.chrome_dirty = true;
                 self.last_error = Some(message);
             }
@@ -159,7 +168,10 @@ impl Relay {
     pub fn resize(&mut self, size: Size) {
         self.size = size;
         self.messages
-            .push(ClientMessage::Resize(terminal::session_area(size)));
+            .push(ClientMessage::Resize(terminal::session_area(
+                size,
+                &self.settings.status,
+            )));
         if self.reconnecting.is_some() {
             self.clear_above_status();
         }
@@ -320,12 +332,12 @@ impl Relay {
             Some(Overlay::Tree(tree)) => tree.is_partial(),
             Some(Overlay::Loading(_)) | None => false,
         };
-        self.escape_at = partial.then(|| Instant::now() + ESCAPE_TIMEOUT);
+        self.escape_at = partial.then(|| Instant::now() + self.settings.escape_time());
     }
 
     fn draw_chrome(&mut self) {
         let above = self.above_status();
-        let status_row = self.size.rows.saturating_sub(terminal::STATUS_ROWS);
+        let status_row = self.size.rows.saturating_sub(self.settings.status.rows());
         let status = self.status_line();
         match &mut self.overlay {
             Some(Overlay::Tree(tree)) => self.output.extend(tree.render(above)),
@@ -365,7 +377,7 @@ impl Relay {
         Rect {
             row: 0,
             col: 0,
-            rows: self.size.rows.saturating_sub(terminal::STATUS_ROWS),
+            rows: self.size.rows.saturating_sub(self.settings.status.rows()),
             cols: self.size.cols,
         }
     }
@@ -478,7 +490,7 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
 
     use super::*;
     use crate::client::chrome::testing::{row_text, screen_text, terminal};
@@ -498,7 +510,12 @@ mod tests {
     }
 
     fn relay_on(server: &str) -> (Relay, vt100::Parser) {
-        let relay = Relay::new("laptop".into(), attached("work", server), SIZE);
+        let relay = Relay::new(
+            "laptop".into(),
+            attached("work", server),
+            SIZE,
+            Arc::new(Settings::default()),
+        );
         (relay, terminal(SIZE.rows, SIZE.cols))
     }
 
@@ -580,7 +597,12 @@ mod tests {
     #[test]
     fn a_remote_session_shows_its_latency_and_the_offline_peers() {
         let size = Size { rows: 4, cols: 70 };
-        let mut relay = Relay::new("laptop".into(), attached("work", "desktop"), size);
+        let mut relay = Relay::new(
+            "laptop".into(),
+            attached("work", "desktop"),
+            size,
+            Arc::new(Settings::default()),
+        );
         let mut parser = terminal(size.rows, size.cols);
         relay.server_message(Some(state("work", 0)));
         relay.server_message(Some(ServerMessage::ClusterStatus(ClusterStatus {

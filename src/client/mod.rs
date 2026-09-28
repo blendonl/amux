@@ -11,6 +11,7 @@ use std::fs::OpenOptions;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -28,6 +29,7 @@ use crate::protocol::{
     self, is_locale_variable, ClientMessage, DebugCommand, Duplex, IncompatibleServer, NewSession,
     ProjectRef, Role, ServerMessage, ServerView, SessionInfo, Version,
 };
+use crate::settings::Settings;
 use crate::target::{self, Target};
 use relay::Relay;
 use terminal::RawTerminal;
@@ -54,6 +56,7 @@ pub async fn attach_or_create(endpoint: &Endpoint) -> Result<()> {
 }
 
 pub async fn new_session(endpoint: &Endpoint, args: NewArgs) -> Result<()> {
+    let settings = Arc::new(Settings::default());
     if let Some(name) = &args.name {
         target::validate_session_name(name)?;
     }
@@ -67,9 +70,9 @@ pub async fn new_session(endpoint: &Endpoint, args: NewArgs) -> Result<()> {
         project,
         branch,
         clone: args.clone,
-        ..NewSession::new(args.name, terminal::session_size()?)
+        ..NewSession::new(args.name, terminal::session_size(&settings.status)?)
     });
-    attach(server, &welcome.server_name, request).await
+    attach(server, &welcome.server_name, request, settings).await
 }
 
 async fn binding(
@@ -129,13 +132,14 @@ async fn detect(cwd: &Path) -> Result<Option<Detected>> {
 }
 
 pub async fn attach_session(endpoint: &Endpoint, target: Option<String>) -> Result<()> {
+    let settings = Arc::new(Settings::default());
     let target = parse_target(target)?;
     let (welcome, server) = greet_server(connect_stream(&endpoint.socket).await?).await?;
     let request = ClientMessage::Attach {
         target,
-        size: terminal::session_size()?,
+        size: terminal::session_size(&settings.status)?,
     };
-    attach(server, &welcome.server_name, request).await
+    attach(server, &welcome.server_name, request, settings).await
 }
 
 pub async fn kill_session(
@@ -348,7 +352,12 @@ fn config_path(endpoint: &Endpoint) -> Result<PathBuf> {
     }
 }
 
-async fn attach(server: ServerConnection, local: &str, request: ClientMessage) -> Result<()> {
+async fn attach(
+    server: ServerConnection,
+    local: &str,
+    request: ClientMessage,
+    settings: Arc<Settings>,
+) -> Result<()> {
     let Duplex {
         mut incoming,
         outgoing,
@@ -361,7 +370,7 @@ async fn attach(server: ServerConnection, local: &str, request: ClientMessage) -
         None => bail!("server closed the connection"),
     };
 
-    let mut relay = Relay::new(local.to_owned(), attached, terminal::size()?);
+    let mut relay = Relay::new(local.to_owned(), attached, terminal::size()?, settings);
     let outcome = {
         let _terminal = RawTerminal::enter()?;
         relay::run(incoming, outgoing, &mut relay).await?
