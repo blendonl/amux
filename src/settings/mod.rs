@@ -1,5 +1,6 @@
 pub mod callback;
 mod client;
+mod cluster;
 mod host;
 mod keymap;
 mod style;
@@ -12,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 pub use callback::{CallbackId, CALLBACK_SLOT};
 pub use client::{StatusSettings, TreeSettings};
+pub use cluster::{ClusterSettings, DiscoverySettings, LanSettings, SshSettings};
 pub use host::{
     BorderSettings, MouseSettings, PaneSettings, SessionSettings, WindowSettings, WorktreeSettings,
 };
@@ -38,6 +40,9 @@ pub struct Settings {
     pub session: SessionSettings,
     pub borders: BorderSettings,
     pub mouse: MouseSettings,
+    pub cluster: ClusterSettings,
+    pub discovery: DiscoverySettings,
+    pub lan: LanSettings,
     pub worktrees: WorktreeSettings,
 }
 
@@ -65,6 +70,9 @@ impl Default for Settings {
             session: SessionSettings::default(),
             borders: BorderSettings::default(),
             mouse: MouseSettings::default(),
+            cluster: ClusterSettings::default(),
+            discovery: DiscoverySettings::default(),
+            lan: LanSettings::default(),
             worktrees: WorktreeSettings::default(),
         }
     }

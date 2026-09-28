@@ -19,7 +19,6 @@ use crate::cluster::{Candidate, Cluster, Listener};
 use crate::protocol::{SourceState, Via};
 
 pub const PROGRAM_ENV: &str = "AMUX_TAILSCALE";
-const DEFAULT_PROGRAM: &str = "tailscale";
 const DEFAULT_SOCKET: &str = "default";
 const DEFAULT_PORT: u16 = 7447;
 const FIRST_DERIVED_PORT: u16 = 7448;
@@ -33,7 +32,8 @@ const SERVER_SYSTEMS: [&str; 4] = ["linux", "macOS", "freebsd", "openbsd"];
 const NOT_INSTALLED: &str = "tailscale is not installed";
 
 pub async fn run(context: SourceContext, status: SourceStatus) {
-    let every = match interval() {
+    let settings = &context.options.settings;
+    let every = match interval(settings) {
         Ok(every) => every,
         Err(err) => {
             warn!("not looking for servers on the tailnet: {err:#}");
@@ -41,10 +41,12 @@ pub async fn run(context: SourceContext, status: SourceStatus) {
             return;
         }
     };
-    let config = &context.options.config;
-    let tailnet = Arc::new(Tailnet::new(program(), config.tailscale_tags.clone()));
+    let tailnet = Arc::new(Tailnet::new(
+        program(env::var_os(PROGRAM_ENV), &settings.tailscale_program),
+        settings.tailscale_tags.clone(),
+    ));
     context.cluster.use_tailnet(Arc::clone(&tailnet));
-    let port = config
+    let port = settings
         .tailscale_port
         .map_or_else(|| port(&context.options.socket_name), NonZeroU16::get);
     let mut listener = TailnetListener::new(port);
@@ -448,10 +450,10 @@ impl WhoisNode {
     }
 }
 
-fn program() -> OsString {
-    env::var_os(PROGRAM_ENV)
+fn program(overridden: Option<OsString>, configured: &str) -> OsString {
+    overridden
         .filter(|program| !program.is_empty())
-        .unwrap_or_else(|| DEFAULT_PROGRAM.into())
+        .unwrap_or_else(|| configured.into())
 }
 
 fn is_not_installed(err: &anyhow::Error) -> bool {
@@ -471,6 +473,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::settings::DiscoverySettings;
 
     const ME: i64 = 5998409928532361;
     const SOMEONE_ELSE: i64 = 7001;
@@ -504,7 +507,7 @@ mod tests {
 
     fn tailnet(tags: &[&str]) -> Tailnet {
         Tailnet::new(
-            DEFAULT_PROGRAM.into(),
+            DiscoverySettings::default().tailscale_program.into(),
             tags.iter().map(|tag| tag.to_string()).collect(),
         )
     }
@@ -517,6 +520,13 @@ mod tests {
                 .collect(),
             _ => panic!("tailscale is not up"),
         }
+    }
+
+    #[test]
+    fn the_tailscale_variable_wins_over_the_configured_program() {
+        assert_eq!(program(None, "/opt/tailscale"), "/opt/tailscale");
+        assert_eq!(program(Some("fake".into()), "/opt/tailscale"), "fake");
+        assert_eq!(program(Some("".into()), "/opt/tailscale"), "/opt/tailscale");
     }
 
     #[test]

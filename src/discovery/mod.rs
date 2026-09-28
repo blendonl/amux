@@ -4,29 +4,30 @@ pub mod mdns;
 pub mod tailscale;
 
 use std::env;
+use std::ffi::OsString;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::cluster::Cluster;
-use crate::config::{DiscoveryConfig, LanConfig, ServerId};
+use crate::config::ServerId;
 use crate::protocol::{DiscoveryReport, PublicKey, SourceState, SourceView, Via};
+use crate::settings::{DiscoverySettings, LanSettings};
 use lan::Lan;
 
 pub const INTERVAL_ENV: &str = "AMUX_DISCOVERY_INTERVAL_MS";
-const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
 const STOP_GRACE: Duration = Duration::from_secs(3);
 
 pub struct DiscoveryOptions {
-    pub config: DiscoveryConfig,
-    pub lan: LanConfig,
+    pub settings: DiscoverySettings,
+    pub lan: LanSettings,
     pub socket_name: String,
     pub state_dir: Option<PathBuf>,
 }
@@ -83,8 +84,8 @@ impl Discovery {
             })
         };
         Self {
-            tailscale: status(options.config.tailscale),
-            lan: status(options.config.lan),
+            tailscale: status(options.settings.tailscale),
+            lan: status(options.settings.lan),
             lan_state: Arc::new(Lan::new(lan_listener)),
             context: SourceContext {
                 cluster,
@@ -109,13 +110,13 @@ impl Discovery {
     }
 
     pub fn start(&self) {
-        let config = &self.context.options.config;
+        let settings = &self.context.options.settings;
         let mut tasks = self.tasks();
-        if config.tailscale {
+        if settings.tailscale {
             let source = tailscale::run(self.context.clone(), self.tailscale.clone());
             tasks.push(tokio::spawn(source));
         }
-        if config.lan {
+        if settings.lan {
             let source = lan::run(
                 self.context.clone(),
                 self.lan.clone(),
@@ -175,14 +176,58 @@ pub trait LanDiscovery: Send + Sync {
     fn shutdown(&self);
 }
 
-pub fn interval() -> Result<Duration> {
-    let Some(value) = env::var_os(INTERVAL_ENV) else {
-        return Ok(DEFAULT_INTERVAL);
+pub fn interval(settings: &DiscoverySettings) -> Result<Duration> {
+    interval_from(env::var_os(INTERVAL_ENV), settings.interval_ms)
+}
+
+fn interval_from(overridden: Option<OsString>, configured: u64) -> Result<Duration> {
+    let millis = match overridden {
+        Some(value) => value
+            .to_str()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|millis| *millis > 0)
+            .with_context(|| format!("{INTERVAL_ENV} must be a positive number"))?,
+        None if configured == 0 => bail!("discovery.interval_ms must be a positive number"),
+        None => configured,
     };
-    value
-        .to_str()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|millis| *millis > 0)
-        .map(Duration::from_millis)
-        .with_context(|| format!("{INTERVAL_ENV} must be a positive number"))
+    Ok(Duration::from_millis(millis))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_interval_comes_from_the_settings_unless_the_variable_is_set() {
+        let settings = DiscoverySettings {
+            interval_ms: 1000,
+            ..DiscoverySettings::default()
+        };
+        assert_eq!(
+            interval_from(None, settings.interval_ms).unwrap(),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            interval_from(Some("250".into()), settings.interval_ms).unwrap(),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            interval_from(None, DiscoverySettings::default().interval_ms).unwrap(),
+            Duration::from_secs(30)
+        );
+
+        for value in ["0", "soon", ""] {
+            let error = interval_from(Some(value.into()), 1000).unwrap_err();
+            assert!(
+                error.to_string().contains(INTERVAL_ENV),
+                "{value:?}: {error}"
+            );
+        }
+        let error = interval_from(None, 0).unwrap_err();
+        assert!(
+            error.to_string().contains("discovery.interval_ms"),
+            "{error}"
+        );
+        assert!(interval_from(Some("10".into()), 0).is_ok());
+    }
 }

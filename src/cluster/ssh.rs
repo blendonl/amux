@@ -9,14 +9,13 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::client::{self, Endpoint};
+use crate::settings::SshSettings;
 
 pub const BRIDGE_EXIT_GRACE: Duration = Duration::from_secs(2);
 pub const NOT_INSTALLED: &str = "amux is not installed on this machine";
 const SSH_ENV: &str = "AMUX_SSH";
-const DEFAULT_SSH: &str = "ssh";
 const BRIDGE_COMMAND: &str = "bridge";
 const NO_START_FLAG: &str = "--no-start";
-const SSH_OPTIONS: [&str; 5] = ["-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15"];
 const AMUX_LOCATIONS: [&str; 4] = [
     "\"$HOME/.cargo/bin/amux\"",
     "\"$HOME/.local/bin/amux\"",
@@ -26,6 +25,7 @@ const AMUX_LOCATIONS: [&str; 4] = [
 const NOT_INSTALLED_STATUS: u8 = 127;
 
 pub fn command(
+    ssh: &SshSettings,
     user: Option<&str>,
     host: &str,
     port: Option<u16>,
@@ -33,8 +33,8 @@ pub fn command(
     socket: &str,
     no_start: bool,
 ) -> Vec<String> {
-    let mut argv = vec![program()];
-    argv.extend(SSH_OPTIONS.map(str::to_owned));
+    let mut argv = vec![program(env::var(SSH_ENV).ok(), &ssh.program)];
+    argv.extend(ssh.options.iter().cloned());
     if let Some(port) = port {
         argv.extend(["-p".to_owned(), port.to_string()]);
     }
@@ -56,7 +56,7 @@ pub fn command(
         }
         None => argv.push(format!(
             "sh -c {}",
-            shell_words::quote(&probe(socket, no_start))
+            shell_words::quote(&probe(&ssh.default_amux_path, socket, no_start))
         )),
     }
     argv
@@ -70,21 +70,20 @@ pub fn exec(argv: &[String], no_start: bool) -> Vec<String> {
     argv
 }
 
-fn program() -> String {
-    env::var(SSH_ENV)
-        .ok()
+fn program(overridden: Option<String>, configured: &str) -> String {
+    overridden
         .filter(|program| !program.is_empty())
-        .unwrap_or_else(|| DEFAULT_SSH.to_owned())
+        .unwrap_or_else(|| configured.to_owned())
 }
 
-fn probe(socket: &str, no_start: bool) -> String {
+fn probe(amux: &str, socket: &str, no_start: bool) -> String {
     let mut bridge = format!("-L {} {BRIDGE_COMMAND}", shell_words::quote(socket));
     if no_start {
         bridge.push(' ');
         bridge.push_str(NO_START_FLAG);
     }
     format!(
-        "command -v amux >/dev/null 2>&1 && exec amux {bridge}; \
+        "command -v {amux} >/dev/null 2>&1 && exec {amux} {bridge}; \
          for amux in {}; do [ -x \"$amux\" ] && exec \"$amux\" {bridge}; done; \
          echo '{NOT_INSTALLED}' >&2; exit {NOT_INSTALLED_STATUS}",
         AMUX_LOCATIONS.join(" ")
@@ -213,14 +212,30 @@ mod tests {
     }
 
     fn remote_command(socket: &str, no_start: bool) -> String {
-        command(None, "laptop", None, None, socket, no_start)
-            .pop()
-            .unwrap()
+        command(
+            &SshSettings::default(),
+            None,
+            "laptop",
+            None,
+            None,
+            socket,
+            no_start,
+        )
+        .pop()
+        .unwrap()
     }
 
     #[test]
     fn without_an_amux_path_ssh_runs_one_quoted_probe() {
-        let argv = command(None, "laptop", None, None, "default", false);
+        let argv = command(
+            &SshSettings::default(),
+            None,
+            "laptop",
+            None,
+            None,
+            "default",
+            false,
+        );
         assert_eq!(
             argv[..argv.len() - 1],
             [
@@ -250,6 +265,7 @@ mod tests {
     fn an_amux_path_is_passed_to_the_remote_shell_as_written() {
         assert_eq!(
             command(
+                &SshSettings::default(),
                 Some("notpc"),
                 "home-server",
                 Some(2222),
@@ -318,6 +334,52 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             "cargo -L default bridge\n"
         );
+    }
+
+    #[test]
+    fn the_ssh_program_options_and_amux_path_come_from_the_settings() {
+        let ssh = SshSettings {
+            program: "autossh".into(),
+            options: argv(&["-M", "0", "-o", "BatchMode=yes"]),
+            default_amux_path: "\"$HOME/custom/amux\"".into(),
+        };
+
+        assert_eq!(
+            command(&ssh, None, "laptop", Some(2222), Some("amux"), "dev", false),
+            argv(&[
+                "autossh",
+                "-M",
+                "0",
+                "-o",
+                "BatchMode=yes",
+                "-p",
+                "2222",
+                "laptop",
+                "amux",
+                "-L",
+                "dev",
+                "bridge",
+            ])
+        );
+
+        let remote = command(&ssh, None, "laptop", None, None, "default", false)
+            .pop()
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        fake_amux(&home.path().join("custom/amux"), "custom");
+        fake_amux(&home.path().join(".cargo/bin/amux"), "cargo");
+        let output = run_remotely(&remote, home.path(), "/usr/bin:/bin");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "custom -L default bridge\n"
+        );
+    }
+
+    #[test]
+    fn the_ssh_environment_variable_wins_over_the_settings() {
+        assert_eq!(program(Some("fake-ssh".into()), "autossh"), "fake-ssh");
+        assert_eq!(program(Some(String::new()), "autossh"), "autossh");
+        assert_eq!(program(None, "autossh"), "autossh");
     }
 
     #[test]

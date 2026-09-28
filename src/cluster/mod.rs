@@ -21,7 +21,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{broadcast, watch, Notify, Semaphore};
 use tracing::{debug, info, warn};
 
-use crate::config::{DiscoveryConfig, Incarnation, ServerConfig, ServerId, ServerIdentity};
+use crate::config::{Incarnation, ServerConfig, ServerId, ServerIdentity};
 use crate::discovery::tailscale::Tailnet;
 use crate::pairing::Pairing;
 use crate::protocol::{
@@ -30,9 +30,10 @@ use crate::protocol::{
     ServerState, ServerStatus, ServerView, Snapshot, StateEvent, TcpKind, TrustUpdate, Version,
     Via,
 };
+use crate::settings::{ClusterSettings, DiscoverySettings, SshSettings};
 use cache::{Cache, CachedOrigin, CachedTarget, CACHE_FILE};
 pub use channel::{Channel, ChannelEnd, CREDIT_WINDOW};
-pub use link::LinkSettings;
+pub use link::with_env;
 use link::{Handshake, LinkHandle};
 pub use listener::{LanListener, LanOptions, Listener, LAN_PORT_FILE};
 pub use noise::{NoiseKey, Secured, NOISE_KEY_FILE};
@@ -40,12 +41,7 @@ pub use transport::{Address, Connect, TransportAuth, Voucher};
 pub use trust::{TrustStore, Witnessed, TRUST_FILE};
 
 const SAVE_DELAY: Duration = Duration::from_millis(500);
-const MIN_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
-const MAX_UNVERIFIED_BACKOFF: Duration = Duration::from_secs(10 * 60);
-const ADDRESS_EXPIRY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const FLUSH_GRACE: Duration = Duration::from_secs(2);
 
 type NoiseHandshake = Handshake<ReadHalf<DuplexStream>, WriteHalf<DuplexStream>>;
@@ -60,10 +56,10 @@ pub struct ClusterOptions {
     pub identity: ServerIdentity,
     pub version: Version,
     pub socket_name: String,
-    pub settings: LinkSettings,
+    pub settings: ClusterSettings,
     pub state_dir: Option<PathBuf>,
     pub servers: BTreeMap<String, ServerConfig>,
-    pub discovery: DiscoveryConfig,
+    pub discovery: DiscoverySettings,
     pub trust: TrustStore,
     pub key: NoiseKey,
 }
@@ -72,7 +68,7 @@ pub struct Cluster {
     identity: ServerIdentity,
     version: Version,
     socket_name: String,
-    settings: LinkSettings,
+    settings: ClusterSettings,
     state_dir: Option<PathBuf>,
     cache_path: Option<PathBuf>,
     trust_path: Option<PathBuf>,
@@ -262,7 +258,7 @@ impl Target {
                 .is_some_and(|found| found.candidate.dialable)
     }
 
-    fn is_expired(&self, now: SystemTime) -> bool {
+    fn is_expired(&self, now: SystemTime, expiry: Duration) -> bool {
         let expires = match self.origin {
             Origin::Configured { .. } => false,
             Origin::Gossiped { .. } => true,
@@ -271,10 +267,16 @@ impl Target {
         expires
             && now
                 .duration_since(self.last_seen)
-                .is_ok_and(|age| age > ADDRESS_EXPIRY)
+                .is_ok_and(|age| age > expiry)
     }
 
-    fn connect(&self, address: &str, socket_name: &str, no_start: bool) -> Result<Option<Connect>> {
+    fn connect(
+        &self,
+        ssh: &SshSettings,
+        address: &str,
+        socket_name: &str,
+        no_start: bool,
+    ) -> Result<Option<Connect>> {
         let parsed: Address = address.parse()?;
         let (amux_path, socket) = match &self.origin {
             Origin::Configured { server, .. } => {
@@ -288,6 +290,7 @@ impl Target {
             .map(|found| found.candidate.endpoints.as_slice())
             .unwrap_or_default();
         Ok(parsed.connect(
+            ssh,
             amux_path,
             socket.unwrap_or(socket_name),
             no_start,
@@ -354,6 +357,7 @@ impl Cluster {
         } = cache_path.as_deref().map(cache::load).unwrap_or_default();
         peers.retain(|id, _| !options.trust.is_forgotten(*id, None));
         let now = SystemTime::now();
+        let expiry = options.settings.address_expiry();
         let mut members = Members {
             peers,
             trust: options.trust,
@@ -409,7 +413,7 @@ impl Cluster {
             if members.targets.contains_key(&cached.address)
                 || forgotten
                 || name_configured
-                || target.is_expired(now)
+                || target.is_expired(now, expiry)
             {
                 continue;
             }
@@ -459,7 +463,7 @@ impl Cluster {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let handshake = tokio::time::timeout(
-            self.settings.handshake_timeout,
+            self.settings.handshake_timeout(),
             link::accept(self, reader, writer, auth),
         )
         .await
@@ -480,7 +484,7 @@ impl Cluster {
             ..
         } = secured;
         let handshake = tokio::time::timeout(
-            self.settings.handshake_timeout,
+            self.settings.handshake_timeout(),
             self.noise_handshake(stream, remote, vouched_by),
         )
         .await
@@ -508,7 +512,7 @@ impl Cluster {
         };
         let (reader, writer) = tokio::io::split(stream);
         let handshake = tokio::time::timeout(
-            self.settings.handshake_timeout,
+            self.settings.handshake_timeout(),
             link::dial(self, reader, writer, auth),
         )
         .await
@@ -1103,7 +1107,7 @@ impl Cluster {
         &self.version
     }
 
-    fn settings(&self) -> &LinkSettings {
+    fn settings(&self) -> &ClusterSettings {
         &self.settings
     }
 
@@ -1527,7 +1531,8 @@ impl Cluster {
 
     async fn dial_loop(self: Arc<Self>, address: String, stop: Arc<Notify>, wake: Arc<Notify>) {
         let mut changes = self.changes.subscribe();
-        let mut backoff = MIN_BACKOFF;
+        let min_backoff = self.settings.backoff_min();
+        let mut backoff = min_backoff;
         loop {
             let (connect, max_backoff) = loop {
                 changes.borrow_and_update();
@@ -1535,7 +1540,7 @@ impl Cluster {
                     DialPlan::Stop => return,
                     DialPlan::Wait => tokio::select! {
                         _ = changes.changed() => {}
-                        () = wake.notified() => backoff = MIN_BACKOFF,
+                        () = wake.notified() => backoff = min_backoff,
                         () = stop.notified() => return,
                     },
                     DialPlan::Dial {
@@ -1549,13 +1554,13 @@ impl Cluster {
                 () = stop.notified() => return,
             };
             if linked {
-                backoff = MIN_BACKOFF;
+                backoff = min_backoff;
             }
             tokio::select! {
                 () = tokio::time::sleep(jittered(backoff)) => {
                     backoff = (backoff * 2).min(max_backoff);
                 }
-                () = wake.notified() => backoff = MIN_BACKOFF,
+                () = wake.notified() => backoff = min_backoff,
                 () = stop.notified() => return,
             }
         }
@@ -1572,8 +1577,12 @@ impl Cluster {
         if target.is_self {
             return DialPlan::Stop;
         }
-        if target.is_expired(SystemTime::now()) {
-            info!(%address, "forgetting an address that has not been seen for a week");
+        if target.is_expired(SystemTime::now(), self.settings.address_expiry()) {
+            info!(
+                %address,
+                hours = self.settings.address_expiry_hours,
+                "forgetting an address that has not been seen for too long"
+            );
             members.targets.remove(address);
             self.dirty.notify_one();
             return DialPlan::Stop;
@@ -1593,12 +1602,12 @@ impl Cluster {
             .and_then(|peer| members.peers.get(&peer))
             .is_some_and(|peer| peer.stopped);
         let max_backoff = if target.is_hidden() {
-            MAX_UNVERIFIED_BACKOFF
+            self.settings.max_unverified_backoff()
         } else {
-            MAX_BACKOFF
+            self.settings.backoff_max()
         };
         let no_start = stopped || target.is_discovered();
-        match target.connect(address, &self.socket_name, no_start) {
+        match target.connect(&self.settings.ssh, address, &self.socket_name, no_start) {
             Ok(Some(connect)) => DialPlan::Dial {
                 connect,
                 max_backoff,
@@ -1622,7 +1631,8 @@ impl Cluster {
         let mut failure = "there is no endpoint to dial".to_owned();
         for endpoint in endpoints {
             debug!(%address, %endpoint, "dialing");
-            let connected = tokio::time::timeout(CONNECT_TIMEOUT, self.connect(endpoint)).await;
+            let connected =
+                tokio::time::timeout(self.settings.connect_timeout(), self.connect(endpoint)).await;
             match connected {
                 Ok(Ok(stream)) => return self.dial_noise(address, stream).await,
                 Ok(Err(err)) => failure = format!("connecting to {endpoint}: {err}"),
@@ -1644,7 +1654,7 @@ impl Cluster {
     async fn dial_noise(self: &Arc<Self>, address: &str, stream: TcpStream) -> bool {
         let _ = stream.set_nodelay(true);
         let key = self.noise_key();
-        let handshake = tokio::time::timeout(self.settings.handshake_timeout, async {
+        let handshake = tokio::time::timeout(self.settings.handshake_timeout(), async {
             let dialed = stream.peer_addr().context("reading the dialed address")?;
             let Secured {
                 remote,
@@ -1718,7 +1728,7 @@ impl Cluster {
         } = transport;
 
         let handshake = tokio::time::timeout(
-            self.settings.handshake_timeout,
+            self.settings.handshake_timeout(),
             link::dial(self, reader, writer, TransportAuth::Ssh),
         )
         .await;
@@ -2060,7 +2070,8 @@ mod tests {
     struct Setup {
         servers: Vec<(&'static str, String)>,
         trust: TrustStore,
-        discovery: DiscoveryConfig,
+        discovery: DiscoverySettings,
+        settings: ClusterSettings,
         state_dir: Option<PathBuf>,
     }
 
@@ -2068,7 +2079,8 @@ mod tests {
         Setup {
             servers: Vec::new(),
             trust: TrustStore::default(),
-            discovery: DiscoveryConfig::default(),
+            discovery: DiscoverySettings::default(),
+            settings: ClusterSettings::default(),
             state_dir: None,
         }
     }
@@ -2102,7 +2114,7 @@ mod tests {
                 },
                 version: Version::current(),
                 socket_name: "test".into(),
-                settings: LinkSettings::default(),
+                settings: self.settings,
                 state_dir: self.state_dir,
                 servers,
                 discovery: self.discovery,
@@ -2343,12 +2355,74 @@ mod tests {
                 max_backoff,
             } => {
                 assert_eq!(connect, Connect::Tcp(vec!["192.168.0.5:40000".into()]));
-                assert_eq!(max_backoff, MAX_UNVERIFIED_BACKOFF);
+                assert_eq!(max_backoff, Duration::from_secs(10 * 60));
             }
             _ => panic!("expected to dial {lan}"),
         }
         assert_eq!(plan(cluster, &untrusted), "wait");
         assert_eq!(statuses(cluster)[1].1, DiscoveryStatus::NotPaired);
+    }
+
+    #[tokio::test]
+    async fn the_backoff_ceilings_come_from_the_settings() {
+        let fixture = Setup {
+            settings: ClusterSettings {
+                backoff_max_ms: 5000,
+                max_unverified_backoff_ms: 20_000,
+                ..ClusterSettings::default()
+            },
+            ..setup()
+        }
+        .server("laptop", "ssh://laptop")
+        .build();
+        let cluster = &fixture.cluster;
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let discovered = format!("tcp://127.0.0.1:{port}");
+        cluster.discovered(Via::Tailscale, vec![Candidate::new("phone", &discovered)]);
+
+        let max_backoff = |address: &str| match cluster.dial_plan(address) {
+            DialPlan::Dial { max_backoff, .. } => max_backoff,
+            _ => panic!("expected to dial {address}"),
+        };
+        assert_eq!(max_backoff("ssh://laptop"), Duration::from_secs(5));
+        assert_eq!(max_backoff(&discovered), Duration::from_secs(20));
+    }
+
+    #[tokio::test]
+    async fn a_failing_server_is_redialed_after_the_minimum_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempts = dir.path().join("attempts");
+        let script = format!(
+            "echo dialed >> {}; exit 1",
+            shell_words::quote(&attempts.display().to_string())
+        );
+        let address = format!("exec:sh -c {}", shell_words::quote(&script));
+        let fixture = Setup {
+            settings: ClusterSettings {
+                backoff_min_ms: 10,
+                backoff_max_ms: 20,
+                ..ClusterSettings::default()
+            },
+            ..setup()
+        }
+        .server("flaky", &address)
+        .build();
+        fixture.cluster.start();
+
+        let dialed = || {
+            std::fs::read_to_string(&attempts)
+                .map(|text| text.lines().count())
+                .unwrap_or(0)
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while dialed() < 5 {
+            assert!(Instant::now() < deadline, "dialed only {} times", dialed());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     async fn woken(cluster: &Cluster, address: &str) -> bool {
@@ -2880,9 +2954,9 @@ mod tests {
 
         let fixture = Setup {
             state_dir: Some(dir.path().to_owned()),
-            discovery: DiscoveryConfig {
+            discovery: DiscoverySettings {
                 lan: false,
-                ..DiscoveryConfig::default()
+                ..DiscoverySettings::default()
             },
             ..setup()
         }

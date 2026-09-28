@@ -480,7 +480,7 @@ mod tests {
 
     use super::super::{SessionName, SessionSpec};
     use super::*;
-    use crate::cluster::{ClusterOptions, LinkSettings, NoiseKey, TrustStore};
+    use crate::cluster::{ClusterOptions, NoiseKey, TrustStore};
     use crate::config::{Config, Incarnation, ServerId, ServerIdentity};
     use crate::discovery::DiscoveryOptions;
     use crate::lua::{EVENTS, INIT_FILE};
@@ -843,8 +843,8 @@ mod tests {
         let config = Config::parse("", dir, &name).unwrap();
         let registry = Registry::load(&dir.join("projects.toml")).unwrap();
         let discovery = DiscoveryOptions {
-            config: config.discovery.clone(),
-            lan: config.lan.clone(),
+            settings: settings.discovery.clone(),
+            lan: settings.lan.clone(),
             socket_name: name.clone(),
             state_dir: None,
         };
@@ -853,10 +853,10 @@ mod tests {
             key: NoiseKey::generate().unwrap(),
             version: Version::current(),
             socket_name: name,
-            settings: LinkSettings::default(),
+            settings: settings.cluster.clone(),
             state_dir: None,
             servers: BTreeMap::new(),
-            discovery: config.discovery.clone(),
+            discovery: settings.discovery.clone(),
             trust: TrustStore::default(),
         };
         Server::new(

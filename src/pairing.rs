@@ -24,7 +24,6 @@ use crate::protocol::{
 
 pub type PairingClient = Duplex<ClientMessage, ServerMessage>;
 
-pub const WINDOW_LIFETIME: Duration = Duration::from_secs(5 * 60);
 pub const ATTEMPTS: u8 = 3;
 const WINDOW_ID_LEN: usize = 2;
 const SECRET_GROUP_LEN: usize = 4;
@@ -156,14 +155,19 @@ impl Pairing {
         self.open.borrow().is_some()
     }
 
-    fn open(&self, code: &Code, host: mpsc::UnboundedSender<HostEvent>) -> Result<()> {
+    fn open(
+        &self,
+        code: &Code,
+        lifetime: Duration,
+        host: mpsc::UnboundedSender<HostEvent>,
+    ) -> Result<()> {
         let mut window = self.window();
         if window.as_ref().is_some_and(|window| !window.is_expired()) {
             bail!("another `amux pair` is already waiting on this server");
         }
         *window = Some(Window {
             code: code.clone(),
-            expires: Instant::now() + WINDOW_LIFETIME,
+            expires: Instant::now() + lifetime,
             attempts: ATTEMPTS,
             host,
         });
@@ -235,7 +239,7 @@ impl Drop for OpenWindow<'_> {
 
 pub async fn open(discovery: &Discovery, new_key: bool, client: &mut PairingClient) -> Result<()> {
     let context = discovery.context();
-    if !context.options.config.lan {
+    if !context.options.settings.lan {
         bail!("pairing needs LAN discovery, which is off in the config");
     }
     let cluster = &context.cluster;
@@ -244,8 +248,9 @@ pub async fn open(discovery: &Discovery, new_key: bool, client: &mut PairingClie
     }
     let code = Code::generate()?;
     let (events, mut happened) = mpsc::unbounded_channel();
+    let lifetime = context.options.lan.pairing_window();
     let pairing = cluster.pairing();
-    pairing.open(&code, events)?;
+    pairing.open(&code, lifetime, events)?;
     let _window = OpenWindow {
         pairing,
         code: &code,
@@ -258,11 +263,11 @@ pub async fn open(discovery: &Discovery, new_key: bool, client: &mut PairingClie
     );
     let opened = ServerMessage::PairingOpen {
         code: code.to_string(),
-        expires_in_secs: WINDOW_LIFETIME.as_secs(),
+        expires_in_secs: lifetime.as_secs(),
     };
     reply(client, opened).await?;
 
-    let expired = tokio::time::sleep(WINDOW_LIFETIME);
+    let expired = tokio::time::sleep(lifetime);
     tokio::pin!(expired);
     loop {
         tokio::select! {
@@ -533,7 +538,7 @@ fn trust(cluster: &Cluster, peer: &Peer) -> Result<()> {
 
 async fn advertised_endpoints(discovery: &Discovery, code: &Code) -> Result<Vec<String>> {
     let context = discovery.context();
-    if !context.options.config.lan {
+    if !context.options.settings.lan {
         bail!(
             "LAN discovery is off in the config, so pass --host with the other machine's address"
         );
@@ -771,6 +776,7 @@ mod tests {
 
     const CODE: &str = "k7-4821-9930";
     const HASH: [u8; 32] = [7; 32];
+    const LIFETIME: Duration = Duration::from_secs(5 * 60);
 
     fn parsed(text: &str) -> Code {
         text.parse().unwrap()
@@ -940,11 +946,13 @@ mod tests {
         let (events, mut happened) = mpsc::unbounded_channel();
         let mut windows = pairing.watch();
 
-        pairing.open(&code, events).unwrap();
+        pairing.open(&code, LIFETIME, events).unwrap();
 
         assert_eq!(*windows.borrow_and_update(), Some("k7".to_owned()));
         let (other, _) = mpsc::unbounded_channel();
-        assert!(pairing.open(&parsed("ab-0000-0000"), other).is_err());
+        assert!(pairing
+            .open(&parsed("ab-0000-0000"), LIFETIME, other)
+            .is_err());
         for left in [2, 1] {
             let attempt = pairing.attempt().unwrap();
             assert_eq!(attempt.attempts_left, left);
@@ -969,11 +977,25 @@ mod tests {
     }
 
     #[test]
+    fn a_window_lasts_as_long_as_the_lifetime_it_was_opened_with() {
+        let pairing = Pairing::default();
+        let (events, _happened) = mpsc::unbounded_channel();
+        pairing.open(&parsed(CODE), Duration::ZERO, events).unwrap();
+        assert!(pairing.attempt().is_none());
+
+        let (events, _happened) = mpsc::unbounded_channel();
+        pairing
+            .open(&parsed("ab-0000-0000"), LIFETIME, events)
+            .unwrap();
+        assert!(pairing.attempt().is_some());
+    }
+
+    #[test]
     fn a_window_closes_only_for_its_own_code() {
         let pairing = Pairing::default();
         let code = parsed(CODE);
         let (events, _happened) = mpsc::unbounded_channel();
-        pairing.open(&code, events).unwrap();
+        pairing.open(&code, LIFETIME, events).unwrap();
 
         assert!(pairing.close(&parsed("k7-0000-0000")).is_none());
         assert!(pairing.is_open());

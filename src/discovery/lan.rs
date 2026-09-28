@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 
 use super::directory::{DirectoryLan, LAN_DIR_ENV};
 use super::mdns::{self, MdnsLan};
-use super::{interval, Advertisement, LanDiscovery, SourceContext, SourceStatus};
+use super::{interval, Advertisement, DiscoveryOptions, LanDiscovery, SourceContext, SourceStatus};
 use crate::cluster::Candidate;
 use crate::protocol::{SourceState, Via, PROTOCOL_MAJOR};
 
@@ -64,7 +64,7 @@ impl Lan {
 }
 
 pub async fn run(context: SourceContext, status: SourceStatus, lan: Arc<Lan>) {
-    let backend = match backend() {
+    let backend = match backend(&context.options) {
         Ok(backend) => backend,
         Err(err) => {
             warn!("LAN discovery is not running: {err:#}");
@@ -86,11 +86,14 @@ pub async fn run(context: SourceContext, status: SourceStatus, lan: Arc<Lan>) {
     }
 }
 
-pub fn backend() -> Result<Arc<dyn LanDiscovery>> {
+pub fn backend(options: &DiscoveryOptions) -> Result<Arc<dyn LanDiscovery>> {
     match env::var_os(LAN_DIR_ENV).filter(|dir| !dir.is_empty()) {
-        Some(dir) => Ok(DirectoryLan::start(dir.into(), interval()?)?),
+        Some(dir) => Ok(DirectoryLan::start(
+            dir.into(),
+            interval(&options.settings)?,
+        )?),
         None => {
-            let service = mdns::service().context("mDNS failed")?;
+            let service = mdns::service(&options.lan.mdns_service).context("mDNS failed")?;
             Ok(MdnsLan::start(service).context("mDNS failed")?)
         }
     }

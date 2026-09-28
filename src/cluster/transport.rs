@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use super::ssh;
 use crate::config::ServerId;
 use crate::protocol::{LinkTransport, PublicKey};
+use crate::settings::SshSettings;
 
 const SSH_SCHEME: &str = "ssh://";
 const EXEC_SCHEME: &str = "exec:";
@@ -112,6 +113,7 @@ impl Address {
 
     pub fn connect(
         &self,
+        ssh: &SshSettings,
         amux_path: Option<&str>,
         socket: &str,
         no_start: bool,
@@ -119,6 +121,7 @@ impl Address {
     ) -> Option<Connect> {
         match self {
             Self::Ssh { user, host, port } => Some(Connect::Command(ssh::command(
+                ssh,
                 user.as_deref(),
                 host,
                 *port,
@@ -332,7 +335,13 @@ mod tests {
             ]))
         );
         assert_eq!(
-            address.connect(Some("ignored"), "ignored", true, &[]),
+            address.connect(
+                &SshSettings::default(),
+                Some("ignored"),
+                "ignored",
+                true,
+                &[]
+            ),
             Some(Connect::Command(argv(&[
                 "env",
                 "HOME=/tmp/a b",
@@ -348,11 +357,11 @@ mod tests {
     #[test]
     fn tcp_addresses_connect_to_their_endpoint() {
         assert_eq!(
-            tcp("100.64.0.2", 7447).connect(None, "default", true, &[]),
+            tcp("100.64.0.2", 7447).connect(&SshSettings::default(), None, "default", true, &[]),
             Some(Connect::Tcp(argv(&["100.64.0.2:7447"])))
         );
         assert_eq!(
-            tcp("fd7a::1", 7447).connect(None, "default", false, &[]),
+            tcp("fd7a::1", 7447).connect(&SshSettings::default(), None, "default", false, &[]),
             Some(Connect::Tcp(argv(&["[fd7a::1]:7447"])))
         );
     }
@@ -362,13 +371,16 @@ mod tests {
         let lan = Address::Lan {
             id: ServerId::random().unwrap(),
         };
-        assert_eq!(lan.connect(None, "default", true, &[]), None);
+        assert_eq!(
+            lan.connect(&SshSettings::default(), None, "default", true, &[]),
+            None
+        );
         let endpoints: [SocketAddr; 2] = [
             "192.168.0.10:40123".parse().unwrap(),
             "[fe80::2]:40123".parse().unwrap(),
         ];
         assert_eq!(
-            lan.connect(None, "default", true, &endpoints),
+            lan.connect(&SshSettings::default(), None, "default", true, &endpoints),
             Some(Connect::Tcp(argv(&[
                 "192.168.0.10:40123",
                 "[fe80::2]:40123"

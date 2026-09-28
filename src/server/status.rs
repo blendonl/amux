@@ -1,13 +1,9 @@
-use std::time::Duration;
-
 use tokio::sync::watch;
 use tokio::time::{Interval, MissedTickBehavior};
 
 use super::connection::Origin;
 use super::Server;
 use crate::protocol::{ClusterStatus, ServerMessage};
-
-const STATUS_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct StatusFeed {
     enabled: bool,
@@ -18,7 +14,7 @@ pub struct StatusFeed {
 
 impl StatusFeed {
     pub fn new(server: &Server, origin: Origin) -> Self {
-        let mut ticks = tokio::time::interval(STATUS_INTERVAL);
+        let mut ticks = tokio::time::interval(server.settings.cluster.status_interval());
         ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
         Self {
             enabled: origin == Origin::Local,

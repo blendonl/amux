@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsString;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -19,48 +20,34 @@ use crate::protocol::{
     self, read_frame, write_message, Farewell, Hello, IncompatibleServer, PeerMessage, Refusal,
     Role, Welcome,
 };
+use crate::settings::ClusterSettings;
 
 const PING_INTERVAL_ENV: &str = "AMUX_PING_INTERVAL_MS";
-const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(5);
-const DEFAULT_MISSED_PINGS: u32 = 3;
-const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_CAPACITY: usize = 64;
 const BULK_CAPACITY: usize = 16;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinkSettings {
-    pub ping_interval: Duration,
-    pub missed_pings: u32,
-    pub handshake_timeout: Duration,
+pub fn with_env(settings: ClusterSettings) -> Result<ClusterSettings> {
+    with_ping_interval(settings, env::var_os(PING_INTERVAL_ENV))
 }
 
-impl Default for LinkSettings {
-    fn default() -> Self {
-        Self {
-            ping_interval: DEFAULT_PING_INTERVAL,
-            missed_pings: DEFAULT_MISSED_PINGS,
-            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
-        }
-    }
-}
-
-impl LinkSettings {
-    pub fn from_env() -> Result<Self> {
-        let mut settings = Self::default();
-        if let Some(value) = env::var_os(PING_INTERVAL_ENV) {
-            let millis = value
+fn with_ping_interval(
+    mut settings: ClusterSettings,
+    value: Option<OsString>,
+) -> Result<ClusterSettings> {
+    match value {
+        Some(value) => {
+            settings.ping_interval_ms = value
                 .to_str()
                 .and_then(|value| value.parse::<u64>().ok())
                 .filter(|millis| *millis > 0)
                 .with_context(|| format!("{PING_INTERVAL_ENV} must be a positive number"))?;
-            settings.ping_interval = Duration::from_millis(millis);
         }
-        Ok(settings)
+        None if settings.ping_interval_ms == 0 => {
+            bail!("cluster.ping_interval_ms must be a positive number")
+        }
+        None => {}
     }
-
-    fn silence_limit(&self) -> Duration {
-        self.ping_interval * self.missed_pings
-    }
+    Ok(settings)
 }
 
 pub enum Handshake<R, W> {
@@ -359,7 +346,13 @@ where
         },
     ));
     tasks.spawn(publish(cluster.source(), bulk));
-    tasks.spawn(keep_alive(control, stats, cluster.settings().clone()));
+    let settings = cluster.settings();
+    tasks.spawn(keep_alive(
+        control,
+        stats,
+        settings.ping_interval(),
+        settings.silence_limit(),
+    ));
 
     let end = tokio::select! {
         Some(joined) = tasks.join_next() => joined
@@ -541,11 +534,11 @@ async fn publish(source: Weak<dyn StateSource>, bulk: mpsc::Sender<PeerMessage>)
 async fn keep_alive(
     control: mpsc::Sender<PeerMessage>,
     stats: Arc<LinkStats>,
-    settings: LinkSettings,
+    interval: Duration,
+    limit: Duration,
 ) -> LinkEnd {
-    let mut ticks = tokio::time::interval(settings.ping_interval);
+    let mut ticks = tokio::time::interval(interval);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let limit = settings.silence_limit();
     let mut nonce = 0;
     loop {
         ticks.tick().await;
@@ -626,11 +619,12 @@ mod tests {
     use crate::cluster::{
         Channel, ChannelEnd, ClusterOptions, NoiseKey, TrustStore, Voucher, CREDIT_WINDOW,
     };
-    use crate::config::{DiscoveryConfig, Incarnation, ServerIdentity};
+    use crate::config::{Incarnation, ServerIdentity};
     use crate::protocol::{
         ClientMessage, Duplex, Event, ServerMessage, ServerState, ServerStatus, SessionId,
         SessionInfo, Snapshot, StateEvent, TcpKind, Version, WindowSummary, PROTOCOL_MAJOR,
     };
+    use crate::settings::DiscoverySettings;
 
     type HostEnd = Duplex<ClientMessage, ServerMessage>;
 
@@ -691,7 +685,7 @@ mod tests {
         name: &'static str,
         incarnation: Incarnation,
         version: Version,
-        settings: LinkSettings,
+        settings: ClusterSettings,
         sessions: Vec<SessionInfo>,
     }
 
@@ -706,7 +700,7 @@ mod tests {
             self
         }
 
-        fn settings(mut self, settings: LinkSettings) -> Self {
+        fn settings(mut self, settings: ClusterSettings) -> Self {
             self.settings = settings;
             self
         }
@@ -737,7 +731,7 @@ mod tests {
                 settings: self.settings,
                 state_dir: None,
                 servers: BTreeMap::new(),
-                discovery: DiscoveryConfig::default(),
+                discovery: DiscoverySettings::default(),
                 trust: TrustStore::default(),
                 key: NoiseKey::generate().unwrap(),
             };
@@ -755,7 +749,7 @@ mod tests {
             name,
             incarnation: Incarnation::random().unwrap(),
             version: Version::current(),
-            settings: LinkSettings::default(),
+            settings: ClusterSettings::default(),
             sessions: Vec::new(),
         }
     }
@@ -1289,9 +1283,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_silent_peer_is_dropped_after_the_missed_pings() {
-        let settings = LinkSettings {
-            ping_interval: Duration::from_millis(20),
-            ..LinkSettings::default()
+        let settings = ClusterSettings {
+            ping_interval_ms: 20,
+            ..ClusterSettings::default()
         };
         let ours = node(LOWER, "ours").settings(settings).build();
         let (_raw, link) = raw_peer(&ours, PIPE_CAPACITY).await;
@@ -1302,6 +1296,67 @@ mod tests {
 
         assert!(matches!(end, LinkEnd::Silent(_)), "{end}");
         assert!(ours.cluster.links().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_ping_interval_and_missed_pings_come_from_the_settings() {
+        let settings = ClusterSettings {
+            ping_interval_ms: 15,
+            missed_pings: 2,
+            ..ClusterSettings::default()
+        };
+        let ours = node(LOWER, "ours").settings(settings).build();
+        let (_raw, link) = raw_peer(&ours, PIPE_CAPACITY).await;
+
+        let started = Instant::now();
+        let end = tokio::time::timeout(PATIENCE, run(link, &ours.cluster))
+            .await
+            .unwrap();
+
+        match end {
+            LinkEnd::Silent(limit) => assert_eq!(limit, Duration::from_millis(30)),
+            other => panic!("expected a silent peer, got {other}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_ping_interval_variable_wins_over_the_settings() {
+        let configured = ClusterSettings {
+            ping_interval_ms: 7000,
+            ..ClusterSettings::default()
+        };
+        let overridden = with_ping_interval(configured.clone(), Some("100".into())).unwrap();
+        assert_eq!(overridden.ping_interval(), Duration::from_millis(100));
+        assert_eq!(
+            ClusterSettings {
+                ping_interval_ms: 7000,
+                ..overridden
+            },
+            configured
+        );
+        assert_eq!(
+            with_ping_interval(configured.clone(), None).unwrap(),
+            configured
+        );
+
+        for value in ["0", "fast", ""] {
+            let error = with_ping_interval(configured.clone(), Some(value.into())).unwrap_err();
+            assert!(
+                error.to_string().contains(PING_INTERVAL_ENV),
+                "{value:?}: {error}"
+            );
+        }
+        let never = ClusterSettings {
+            ping_interval_ms: 0,
+            ..ClusterSettings::default()
+        };
+        let error = with_ping_interval(never.clone(), None).unwrap_err();
+        assert!(
+            error.to_string().contains("cluster.ping_interval_ms"),
+            "{error}"
+        );
+        assert!(with_ping_interval(never, Some("100".into())).is_ok());
     }
 
     #[tokio::test]

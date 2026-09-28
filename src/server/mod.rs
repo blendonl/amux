@@ -26,8 +26,8 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::cluster::{
-    Cluster, ClusterOptions, LanListener, LanOptions, LinkSettings, NoiseKey, StateSource,
-    TransportAuth, TrustStore, TRUST_FILE,
+    self, Cluster, ClusterOptions, LanListener, LanOptions, NoiseKey, StateSource, TransportAuth,
+    TrustStore, TRUST_FILE,
 };
 use crate::config::{self, Config, Incarnation, ServerId, ServerIdentity};
 use crate::discovery::{Discovery, DiscoveryOptions};
@@ -84,9 +84,14 @@ pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
     let listener = bind(socket)?;
     let mut terminate = signal(SignalKind::terminate())?;
     let socket_name = paths::socket_name(socket)?;
-    let discovery = DiscoveryOptions {
-        config: config.discovery.clone(),
+    let settings = Settings {
+        discovery: config.discovery.clone(),
         lan: config.lan.clone(),
+        ..Settings::default()
+    };
+    let discovery = DiscoveryOptions {
+        settings: settings.discovery.clone(),
+        lan: settings.lan.clone(),
         socket_name: socket_name.clone(),
         state_dir: Some(state_dir.clone()),
     };
@@ -94,17 +99,17 @@ pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
         identity: identity.clone(),
         version: Version::current(),
         socket_name,
-        settings: LinkSettings::from_env()?,
+        settings: cluster::with_env(settings.cluster.clone())?,
         state_dir: Some(state_dir),
         servers: config.servers.clone(),
-        discovery: config.discovery.clone(),
+        discovery: settings.discovery.clone(),
         trust,
         key,
     };
     let server = Server::new(
         identity,
         config,
-        Settings::default(),
+        settings,
         config_path,
         registry,
         options,
@@ -222,7 +227,7 @@ impl Server {
             ..LocalState::default()
         };
         let lan = LanOptions {
-            enabled: discovery.config.lan,
+            enabled: discovery.settings.lan,
             port: discovery.lan.port,
             state_dir: discovery.state_dir.clone(),
         };

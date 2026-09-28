@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::OsString;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -13,9 +14,10 @@ use tracing::{debug, info, warn};
 
 use super::{Advertisement, LanDiscovery};
 use crate::config::ServerId;
+use crate::settings::LanSettings;
 
 pub const SERVICE_ENV: &str = "AMUX_MDNS_SERVICE";
-pub const DEFAULT_SERVICE: &str = "_amux._tcp.local.";
+const SERVICE_SUFFIX: &str = "._tcp.local.";
 const LOOPBACK_INTERFACE: &str = "lo";
 const SKIPPED_PREFIXES: [&str; 5] = ["tailscale", "utun", "docker", "br-", "veth"];
 const NAME: &str = "name";
@@ -119,17 +121,23 @@ impl LanDiscovery for MdnsLan {
     }
 }
 
-pub fn service() -> Result<String> {
-    match env::var_os(SERVICE_ENV) {
-        None => Ok(DEFAULT_SERVICE.to_owned()),
-        Some(service) => service
-            .into_string()
-            .ok()
-            .filter(|service| service.ends_with("._tcp.local."))
-            .with_context(|| {
-                format!("{SERVICE_ENV} must be an mDNS service like {DEFAULT_SERVICE}")
-            }),
-    }
+pub fn service(configured: &str) -> Result<String> {
+    service_from(env::var_os(SERVICE_ENV), configured)
+}
+
+fn service_from(overridden: Option<OsString>, configured: &str) -> Result<String> {
+    let (service, source) = match overridden {
+        Some(service) => (service.into_string().ok(), SERVICE_ENV),
+        None => (Some(configured.to_owned()), "lan.mdns_service"),
+    };
+    service
+        .filter(|service| service.ends_with(SERVICE_SUFFIX))
+        .with_context(|| {
+            format!(
+                "{source} must be an mDNS service like {}",
+                LanSettings::default().mdns_service
+            )
+        })
 }
 
 pub fn is_skipped_interface(name: &str) -> bool {
@@ -202,6 +210,28 @@ fn parse(resolved: &ResolvedService, service: &str) -> Option<Advertisement> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_service_variable_wins_over_the_configured_service() {
+        let default = LanSettings::default().mdns_service;
+        assert_eq!(service_from(None, &default).unwrap(), "_amux._tcp.local.");
+        assert_eq!(
+            service_from(None, "_home._tcp.local.").unwrap(),
+            "_home._tcp.local."
+        );
+        assert_eq!(
+            service_from(Some("_test._tcp.local.".into()), "_home._tcp.local.").unwrap(),
+            "_test._tcp.local."
+        );
+
+        let error = service_from(Some("amux".into()), &default).unwrap_err();
+        assert!(error.to_string().starts_with(SERVICE_ENV), "{error}");
+        let error = service_from(None, "amux").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "lan.mdns_service must be an mDNS service like _amux._tcp.local."
+        );
+    }
 
     #[test]
     fn loopback_tailscale_docker_and_bridge_interfaces_are_skipped() {

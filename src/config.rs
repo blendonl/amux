@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::num::NonZeroU16;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -13,6 +12,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use toml_edit::{DocumentMut, Item, Table};
 
 use crate::paths;
+use crate::settings::{DiscoverySettings, LanSettings};
 
 const DEFAULT_PROJECTS_DIR: &str = "projects";
 const SERVERS_TABLE: &str = "servers";
@@ -26,8 +26,8 @@ pub struct Config {
     pub projects_dir: PathBuf,
     pub servers: BTreeMap<String, ServerConfig>,
     pub projects: BTreeMap<String, ProjectConfig>,
-    pub discovery: DiscoveryConfig,
-    pub lan: LanConfig,
+    pub discovery: DiscoverySettings,
+    pub lan: LanSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,32 +45,6 @@ pub struct ProjectConfig {
     pub worktrees_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct DiscoveryConfig {
-    pub tailscale: bool,
-    pub lan: bool,
-    pub tailscale_tags: Vec<String>,
-    pub tailscale_port: Option<NonZeroU16>,
-}
-
-impl Default for DiscoveryConfig {
-    fn default() -> Self {
-        Self {
-            tailscale: true,
-            lan: true,
-            tailscale_tags: Vec::new(),
-            tailscale_port: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct LanConfig {
-    pub port: u16,
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
@@ -81,9 +55,9 @@ struct ConfigFile {
     #[serde(default)]
     projects: BTreeMap<String, ProjectConfig>,
     #[serde(default)]
-    discovery: DiscoveryConfig,
+    discovery: DiscoverySettings,
     #[serde(default)]
-    lan: LanConfig,
+    lan: LanSettings,
 }
 
 impl Config {
@@ -327,6 +301,7 @@ fn random_bytes<const N: usize>() -> Result<[u8; N]> {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU16;
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
@@ -347,13 +322,17 @@ mod tests {
                 projects_dir: PathBuf::from("/home/tester/projects"),
                 servers: BTreeMap::new(),
                 projects: BTreeMap::new(),
-                discovery: DiscoveryConfig {
+                discovery: DiscoverySettings {
                     tailscale: true,
                     lan: true,
                     tailscale_tags: Vec::new(),
                     tailscale_port: None,
+                    ..DiscoverySettings::default()
                 },
-                lan: LanConfig { port: 0 },
+                lan: LanSettings {
+                    port: 0,
+                    ..LanSettings::default()
+                },
             }
         );
     }
@@ -374,14 +353,21 @@ mod tests {
 
         assert_eq!(
             config.discovery,
-            DiscoveryConfig {
+            DiscoverySettings {
                 tailscale: false,
                 lan: true,
                 tailscale_tags: vec!["tag:amux".into()],
                 tailscale_port: None,
+                ..DiscoverySettings::default()
             }
         );
-        assert_eq!(config.lan, LanConfig { port: 7448 });
+        assert_eq!(
+            config.lan,
+            LanSettings {
+                port: 7448,
+                ..LanSettings::default()
+            }
+        );
     }
 
     #[test]

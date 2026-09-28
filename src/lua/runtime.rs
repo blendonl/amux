@@ -123,7 +123,9 @@ pub(super) fn load_init(source: &str, process: Process) -> Result<Loaded> {
 mod tests {
     use super::*;
     use crate::keys::Key;
-    use crate::settings::{Color, StyleSpec, Theme};
+    use crate::settings::{
+        ClusterSettings, Color, DiscoverySettings, LanSettings, SshSettings, StyleSpec, Theme,
+    };
 
     fn loaded(source: &str) -> Loaded {
         load_init(source, Process::Client).unwrap()
@@ -242,6 +244,71 @@ mod tests {
     }
 
     #[test]
+    fn cluster_and_discovery_options_are_set_through_amux_opt() {
+        let loaded = loaded(
+            "local opt = amux.opt\n\
+             assert(opt.cluster.ping_interval_ms == 5000)\n\
+             assert(opt.cluster.ssh.program == 'ssh')\n\
+             assert(opt.discovery.interval_ms == 30000)\n\
+             assert(opt.discovery.tailscale_port == nil)\n\
+             opt.cluster.ping_interval_ms = 1000\n\
+             opt.cluster.backoff_max_ms = 5000\n\
+             opt.cluster.ssh.program = 'autossh'\n\
+             opt.cluster.ssh.options = { '-T', '-o', 'BatchMode=yes' }\n\
+             opt.discovery.tailscale = false\n\
+             opt.discovery.tailscale_tags = { 'tag:amux' }\n\
+             opt.discovery.tailscale_port = 7500\n\
+             opt.discovery.interval_ms = 10000\n\
+             opt.lan.port = 7448\n\
+             opt.lan.pairing_window_ms = 60000\n\
+             assert(opt.cluster.ssh.default_amux_path == 'amux')",
+        );
+        let settings = loaded.settings;
+        assert_eq!(
+            settings.cluster,
+            ClusterSettings {
+                ping_interval_ms: 1000,
+                backoff_max_ms: 5000,
+                ssh: SshSettings {
+                    program: "autossh".into(),
+                    options: vec!["-T".into(), "-o".into(), "BatchMode=yes".into()],
+                    ..SshSettings::default()
+                },
+                ..ClusterSettings::default()
+            }
+        );
+        assert_eq!(
+            settings.discovery,
+            DiscoverySettings {
+                tailscale: false,
+                tailscale_tags: vec!["tag:amux".into()],
+                tailscale_port: std::num::NonZeroU16::new(7500),
+                interval_ms: 10_000,
+                ..DiscoverySettings::default()
+            }
+        );
+        assert_eq!(
+            settings.lan,
+            LanSettings {
+                port: 7448,
+                pairing_window_ms: 60_000,
+                ..LanSettings::default()
+            }
+        );
+
+        let error = failure("amux.opt.cluster.backof_max_ms = 1");
+        assert!(
+            error.contains("init.lua:1: unknown option amux.opt.cluster.backof_max_ms"),
+            "{error}"
+        );
+        let error = failure("amux.opt.discovery.tailscale_port = 0");
+        assert!(
+            error.contains("init.lua:1: amux.opt.discovery.tailscale_port: invalid value"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn an_unknown_option_reports_the_init_line() {
         let error = failure("amux.opt.prefix = 'C-a'\n\namux.opt.bogus = true");
         assert!(
@@ -250,8 +317,8 @@ mod tests {
         );
         assert!(
             error.contains(
-                "borders, escape_time_ms, mouse, notice_ms, pane, prefix, session, status, \
-                 theme, tree, window, worktrees"
+                "borders, cluster, discovery, escape_time_ms, lan, mouse, notice_ms, pane, \
+                 prefix, session, status, theme, tree, window, worktrees"
             ),
             "{error}"
         );
