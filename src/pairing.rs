@@ -601,7 +601,13 @@ async fn connect(endpoints: &[String]) -> Result<TcpStream> {
                 return Ok(stream);
             }
             Ok(Err(err)) => failure = anyhow!("connecting to {endpoint}: {err}"),
-            Err(_) => failure = anyhow!("connecting to {endpoint} timed out"),
+            Err(_) => {
+                failure = anyhow!(
+                    "connecting to {endpoint} timed out, a firewall on the other machine is \
+                     likely dropping the port, so set amux.opt.lan.port there to a fixed port \
+                     and allow it in that firewall"
+                )
+            }
         }
     }
     Err(failure)
