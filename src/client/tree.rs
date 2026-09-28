@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
+use std::mem;
 
-use super::chrome::{self, draw_row, Rect, Span, Style};
+use super::chrome::{self, draw_row, Panel, PanelEvent, Placement, Rect, Span, Style};
 use crate::keys::{Decoded, KeyDecoder};
 use crate::project::ProjectId;
-use crate::protocol::{ServerStatus, ServerView, SessionInfo, WindowSummary};
+use crate::protocol::{ClientMessage, ServerStatus, ServerView, SessionInfo, WindowSummary};
 use crate::settings::{Table, TreeAction};
 use crate::target::Target;
 
@@ -23,6 +24,16 @@ pub enum TreeEvent {
     Pending,
     Pick(Target),
     Cancel,
+}
+
+impl From<TreeEvent> for PanelEvent {
+    fn from(event: TreeEvent) -> Self {
+        match event {
+            TreeEvent::Pending => Self::Pending,
+            TreeEvent::Pick(target) => Self::Done(ClientMessage::Switch(target)),
+            TreeEvent::Cancel => Self::Cancel,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,43 +125,11 @@ impl ClusterTree {
         TreeEvent::Pending
     }
 
-    pub fn is_partial(&self) -> bool {
-        self.keys.is_partial()
-    }
-
     pub fn time_out(&mut self) -> TreeEvent {
         self.keys
             .time_out()
             .and_then(|decoded| self.press(&decoded))
             .unwrap_or(TreeEvent::Pending)
-    }
-
-    pub fn render(&mut self, rect: Rect) -> Vec<u8> {
-        let mut out = Vec::new();
-        if rect.rows == 0 || rect.cols == 0 {
-            return out;
-        }
-        let visible = self.visible();
-        let height = usize::from(rect.rows);
-        self.scroll_into_view(&visible, height);
-
-        out.extend_from_slice(chrome::HIDE_CURSOR);
-        for line in 0..height {
-            let (spans, fill) = match visible.get(self.scroll + line) {
-                Some(&index) => self.row(index),
-                None => (Vec::new(), ENTRY),
-            };
-            let row = usize::from(rect.row) + line;
-            draw_row(
-                &mut out,
-                row,
-                usize::from(rect.col),
-                usize::from(rect.cols),
-                &spans,
-                fill,
-            );
-        }
-        out
     }
 
     fn press(&mut self, decoded: &Decoded) -> Option<TreeEvent> {
@@ -270,6 +249,103 @@ impl ClusterTree {
             text.push_str(&node.detail);
         }
         (vec![Span::new(text, style)], style)
+    }
+}
+
+impl Panel for ClusterTree {
+    fn handle(&mut self, input: &[u8], _attached: &Target) -> PanelEvent {
+        ClusterTree::handle(self, input).into()
+    }
+
+    fn time_out(&mut self, _attached: &Target) -> PanelEvent {
+        ClusterTree::time_out(self).into()
+    }
+
+    fn is_partial(&self) -> bool {
+        self.keys.is_partial()
+    }
+
+    fn render(&mut self, rect: Rect) -> Vec<u8> {
+        let mut out = Vec::new();
+        if rect.rows == 0 || rect.cols == 0 {
+            return out;
+        }
+        let visible = self.visible();
+        let height = usize::from(rect.rows);
+        self.scroll_into_view(&visible, height);
+
+        out.extend_from_slice(chrome::HIDE_CURSOR);
+        for line in 0..height {
+            let (spans, fill) = match visible.get(self.scroll + line) {
+                Some(&index) => self.row(index),
+                None => (Vec::new(), ENTRY),
+            };
+            let row = usize::from(rect.row) + line;
+            draw_row(
+                &mut out,
+                row,
+                usize::from(rect.col),
+                usize::from(rect.cols),
+                &spans,
+                fill,
+            );
+        }
+        out
+    }
+
+    fn placement(&self) -> Option<Placement> {
+        Some(Placement::SessionArea)
+    }
+
+    fn hides_session(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug)]
+pub struct Loading {
+    pending: Vec<u8>,
+    bindings: Table<TreeAction>,
+}
+
+impl Loading {
+    pub fn new(bindings: Table<TreeAction>) -> Self {
+        Self {
+            pending: Vec::new(),
+            bindings,
+        }
+    }
+}
+
+impl Panel for Loading {
+    fn handle(&mut self, input: &[u8], _attached: &Target) -> PanelEvent {
+        self.pending.extend_from_slice(input);
+        PanelEvent::Unchanged
+    }
+
+    fn time_out(&mut self, _attached: &Target) -> PanelEvent {
+        PanelEvent::Unchanged
+    }
+
+    fn is_partial(&self) -> bool {
+        false
+    }
+
+    fn render(&mut self, _area: Rect) -> Vec<u8> {
+        Vec::new()
+    }
+
+    fn placement(&self) -> Option<Placement> {
+        None
+    }
+
+    fn hides_session(&self) -> bool {
+        true
+    }
+
+    fn cluster_listed(&mut self, servers: &[ServerView], attached: &Target) -> PanelEvent {
+        let tree = ClusterTree::new(servers, Some(attached), self.bindings.clone());
+        PanelEvent::Replace(Box::new(tree), mem::take(&mut self.pending))
     }
 }
 

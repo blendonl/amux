@@ -1,6 +1,9 @@
-use super::draw::{self, Color, Span, Style};
+use super::draw::{self, Color, Rect, Span, Style};
+use super::panel::{Panel, PanelEvent, Placement};
 use crate::keys::{Decoded, Key, KeyDecoder};
+use crate::protocol::{ClientMessage, SessionCommand};
 use crate::settings::{PromptAction, Table};
+use crate::target::Target;
 
 const PROMPT: Style = Style::PLAIN.fg(Color::Black).bg(Color::Yellow);
 const LABEL: Style = PROMPT.bold();
@@ -14,8 +17,30 @@ pub enum PromptEvent {
     Cancel,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptPurpose {
+    RenameWindow,
+    RenameSession,
+}
+
+impl PromptPurpose {
+    fn submit(&self, text: String, attached: &Target) -> PanelEvent {
+        if text.is_empty() {
+            return PanelEvent::Cancel;
+        }
+        PanelEvent::Done(match self {
+            Self::RenameWindow => ClientMessage::Command(SessionCommand::RenameWindow(text)),
+            Self::RenameSession => ClientMessage::RenameSession {
+                target: attached.clone(),
+                name: text,
+            },
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct Prompt {
+    purpose: PromptPurpose,
     label: String,
     text: Vec<char>,
     cursor: usize,
@@ -24,12 +49,18 @@ pub struct Prompt {
 }
 
 impl Prompt {
-    pub fn new(label: impl Into<String>, initial: &str, bindings: Table<PromptAction>) -> Self {
+    pub fn new(
+        purpose: PromptPurpose,
+        label: impl Into<String>,
+        initial: &str,
+        bindings: Table<PromptAction>,
+    ) -> Self {
         let text: Vec<char> = initial
             .chars()
             .filter(|character| !character.is_control())
             .collect();
         Self {
+            purpose,
             label: label.into(),
             cursor: text.len(),
             text,
@@ -51,41 +82,11 @@ impl Prompt {
         PromptEvent::Pending
     }
 
-    pub fn is_partial(&self) -> bool {
-        self.keys.is_partial()
-    }
-
     pub fn time_out(&mut self) -> PromptEvent {
         self.keys
             .time_out()
             .and_then(|decoded| self.press(&decoded))
             .unwrap_or(PromptEvent::Pending)
-    }
-
-    pub fn render(&self, width: u16, row: u16) -> Vec<u8> {
-        let columns = usize::from(width);
-        let mut out = Vec::new();
-        if columns == 0 {
-            return out;
-        }
-
-        let label = format!("{}{LABEL_SEPARATOR}", self.label);
-        let label_width = draw::width(&label);
-        let label_budget = if label_width + MIN_INPUT_COLUMNS <= columns {
-            label_width
-        } else {
-            label_width.min(columns / 2)
-        };
-        let label = draw::truncate(&label, label_budget);
-        let label_width = draw::width(&label);
-        let (visible, cursor_column) = self.visible_text(columns - label_width);
-
-        let row = usize::from(row);
-        let spans = [Span::new(label, LABEL), Span::new(visible, PROMPT)];
-        draw::draw_row(&mut out, row, 0, columns, &spans, PROMPT);
-        draw::move_to(&mut out, row, label_width + cursor_column);
-        out.extend_from_slice(draw::SHOW_CURSOR);
-        out
     }
 
     fn visible_text(&self, columns: usize) -> (String, usize) {
@@ -111,6 +112,14 @@ impl Prompt {
             used += width;
         }
         (visible, cursor_column)
+    }
+
+    fn panel_event(&self, event: PromptEvent, attached: &Target) -> PanelEvent {
+        match event {
+            PromptEvent::Pending => PanelEvent::Pending,
+            PromptEvent::Submit(text) => self.purpose.submit(text, attached),
+            PromptEvent::Cancel => PanelEvent::Cancel,
+        }
     }
 
     fn press(&mut self, decoded: &Decoded) -> Option<PromptEvent> {
@@ -153,6 +162,56 @@ impl Prompt {
     }
 }
 
+impl Panel for Prompt {
+    fn handle(&mut self, input: &[u8], attached: &Target) -> PanelEvent {
+        let event = Prompt::handle(self, input);
+        self.panel_event(event, attached)
+    }
+
+    fn time_out(&mut self, attached: &Target) -> PanelEvent {
+        let event = Prompt::time_out(self);
+        self.panel_event(event, attached)
+    }
+
+    fn is_partial(&self) -> bool {
+        self.keys.is_partial()
+    }
+
+    fn render(&mut self, area: Rect) -> Vec<u8> {
+        let columns = usize::from(area.cols);
+        let mut out = Vec::new();
+        if columns == 0 {
+            return out;
+        }
+
+        let label = format!("{}{LABEL_SEPARATOR}", self.label);
+        let label_width = draw::width(&label);
+        let label_budget = if label_width + MIN_INPUT_COLUMNS <= columns {
+            label_width
+        } else {
+            label_width.min(columns / 2)
+        };
+        let label = draw::truncate(&label, label_budget);
+        let label_width = draw::width(&label);
+        let (visible, cursor_column) = self.visible_text(columns - label_width);
+
+        let (row, col) = (usize::from(area.row), usize::from(area.col));
+        let spans = [Span::new(label, LABEL), Span::new(visible, PROMPT)];
+        draw::draw_row(&mut out, row, col, columns, &spans, PROMPT);
+        draw::move_to(&mut out, row, col + label_width + cursor_column);
+        out.extend_from_slice(draw::SHOW_CURSOR);
+        out
+    }
+
+    fn placement(&self) -> Option<Placement> {
+        Some(Placement::StatusRow)
+    }
+
+    fn hides_session(&self) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,7 +219,12 @@ mod tests {
     use crate::settings::Keymap;
 
     fn new_prompt(label: &str, initial: &str) -> Prompt {
-        Prompt::new(label, initial, Keymap::default().prompt)
+        Prompt::new(
+            PromptPurpose::RenameWindow,
+            label,
+            initial,
+            Keymap::default().prompt,
+        )
     }
 
     fn edited(initial: &str, chunks: &[&[u8]]) -> Prompt {
@@ -171,10 +235,15 @@ mod tests {
         prompt
     }
 
-    fn draw(prompt: &Prompt, width: u16) -> vt100::Parser {
+    fn draw(prompt: &mut Prompt, width: u16) -> vt100::Parser {
         let mut parser = terminal(3, width);
         parser.process(b"\x1b[?25l");
-        parser.process(&prompt.render(width, 2));
+        parser.process(&prompt.render(Rect {
+            row: 2,
+            col: 0,
+            rows: 1,
+            cols: width,
+        }));
         parser
     }
 
@@ -266,7 +335,7 @@ mod tests {
 
     #[test]
     fn rendering_draws_the_label_and_text_and_places_the_cursor() {
-        let parser = draw(&new_prompt("rename window", "sh"), 40);
+        let parser = draw(&mut new_prompt("rename window", "sh"), 40);
         let screen = parser.screen();
 
         assert_eq!(row_text(&parser, 2), "rename window: sh");
@@ -279,7 +348,7 @@ mod tests {
 
     #[test]
     fn rendering_leaves_default_attributes() {
-        let mut parser = draw(&new_prompt("name", ""), 20);
+        let mut parser = draw(&mut new_prompt("name", ""), 20);
         parser.process(b"x");
         let cell = parser.screen().cell(2, 6).unwrap();
         assert_eq!(cell.contents(), "x");
@@ -290,12 +359,12 @@ mod tests {
     #[test]
     fn long_text_scrolls_to_keep_the_cursor_visible() {
         let mut prompt = new_prompt("name", "abcdefghijklmnopqrstuvwxyz");
-        let parser = draw(&prompt, 20);
+        let parser = draw(&mut prompt, 20);
         assert_eq!(row_text(&parser, 2), "name: nopqrstuvwxyz");
         assert_eq!(parser.screen().cursor_position(), (2, 19));
 
         prompt.handle(b"\x01");
-        let parser = draw(&prompt, 20);
+        let parser = draw(&mut prompt, 20);
         assert_eq!(row_text(&parser, 2), "name: abcdefghijklmn");
         assert_eq!(parser.screen().cursor_position(), (2, 6));
     }
@@ -303,29 +372,29 @@ mod tests {
     #[test]
     fn wide_characters_scroll_by_whole_characters() {
         let mut prompt = new_prompt("n", "日本語");
-        let parser = draw(&prompt, 12);
+        let parser = draw(&mut prompt, 12);
         assert_eq!(row_text(&parser, 2), "n: 日本語");
         assert_eq!(parser.screen().cursor_position(), (2, 9));
 
-        let parser = draw(&prompt, 7);
+        let parser = draw(&mut prompt, 7);
         assert_eq!(row_text(&parser, 2), "n: 語");
         assert_eq!(parser.screen().cursor_position(), (2, 5));
 
         prompt.handle(b"\x1b[D");
-        let parser = draw(&prompt, 7);
+        let parser = draw(&mut prompt, 7);
         assert_eq!(row_text(&parser, 2), "n: 本語");
         assert_eq!(parser.screen().cursor_position(), (2, 5));
     }
 
     #[test]
     fn a_narrow_row_shortens_the_label_first() {
-        let prompt = new_prompt("rename window", "sh");
-        let parser = draw(&prompt, 12);
+        let mut prompt = new_prompt("rename window", "sh");
+        let parser = draw(&mut prompt, 12);
         assert_eq!(row_text(&parser, 2), "renam…sh");
         assert_eq!(parser.screen().cursor_position(), (2, 8));
 
         for width in 1..=30 {
-            let parser = draw(&prompt, width);
+            let parser = draw(&mut prompt, width);
             assert!(row_text(&parser, 1).is_empty(), "width {width}");
             let (row, col) = parser.screen().cursor_position();
             assert_eq!(row, 2, "width {width}");

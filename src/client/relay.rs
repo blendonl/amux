@@ -8,15 +8,14 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Instant};
 
 use super::chrome::{
-    detach_hint, draw_row, render_reconnecting, Prompt, PromptEvent, Rect, StatusLine, Style,
-    WindowTab,
+    detach_hint, draw_row, render_reconnecting, Panel, PanelEvent, Placement, Prompt,
+    PromptPurpose, Rect, StatusLine, Style, WindowTab,
 };
-use super::router::{Action, KeyRouter, Panel};
+use super::router::{self, Action, KeyRouter};
 use super::terminal;
-use super::tree::{ClusterTree, TreeEvent};
+use super::tree::Loading;
 use crate::protocol::{
-    AttachedSession, ClientMessage, ClusterStatus, ServerMessage, ServerView, SessionCommand,
-    SessionState, Size,
+    AttachedSession, ClientMessage, ClusterStatus, ServerMessage, ServerView, SessionState, Size,
 };
 use crate::settings::{Keymap, Settings};
 use crate::target::Target;
@@ -42,18 +41,6 @@ impl fmt::Display for Outcome {
     }
 }
 
-enum Overlay {
-    Prompt(Prompt, Rename),
-    Loading(Vec<u8>),
-    Tree(ClusterTree),
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Rename {
-    Window,
-    Session,
-}
-
 pub struct Relay {
     local: String,
     attached: AttachedSession,
@@ -66,7 +53,7 @@ pub struct Relay {
     cluster: Option<ClusterStatus>,
     notice: Option<(String, Instant)>,
     reconnecting: Option<String>,
-    overlay: Option<Overlay>,
+    panel: Option<Box<dyn Panel>>,
     escape_at: Option<Instant>,
     last_error: Option<String>,
     output: Vec<u8>,
@@ -97,7 +84,7 @@ impl Relay {
             cluster: None,
             notice: None,
             reconnecting: None,
-            overlay: None,
+            panel: None,
             escape_at: None,
             last_error: None,
             output: Vec::new(),
@@ -128,7 +115,7 @@ impl Relay {
                 self.cluster = Some(status);
                 self.chrome_dirty = true;
             }
-            Some(ServerMessage::Cluster(servers)) => self.show_tree(&servers),
+            Some(ServerMessage::Cluster(servers)) => self.cluster_listed(&servers),
             Some(ServerMessage::Reconnecting { server }) => {
                 self.reconnecting = Some(server);
                 self.chrome_dirty = true;
@@ -153,8 +140,8 @@ impl Relay {
     pub fn input(&mut self, chunk: &[u8]) {
         let mut input = chunk.to_vec();
         while !input.is_empty() {
-            if self.overlay.is_some() {
-                self.overlay_input(&input);
+            if self.panel.is_some() {
+                self.panel_input(&input);
                 return;
             }
             let (actions, rest) = self.router.route(&input);
@@ -199,17 +186,7 @@ impl Relay {
             return;
         }
         self.escape_at = None;
-        match &mut self.overlay {
-            Some(Overlay::Prompt(prompt, rename)) => {
-                let (event, rename) = (prompt.time_out(), *rename);
-                self.prompt_event(event, rename);
-            }
-            Some(Overlay::Tree(tree)) => {
-                let event = tree.time_out();
-                self.tree_event(event);
-            }
-            Some(Overlay::Loading(_)) | None => {}
-        }
+        self.drive_panel(|panel, attached| panel.time_out(attached));
     }
 
     pub fn notice_deadline(&self) -> Option<Instant> {
@@ -252,7 +229,11 @@ impl Relay {
     }
 
     fn host_output(&mut self, bytes: &[u8]) {
-        if matches!(self.overlay, Some(Overlay::Tree(_) | Overlay::Loading(_))) {
+        if self
+            .panel
+            .as_ref()
+            .is_some_and(|panel| panel.hides_session())
+        {
             return;
         }
         self.output.extend_from_slice(bytes);
@@ -266,96 +247,65 @@ impl Relay {
         self.chrome_dirty = true;
     }
 
-    fn open(&mut self, panel: Panel) {
-        let overlay = match panel {
-            Panel::RenameWindow => Overlay::Prompt(
-                Prompt::new(
-                    RENAME_WINDOW,
-                    &self.active_window_name(),
-                    self.keymap.prompt.clone(),
-                ),
-                Rename::Window,
-            ),
-            Panel::RenameSession => Overlay::Prompt(
-                Prompt::new(
-                    RENAME_SESSION,
-                    self.session_name(),
-                    self.keymap.prompt.clone(),
-                ),
-                Rename::Session,
-            ),
-            Panel::ClusterTree => {
+    fn open(&mut self, request: router::Panel) {
+        let panel: Box<dyn Panel> = match request {
+            router::Panel::RenameWindow => Box::new(Prompt::new(
+                PromptPurpose::RenameWindow,
+                RENAME_WINDOW,
+                &self.active_window_name(),
+                self.keymap.prompt.clone(),
+            )),
+            router::Panel::RenameSession => Box::new(Prompt::new(
+                PromptPurpose::RenameSession,
+                RENAME_SESSION,
+                self.session_name(),
+                self.keymap.prompt.clone(),
+            )),
+            router::Panel::ClusterTree => {
                 self.messages.push(ClientMessage::ListCluster);
-                Overlay::Loading(Vec::new())
+                Box::new(Loading::new(self.keymap.tree.clone()))
             }
         };
-        self.overlay = Some(overlay);
+        self.panel = Some(panel);
         self.chrome_dirty = true;
     }
 
-    fn show_tree(&mut self, servers: &[ServerView]) {
-        let Some(Overlay::Loading(pending)) = &mut self.overlay else {
-            return;
-        };
-        let pending = mem::take(pending);
-        let attached = self.attached_target();
-        self.overlay = Some(Overlay::Tree(ClusterTree::new(
-            servers,
-            Some(&attached),
-            self.keymap.tree.clone(),
-        )));
-        self.chrome_dirty = true;
-        self.overlay_input(&pending);
+    fn cluster_listed(&mut self, servers: &[ServerView]) {
+        self.drive_panel(|panel, attached| panel.cluster_listed(servers, attached));
     }
 
-    fn overlay_input(&mut self, input: &[u8]) {
-        match &mut self.overlay {
-            Some(Overlay::Prompt(prompt, rename)) => {
-                let (event, rename) = (prompt.handle(input), *rename);
-                self.prompt_event(event, rename);
-            }
-            Some(Overlay::Tree(tree)) => {
-                let event = tree.handle(input);
-                self.tree_event(event);
-            }
-            Some(Overlay::Loading(pending)) => pending.extend_from_slice(input),
-            None => {}
-        }
+    fn panel_input(&mut self, input: &[u8]) {
+        self.drive_panel(|panel, attached| panel.handle(input, attached));
         self.arm_escape();
     }
 
-    fn prompt_event(&mut self, event: PromptEvent, rename: Rename) {
+    fn drive_panel(&mut self, drive: impl FnOnce(&mut dyn Panel, &Target) -> PanelEvent) {
+        let attached = self.attached_target();
+        if let Some(panel) = self.panel.as_deref_mut() {
+            let event = drive(panel, &attached);
+            self.panel_event(event);
+        }
+    }
+
+    fn panel_event(&mut self, event: PanelEvent) {
         match event {
-            PromptEvent::Pending => self.chrome_dirty = true,
-            PromptEvent::Cancel => self.close_overlay(),
-            PromptEvent::Submit(name) if name.is_empty() => self.close_overlay(),
-            PromptEvent::Submit(name) => {
-                let request = match rename {
-                    Rename::Window => ClientMessage::Command(SessionCommand::RenameWindow(name)),
-                    Rename::Session => ClientMessage::RenameSession {
-                        target: self.attached_target(),
-                        name,
-                    },
-                };
-                self.messages.push(request);
-                self.close_overlay();
+            PanelEvent::Unchanged => {}
+            PanelEvent::Pending => self.chrome_dirty = true,
+            PanelEvent::Cancel => self.close_panel(),
+            PanelEvent::Done(message) => {
+                self.messages.push(message);
+                self.close_panel();
+            }
+            PanelEvent::Replace(panel, input) => {
+                self.panel = Some(panel);
+                self.chrome_dirty = true;
+                self.panel_input(&input);
             }
         }
     }
 
-    fn tree_event(&mut self, event: TreeEvent) {
-        match event {
-            TreeEvent::Pending => self.chrome_dirty = true,
-            TreeEvent::Cancel => self.close_overlay(),
-            TreeEvent::Pick(target) => {
-                self.messages.push(ClientMessage::Switch(target));
-                self.close_overlay();
-            }
-        }
-    }
-
-    fn close_overlay(&mut self) {
-        self.overlay = None;
+    fn close_panel(&mut self) {
+        self.panel = None;
         self.escape_at = None;
         self.messages.push(ClientMessage::Redraw);
         if self.reconnecting.is_some() {
@@ -365,40 +315,41 @@ impl Relay {
     }
 
     fn arm_escape(&mut self) {
-        let partial = match &self.overlay {
-            Some(Overlay::Prompt(prompt, _)) => prompt.is_partial(),
-            Some(Overlay::Tree(tree)) => tree.is_partial(),
-            Some(Overlay::Loading(_)) | None => false,
-        };
+        let partial = self.panel.as_ref().is_some_and(|panel| panel.is_partial());
         self.escape_at = partial.then(|| Instant::now() + self.settings.escape_time());
     }
 
     fn draw_chrome(&mut self) {
         let above = self.above_status();
-        let status_row = self.size.rows.saturating_sub(self.settings.status.rows());
+        let status_row = self.status_row();
         let status = self.status_line();
-        match &mut self.overlay {
-            Some(Overlay::Tree(tree)) => self.output.extend(tree.render(above)),
-            _ => {
-                if let Some(server) = &self.reconnecting {
-                    let area = Size {
-                        rows: above.rows,
-                        cols: above.cols,
-                    };
-                    self.output.extend(render_reconnecting(
-                        server,
-                        self.detach_hint.as_deref(),
-                        area,
-                    ));
-                }
+        if let Some(panel) = self.placed(Placement::SessionArea) {
+            let drawn = panel.render(above);
+            self.output.extend(drawn);
+        } else if let Some(server) = &self.reconnecting {
+            let area = Size {
+                rows: above.rows,
+                cols: above.cols,
+            };
+            self.output.extend(render_reconnecting(
+                server,
+                self.detach_hint.as_deref(),
+                area,
+            ));
+        }
+        match self.placed(Placement::StatusRow) {
+            Some(panel) => {
+                let drawn = panel.render(status_row);
+                self.output.extend(drawn);
             }
+            None => self.output.extend(status.render(self.size.cols)),
         }
-        match &self.overlay {
-            Some(Overlay::Prompt(prompt, _)) => self
-                .output
-                .extend(prompt.render(self.size.cols, status_row)),
-            _ => self.output.extend(status.render(self.size.cols)),
-        }
+    }
+
+    fn placed(&mut self, placement: Placement) -> Option<&mut Box<dyn Panel>> {
+        self.panel
+            .as_mut()
+            .filter(|panel| panel.placement() == Some(placement))
     }
 
     fn clear_above_status(&mut self) {
@@ -420,6 +371,16 @@ impl Relay {
             row: 0,
             col: 0,
             rows: self.size.rows.saturating_sub(self.settings.status.rows()),
+            cols: self.size.cols,
+        }
+    }
+
+    fn status_row(&self) -> Rect {
+        let above = self.above_status();
+        Rect {
+            row: above.rows,
+            col: 0,
+            rows: self.settings.status.rows(),
             cols: self.size.cols,
         }
     }
@@ -537,7 +498,9 @@ mod tests {
     use super::*;
     use crate::client::chrome::testing::{row_text, screen_text, terminal};
     use crate::config::Incarnation;
-    use crate::protocol::{Direction, ServerStatus, SessionId, SessionInfo, WindowSummary};
+    use crate::protocol::{
+        Direction, ServerStatus, SessionCommand, SessionId, SessionInfo, WindowSummary,
+    };
     use crate::settings::Binding;
 
     const SIZE: Size = Size { rows: 10, cols: 40 };
