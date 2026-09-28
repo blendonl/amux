@@ -131,6 +131,12 @@ impl Scripting for LuaScripting {
         );
         status_spans(result?)
     }
+
+    fn release(&mut self, id: CallbackId) {
+        if let Some(mut registry) = self.lua.app_data_mut::<Registry>() {
+            registry.callbacks.release(id);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -448,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prompt_registers_its_submit_callback() {
+    fn a_prompt_registers_its_submit_callback_until_it_is_released() {
         let (mut scripting, keymap) = scripting(
             "amux.keymap.set('prefix', 'g', function(ctx)\n\
                amux.prompt { label = 'find', on_submit = function(text, ctx)\n\
@@ -468,10 +474,33 @@ mod tests {
             panic!("{effects:?}");
         };
         assert_eq!((label.as_str(), initial.as_str()), ("find", ""));
+        assert_eq!(registered(&scripting), 2);
         assert_eq!(
             scripting.call(*submit, Some("todo"), &context()),
             Ok(vec![Effect::Notify("todo in work".into())])
         );
+
+        scripting.release(*submit);
+        assert_eq!(registered(&scripting), 1);
+        assert_eq!(
+            scripting.call(*submit, Some("todo"), &context()),
+            Err(format!("callback {} is not registered", submit.0))
+        );
+        let effects = scripting
+            .call(callback_for(&keymap, "g"), None, &context())
+            .unwrap();
+        let [Effect::Prompt { submit: next, .. }] = effects.as_slice() else {
+            panic!("{effects:?}");
+        };
+        assert_ne!(next, submit);
+        assert_eq!(registered(&scripting), 2);
+    }
+
+    fn registered(scripting: &LuaScripting) -> usize {
+        scripting
+            .lua
+            .app_data_ref::<Registry>()
+            .map_or(0, |registry| registry.callbacks.len())
     }
 
     #[test]

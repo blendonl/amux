@@ -1164,13 +1164,16 @@ impl TestClient {
     }
 }
 
+type ModesCheck = Box<dyn Fn(&dyn MasterPty) -> bool>;
+
 pub struct TerminalClient {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     exited: bool,
     input: Box<dyn Write + Send>,
     output: std_mpsc::Receiver<Vec<u8>>,
     screen: vt100::Parser,
-    _master: Box<dyn MasterPty + Send>,
+    master: Box<dyn MasterPty + Send>,
+    modes_unchanged: ModesCheck,
 }
 
 impl TerminalClient {
@@ -1183,6 +1186,7 @@ impl TerminalClient {
                 pixel_height: 0,
             })
             .expect("opening a pty");
+        let modes = pair.master.get_termios().expect("reading the pty modes");
 
         let mut command = CommandBuilder::new(AMUX);
         command.env_clear();
@@ -1222,8 +1226,13 @@ impl TerminalClient {
             input,
             output,
             screen: vt100::Parser::new(SIZE.rows, SIZE.cols, 0),
-            _master: pair.master,
+            master: pair.master,
+            modes_unchanged: Box::new(move |master| master.get_termios().as_ref() == Some(&modes)),
         }
+    }
+
+    pub fn terminal_modes_unchanged(&self) -> bool {
+        (self.modes_unchanged)(self.master.as_ref())
     }
 
     pub fn contents(&self) -> String {

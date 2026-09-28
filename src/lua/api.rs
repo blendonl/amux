@@ -30,24 +30,33 @@ pub const EVENTS: [&str; 11] = [
 ];
 
 #[derive(Debug, Default)]
-pub struct Callbacks(Vec<Function>);
+pub struct Callbacks {
+    functions: BTreeMap<usize, Function>,
+    next: usize,
+}
 
 impl Callbacks {
     pub fn get(&self, id: CallbackId) -> Option<&Function> {
-        self.0.get(id.0)
+        self.functions.get(&id.0)
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.functions.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.functions.is_empty()
     }
 
     pub(super) fn register(&mut self, callback: Function) -> CallbackId {
-        self.0.push(callback);
-        CallbackId(self.0.len() - 1)
+        let id = CallbackId(self.next);
+        self.functions.insert(id.0, callback);
+        self.next += 1;
+        id
+    }
+
+    pub(super) fn release(&mut self, id: CallbackId) {
+        self.functions.remove(&id.0);
     }
 }
 

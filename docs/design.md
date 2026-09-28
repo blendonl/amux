@@ -235,7 +235,9 @@ opt.projects.amux = {
 }
 ```
 
-Every option lives in one `Settings` tree with a built-in default in Rust, and `amux.opt` is a strict view of it that rejects unknown options and wrong types at the line that sets them. The loaded tree is then checked for values that would break the server, such as a zero interval. Either kind of error stops the server before it listens.
+Every option lives in one `Settings` tree with a built-in default in Rust, and `amux.opt` is a strict view of it that rejects unknown options and wrong types at the line that sets them. The loaded tree is then checked for values that would break the server, such as a zero interval. Either kind of error stops the server before it listens, and the client before it enters raw mode.
+
+The client runs the same file when it attaches, in its own Lua VM on the main thread, and takes what it draws from it: the prefix, the keymap, the status bar with its Lua functions, the tree and their theme slots. The server runs it on a thread that owns its VM and takes the rest, including the hooks. [lua.md](lua.md) is the API reference.
 
 `amux servers add` and `remove` write only `servers.lua`, a data file in the config directory that amux owns. It is merged into `amux.opt.servers` before `init.lua` runs, so `init.lua` can read and override its entries. Each rewrite is checked by loading the whole config with it, then renamed into place.
 
@@ -259,7 +261,7 @@ Every option lives in one `Settings` tree with a built-in default in Rust, and `
 | `src/config/`             | `amux config` and the rewrites of `servers.lua`     |
 | `src/identity.rs`         | Server ID, incarnation and hostname                 |
 | `src/settings/`           | Every setting and its built-in default              |
-| `src/lua/`                | The Lua runtime, `amux.opt` and Lua data files      |
+| `src/lua/`                | The Lua runtime, `amux.opt`, bindings and hooks     |
 | `src/target.rs`           | Target parsing and resolution                       |
 | `src/project.rs`          | Git detection, project identity, worktrees          |
 | `src/protocol/`           | Client protocol, peer protocol, framing, versioning |

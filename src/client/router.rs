@@ -123,7 +123,7 @@ impl KeyRouter {
         routed: &mut Routed,
     ) -> Option<Binding> {
         let holding = !self.held.bytes.is_empty();
-        if !holding && !self.scanner.starts_sequence(byte) {
+        if !holding && (self.scanner.is_pasting() || !self.scanner.starts_sequence(byte)) {
             self.pass(byte, routed);
             return None;
         }
@@ -212,6 +212,10 @@ impl KeyRouter {
         if let Some(binding) = bound {
             return Some(binding.clone());
         }
+        if self.scanner_after(&decoded.raw).is_pasting() {
+            requeue(queue, &decoded.raw);
+            return None;
+        }
         if table == PREFIX_TABLE && decoded.key == Some(self.prefix) {
             routed.forward.extend(decoded.raw);
             return None;
@@ -219,9 +223,6 @@ impl KeyRouter {
         if let Some((escape, rest)) = decoded.split_escape() {
             requeue(queue, &rest.raw);
             return self.table_key(table, escape, queue, routed);
-        }
-        if let Some(payload) = decoded.mouse_payload() {
-            requeue(queue, payload);
         }
         None
     }
@@ -564,16 +565,48 @@ mod tests {
     }
 
     #[test]
-    fn a_pasted_prefix_still_acts_as_the_prefix() {
+    fn a_pasted_prefix_reaches_the_pane() {
         let mut router = router();
-        let (actions, rest) = router.route(b"\x1b[200~ab\x02dcd\x1b[201~");
-        assert_eq!(actions, vec![forward(b"\x1b[200~ab"), Action::Detach]);
-        assert_eq!(rest, b"cd\x1b[201~");
+        let paste = b"\x1b[200~ab\x02dcd\x1b[201~";
+        assert_eq!(router.route(paste), (vec![forward(paste)], Vec::new()));
+        assert_eq!(route(&mut router, b"\x02d"), vec![Action::Detach]);
     }
 
     #[test]
-    fn a_mouse_payload_after_the_prefix_is_still_forwarded() {
-        assert_eq!(routed(b"\x02\x1b[M !!"), vec![forward(b" !!")]);
+    fn a_paste_split_across_chunks_suppresses_bindings_until_it_ends() {
+        let mut router = router_with("C-b", &[("M-h", select_left())]);
+        let mut forwarded = Vec::new();
+        for chunk in [&b"\x1b[20"[..], b"0~a\x1bh\x02", b"d\x1b", b"[201~"] {
+            for action in route(&mut router, chunk) {
+                match action {
+                    Action::Forward(bytes) => forwarded.extend(bytes),
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            assert_eq!(router.escape_deadline(), None);
+        }
+        assert_eq!(forwarded, b"\x1b[200~a\x1bh\x02d\x1b[201~");
+        assert_eq!(
+            route(&mut router, b"\x1bh"),
+            vec![command(SessionCommand::SelectPane(Direction::Left))]
+        );
+    }
+
+    #[test]
+    fn a_paste_after_the_prefix_cancels_it_and_reaches_the_pane_whole() {
+        let paste = b"\x1b[200~x\x02d\x1b[201~";
+        let mut input = b"\x02".to_vec();
+        input.extend(paste);
+        assert_eq!(routed(&input), vec![forward(paste)]);
+    }
+
+    #[test]
+    fn a_mouse_report_after_the_prefix_is_swallowed_with_its_payload() {
+        assert_eq!(routed(b"\x02\x1b[M !!a"), vec![forward(b"a")]);
+        let mut router = router();
+        assert_eq!(route(&mut router, b"\x02\x1b[M"), vec![]);
+        assert_eq!(route(&mut router, b" !!"), vec![]);
+        assert_eq!(route(&mut router, b"b"), vec![forward(b"b")]);
     }
 
     #[test]

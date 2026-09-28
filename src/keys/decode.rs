@@ -4,7 +4,6 @@ use super::encode::function_tilde;
 use super::{Key, KeyCode, Mods, ESC, FUNCTION_KEYS, X10_MOUSE_PAYLOAD_LEN};
 
 const MAX_SEQUENCE_LEN: usize = 32;
-const X10_MOUSE: &[u8] = b"\x1b[M";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decoded {
@@ -28,12 +27,6 @@ impl Decoded {
             raw: rest.to_vec(),
         };
         Some((escape, unmeta))
-    }
-
-    pub fn mouse_payload(&self) -> Option<&[u8]> {
-        self.raw
-            .strip_prefix(X10_MOUSE)
-            .filter(|payload| payload.len() == X10_MOUSE_PAYLOAD_LEN)
     }
 }
 
@@ -562,12 +555,5 @@ mod tests {
         );
         assert_eq!(split(b"\x1b[1;3A"), None);
         assert_eq!(split(b"x"), None);
-    }
-
-    #[test]
-    fn only_x10_mouse_reports_have_a_payload() {
-        let decoded = KeyDecoder::default().feed(b"\x1b[M !#\x1b[<0;3;4M");
-        assert_eq!(decoded[0].mouse_payload(), Some(&b" !#"[..]));
-        assert_eq!(decoded[1].mouse_payload(), None);
     }
 }

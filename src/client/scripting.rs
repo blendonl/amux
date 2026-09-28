@@ -18,6 +18,8 @@ pub trait Scripting {
         id: CallbackId,
         context: &StatusContext,
     ) -> Result<Option<Vec<StatusSpan>>, String>;
+
+    fn release(&mut self, id: CallbackId);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

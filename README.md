@@ -34,7 +34,7 @@ cargo run -- config defaults             # every default setting, as Lua for a s
 cargo run -- kill-server                 # stop the server and all sessions
 ```
 
-Inside a session, press `Ctrl-b d` to detach and `Ctrl-b Ctrl-b` to send a literal `Ctrl-b`. The other keys after `Ctrl-b` manage windows and panes, as in tmux, and `Ctrl-b s` opens a tree of every session in the cluster. The bottom row is a status bar that shows the session, its server and its windows.
+Inside a session, press `Ctrl-b d` to detach and `Ctrl-b Ctrl-b` to send a literal `Ctrl-b`. The other keys after `Ctrl-b` manage windows and panes, as in tmux, and `Ctrl-b s` opens a tree of every session in the cluster. The bottom row is a status bar that shows the session, its server and its windows. The prefix, every binding, the status bar and the colours come from the [config](#config), and text pasted with bracketed paste reaches the pane whole, even when it contains the prefix.
 
 `-L <name>` picks a named server socket in the runtime directory and `-S <path>` sets an explicit socket path. Both work like tmux's flags, so you can run an isolated dev server next to your usual one. Each `-L` name is its own cluster: a `-L dev` server only links to other `-L dev` servers.
 
@@ -68,7 +68,7 @@ A session holds numbered windows, and each window splits into panes, each runnin
 
 ### Status bar and the cluster tree
 
-The client keeps the bottom row of the terminal for a status bar, so a session gets one row less than the terminal has:
+The client keeps the bottom row of the terminal for a status bar, so a session gets one row less than the terminal has. With `amux.opt.status.enabled = false` the session gets every row, and errors and prompts cover the bottom row only while they show:
 
 ```
 [notes@laptop] 0:sh  1:vim                            home-server offline  12 ms
@@ -117,7 +117,7 @@ Panes are numbered from 0 in layout order. `attach -t work:1.0` makes window 1 a
 
 ### Config
 
-amux is configured in Lua. The server loads the config when it starts, and so do `amux servers add`, `amux servers remove` and `amux config`. It runs the first of these that applies:
+amux is configured in Lua. The server loads the config when it starts, the client loads it when it attaches (`amux`, `amux new` and `amux attach`), and so do `amux servers add`, `amux servers remove` and `amux config`. `amux ls`, `kill`, `bridge`, `kill-server` and the other one-shot commands never read it. It runs the first of these that applies:
 
 1. The file named by `--config <path>` or `AMUX_CONFIG`, which must exist
 2. `$XDG_CONFIG_HOME/amux/init.lua`, usually `~/.config/amux/init.lua`
@@ -147,7 +147,30 @@ opt.discovery.tailscale_tags = { "tag:server" }
 opt.lan.port = 7448
 ```
 
-Every option has a built-in default, so a config only sets what it changes. `amux.opt` is strict: an unknown option or a value of the wrong type is an error that names the file and line, such as `init.lua:3: unknown option amux.opt.bogus, expected one of …`. Values that would break the server, such as a zero interval or a blank `name`, are errors too. A bad config stops the server before it starts listening, so a typo is never ignored.
+Every option has a built-in default, so a config only sets what it changes. `amux.opt` is strict: an unknown option or a value of the wrong type is an error that names the file and line, such as `init.lua:3: unknown option amux.opt.bogus, expected one of …`. Values that would break the server, such as a zero interval or a blank `name`, are errors too. A bad config stops the server before it starts listening, and stops `amux`, `new` and `attach` before they take over the terminal, so a typo is never ignored.
+
+The client and the server each read the config of the machine they run on. The client takes the prefix, the key bindings, the status bar, the tree and their colours from it, and the server everything the host does: panes, windows, sessions, pane borders, the cluster and hooks. Key bindings can call Lua functions, the status bar can show what a Lua function returns, and hooks run on server events:
+
+```lua
+amux.opt.prefix = "C-a"
+amux.keymap.set("prefix", "a", amux.action.send_prefix())
+amux.keymap.set("root", "M-h", amux.action.select_pane("left"))
+amux.keymap.set("prefix", "g", function(ctx)
+  amux.run(amux.action.new_window())
+  amux.send_keys("git status\r")
+end)
+
+amux.opt.theme.status = { fg = "black", bg = "#8ec07c" }
+amux.opt.status.interval_ms = 1000
+amux.opt.status.right = function(ctx) return os.date(" %H:%M ") end
+
+amux.opt.pane.term = "tmux-256color"
+amux.opt.window.base_index = 1
+
+amux.on("session_created", function(event) amux.log("new session " .. event.session) end)
+```
+
+[docs/lua.md](docs/lua.md) is the reference for `amux.keymap`, `amux.action`, the functions a binding can call, status functions, the theme slots and hooks.
 
 | Command                | Does                                                                                        |
 | ---------------------- | ------------------------------------------------------------------------------------------- |
@@ -489,5 +512,5 @@ Phases 1 to 7 of the design are done. What remains is its phase 8, "Later":
 Beyond the design:
 
 - [x] A Lua config: `init.lua` and `servers.lua` in place of `config.toml`, and `amux config check`, `defaults` and `path`
-- [ ] Prefix key and key bindings from the config in the client, which still uses the defaults
+- [x] Prefix key and key bindings from the config in the client
 - [ ] Scrollback and copy mode

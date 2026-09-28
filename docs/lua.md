@@ -1,0 +1,213 @@
+# Lua API reference
+
+amux runs `init.lua` in two places, and each machine uses its own copy (see [Config](../README.md#config) for where it is found):
+
+- **The client** runs it when it attaches: `amux`, `amux new` and `amux attach`. It uses the prefix, the key bindings, the status bar, the theme and the tree, which is everything the client draws. A config error stops the client with `init.lua:N` before it takes over the terminal.
+- **The server** runs it when it starts. It uses everything the host does: panes, windows, sessions, borders, the cluster and the hooks.
+
+`amux.process` is `"client"` or `"server"`, so one file can do different things in each. `amux config check` loads the file both ways. `amux ls`, `kill`, `bridge`, `kill-server` and the other one-shot commands never run it.
+
+| Everywhere             | Does                                                          |
+| ---------------------- | ------------------------------------------------------------- |
+| `amux.opt`             | Every setting, `amux config defaults` lists them              |
+| `amux.keymap`          | Key bindings, used by the client                              |
+| `amux.action`          | Action constructors for bindings                              |
+| `amux.on(event, fn)`   | Registers a hook, which only the server runs                  |
+| `amux.process`         | `"client"` or `"server"`                                      |
+| `amux.hostname()`      | This machine's hostname                                       |
+| `amux.log(...)`        | Writes its arguments, tab-separated, to the server log        |
+
+## Keys
+
+A key is written like tmux writes it: `C-b` (Ctrl), `M-h` (Alt), `S-Left` (Shift), and combinations such as `C-M-Up`. Single characters stand for themselves (`%`, `"`, `G`), and named keys are `Space`, `Enter`, `Tab`, `BackTab`, `Backspace`, `Escape`, `Up`, `Down`, `Left`, `Right`, `Home`, `End`, `Insert`, `Delete`, `PageUp`, `PageDown` and `F1` to `F12`. tmux's spellings `BSpace`, `Esc`, `IC`, `DC`, `PPage`, `NPage`, `PgUp`, `PgDn` and `BTab` work too.
+
+`amux.opt.prefix` is the prefix key, `"C-b"` by default. `amux.opt.escape_time_ms` (50) is how long a lone `Escape` waits for the rest of a sequence.
+
+## amux.keymap
+
+| Function                              | Does                                                                   |
+| ------------------------------------- | ---------------------------------------------------------------------- |
+| `amux.keymap.set(table, key, binding)` | Binds `key` in `table`, replacing what it was bound to                 |
+| `amux.keymap.del(table, key)`          | Unbinds `key`. It is an error when `key` is not bound there            |
+| `amux.keymap.get(table, key)`          | The action or function bound to `key`, or `nil`                        |
+| `amux.keymap.clear(table)`             | Unbinds every key in `table`, and removes a custom table               |
+
+The tables are:
+
+- `root`: keys that act as soon as they are typed, without the prefix. Empty by default. Everything else reaches the pane byte for byte, and only a lone `Escape` is ever held back, when a root binding starts with it (`M-h` does).
+- `prefix`: the key after the prefix. The defaults are the keys in the [README](../README.md#windows-and-panes). A key it doesn't bind is dropped, and the prefix itself, when it isn't bound here, sends a literal prefix.
+- `prompt`: the rename and `amux.prompt` prompts. It binds prompt actions by name: `submit`, `cancel`, `delete_backward`, `delete_forward`, `delete_line`, `cursor_left`, `cursor_right`, `cursor_start` and `cursor_end`.
+- `tree`: the `Ctrl-b s` tree. It binds tree actions by name: `down`, `up`, `top`, `bottom`, `collapse`, `expand`, `pick` and `cancel`.
+- Any other name is a custom table, created by its first `set`. `switch_table(name)` reads the next key from it, then goes back to `root`.
+
+In the `prompt` and `tree` tables, a modified key that isn't bound acts like the plain key, so `C-Left` moves like `Left`. Text pasted with bracketed paste (`ESC[200~ … ESC[201~`) always goes to the pane whole: root and prefix bindings don't fire inside a paste, and a paste right after the prefix cancels the prefix.
+
+```lua
+amux.opt.prefix = "C-a"
+amux.keymap.set("prefix", "a", amux.action.send_prefix())
+amux.keymap.set("prefix", "|", amux.action.split_pane("left-right"))
+amux.keymap.set("prefix", "-", "next_pane")
+amux.keymap.set("prefix", "N", { select_window = 3 })
+amux.keymap.del("prefix", "&")
+amux.keymap.set("root", "M-h", amux.action.select_pane("left"))
+amux.keymap.set("root", "M-r", amux.action.switch_table("resize"))
+amux.keymap.set("resize", "h", amux.action.select_pane("left"))
+amux.keymap.set("prompt", "C-w", "delete_line")
+amux.keymap.set("tree", "Space", "pick")
+```
+
+## amux.action
+
+`root`, `prefix` and custom tables bind an action or a function. An action is written as a constructor call, `amux.action.split_pane("left-right")`, as a bare constructor for actions without an argument, `amux.action.new_window`, as its name, `"new_window"`, or as a table, `{ split_pane = "left-right" }`. An unknown action is an error that lists the valid ones.
+
+| Action                      | Does                                                   |
+| --------------------------- | ------------------------------------------------------ |
+| `detach()`                  | Detaches the client                                    |
+| `send_prefix()`             | Sends the prefix key to the pane                       |
+| `new_window()`              | Opens a window                                         |
+| `next_window()`             | Selects the next window                                |
+| `previous_window()`         | Selects the previous window                            |
+| `select_window(n)`          | Selects window `n`                                     |
+| `split_pane(split)`         | Splits the active pane, `"left-right"` or `"top-bottom"` |
+| `next_pane()`               | Selects the next pane                                  |
+| `select_pane(direction)`    | Selects the pane `"left"`, `"right"`, `"up"` or `"down"` |
+| `kill_pane()`               | Kills the active pane                                  |
+| `kill_window()`             | Kills the active window                                |
+| `rename_window()`           | Opens the rename window prompt                         |
+| `rename_session()`          | Opens the rename session prompt                        |
+| `cluster_tree()`            | Opens the cluster tree                                 |
+| `switch_table(name)`        | Reads the next key from table `name`                   |
+
+## Functions as bindings
+
+A function bound to a key runs in the client when the key is pressed. It gets `ctx`, a read-only snapshot of the client:
+
+| Field          | Is                                                                   |
+| -------------- | -------------------------------------------------------------------- |
+| `session`      | The attached session's name                                          |
+| `server`       | The server that holds it                                             |
+| `local_server` | This client's own server                                             |
+| `window_index`, `window_name`, `panes` | The active window, when the session has sent it |
+| `windows`      | Every window: `{ index, name, panes, active }`                       |
+| `latency_ms`   | The latency to a remote session's server, when it is known           |
+| `offline`      | The names of the servers that are offline                            |
+| `width`        | The terminal width, in status functions only                         |
+
+Inside a binding these work, and they take effect in order once the function returns:
+
+| Function                     | Does                                                                         |
+| ---------------------------- | ---------------------------------------------------------------------------- |
+| `amux.notify(message)`       | Shows `message` on the status row for `notice_ms` (3000)                     |
+| `amux.run(action)`           | Runs an action, as if its key was pressed                                    |
+| `amux.send_keys(keys)`       | Types `keys` into the active pane, escape sequences included                 |
+| `amux.switch(target)`        | Switches this client to a target such as `"notes@laptop"` or `"work:1"`      |
+| `amux.prompt { label, initial, on_submit }` | Opens a prompt. `on_submit(text, ctx)` runs on `Enter`, with the same API. Cancelling runs nothing |
+| `amux.state()`               | The same snapshot as `ctx`                                                   |
+| `amux.keymap.set/del/clear`  | Changes the bindings from the next key on                                    |
+
+A binding has one second to finish. An error, or running past the budget, shows the error on the status row and applies none of the binding's effects or keymap changes. `notify`, `run`, `send_keys`, `switch` and `prompt` are errors outside a binding, and only the client has them.
+
+```lua
+amux.keymap.set("prefix", "g", function(ctx)
+  amux.run(amux.action.new_window())
+  amux.send_keys("git status\r")
+end)
+
+amux.keymap.set("prefix", "f", function(ctx)
+  amux.prompt {
+    label = "switch to",
+    initial = ctx.session,
+    on_submit = function(text) amux.switch(text) end,
+  }
+end)
+```
+
+## The status bar
+
+| Option                | Default                  | Is                                                                 |
+| --------------------- | ------------------------ | ------------------------------------------------------------------ |
+| `enabled`             | `true`                   | Whether the bottom row is a status bar                             |
+| `left`                | none                     | A function that replaces the `[session@server]` tag                |
+| `right`               | none                     | A function that replaces the offline servers and the latency       |
+| `interval_ms`         | `0`                      | Also reruns `left` and `right` every this many ms, on the clock    |
+| `session_format`      | `"[{session}@{server}]"` | The tag, with `{session}` and `{server}`                           |
+| `window_format`       | `" {index}:{name} "`     | Each window, with `{index}` and `{name}`                           |
+| `latency_format`      | `" {latency} "`          | The latency, with `{latency}`                                      |
+| `offline_format`      | `" {server} offline "`   | An offline server, with `{server}`                                 |
+| `offline_count_format`| `" {count} offline "`    | The offline servers when their names don't fit, with `{count}`     |
+| `hidden_marker`       | `"…"`                    | Marks windows cut from the list                                    |
+
+All of them live under `amux.opt.status`. With `enabled = false` the session gets the whole terminal. Notices and prompts then cover the bottom row while they show, and the session redraws it after.
+
+`left` and `right` get the same `ctx` as a binding, with `width` added, and return `nil` to keep the built-in segment, a string, or a list of spans `{ text = …, style = { … } }`. The window list stays in the middle, and a right side that doesn't fit is dropped whole. They run again only when the session, the cluster status or the width changes, or on the next `interval_ms` tick, and not while a notice shows. Each call has 50 ms, and an error shows once on the status row, after which the built-in segment is used. `amux.state()` works in them, the functions that change something don't.
+
+```lua
+amux.opt.status.interval_ms = 1000
+amux.opt.status.right = function(ctx)
+  return { { text = os.date(" %H:%M "), style = { fg = "black", bg = "cyan" } } }
+end
+```
+
+## The theme
+
+Each slot under `amux.opt.theme` is a style: `fg`, `bg`, `bold`, `dim`, `italic`, `underline` and `reverse`, each optional. A colour is a name (`"black"`, `"red"`, `"green"`, `"yellow"`, `"blue"`, `"magenta"`, `"cyan"`, `"white"` and their `"bright-"` forms), `"default"`, an index from 0 to 255, or `"#rrggbb"`. Assigning a table replaces the whole slot, and assigning one field changes only that field: `amux.opt.theme.status.bg = "blue"`.
+
+| Slot                   | Styles                                                 | Default              |
+| ---------------------- | ------------------------------------------------------ | -------------------- |
+| `status`               | The status bar, and the base of the other `status_` slots and of status function spans | black on green |
+| `status_session`       | The session tag                                        | bold                 |
+| `status_active_window` | The active window                                      | bold, reverse        |
+| `status_offline`       | Offline servers                                        | bold white on red    |
+| `message`              | Notices and errors on the status row                   | black on yellow      |
+| `prompt`               | A prompt                                               | black on yellow      |
+| `prompt_label`         | The prompt's label, over `prompt`                      | bold                 |
+| `tree`                 | The cluster tree                                       | plain                |
+| `tree_server`          | Server rows, over `tree`                               | bold                 |
+| `tree_stale`           | Sessions of offline servers, over `tree`               | dim                  |
+| `tree_cursor`          | The selected row                                       | reverse              |
+| `overlay_text`         | The reconnecting overlay's text                        | bold                 |
+| `overlay_border`       | The reconnecting overlay's border                      | plain                |
+| `pane_border`          | Pane borders, drawn by the host                        | plain                |
+| `pane_border_active`   | The active pane's border, drawn by the host            | green                |
+
+The pane border slots come from the server's config, since the host draws the borders. Everything else comes from the client's.
+
+## Hooks
+
+`amux.on(event, fn)` runs `fn(event)` in the server when something happens there. The client accepts `amux.on` and never runs it. `event.event` is the event's name, and the other fields are:
+
+| Event             | Fields                                                                  |
+| ----------------- | ----------------------------------------------------------------------- |
+| `server_started`  | `server`                                                                |
+| `session_created` | `session`                                                               |
+| `session_closed`  | `session`                                                               |
+| `session_renamed` | `session`, `old`                                                        |
+| `window_created`  | `session`, `window`, `name`                                             |
+| `window_closed`   | `session`, `window`, `name`                                             |
+| `pane_exited`     | `session`, `window`, `pane`, and `status` or `signal` when known        |
+| `client_attached` | `session`, `origin` (`"local"` or `"peer"`), `clients`                  |
+| `client_detached` | `session`, `origin`, `clients`                                          |
+| `peer_online`     | `peer`                                                                  |
+| `peer_offline`    | `peer`                                                                  |
+
+Inside a hook, these read and change the server's own sessions:
+
+| Function                                            | Does                                                              |
+| --------------------------------------------------- | ----------------------------------------------------------------- |
+| `amux.server_name()`                                | This server's name                                                |
+| `amux.sessions()`                                   | Every session: `{ name, clients, windows, project, branch }`, each window `{ index, name, panes }` |
+| `amux.session(name)`                                | One session, or `nil`                                             |
+| `amux.new_window { session = … }`                   | Opens a window                                                    |
+| `amux.rename_window { session = …, window = …, name = … }` | Renames a window                                           |
+| `amux.send_keys { session = …, window = …, pane = …, keys = … }` | Types `keys` into a pane. `window` and `pane` default to the active ones |
+| `amux.rename_session(session, name)`                | Renames a session                                                 |
+| `amux.kill_session(session)`                        | Kills a session                                                   |
+
+The changes are queued and applied after the hook returns. A change that fails, such as a session that is gone, is logged. Hooks run one at a time on their own thread, so a slow hook delays later hooks and never the server. Each has one second, and an error or a hook that runs past it is logged to the server log (`<socket>.log`) and the next event still runs. Events caused by a hook's changes run hooks too, down to three levels, which stops a `window_created` hook that opens a window from looping.
+
+```lua
+amux.on("session_created", function(event)
+  amux.log("new session " .. event.session)
+  amux.send_keys { session = event.session, keys = "git status\r" }
+end)
+```

@@ -59,6 +59,7 @@ pub struct Relay {
     notice: Option<(String, Instant)>,
     reconnecting: Option<String>,
     panel: Option<Box<dyn Panel>>,
+    prompt_callback: Option<CallbackId>,
     escape_at: Option<Instant>,
     last_error: Option<String>,
     output: Vec<u8>,
@@ -94,6 +95,7 @@ impl Relay {
             notice: None,
             reconnecting: None,
             panel: None,
+            prompt_callback: None,
             escape_at: None,
             last_error: None,
             output: Vec::new(),
@@ -200,6 +202,9 @@ impl Relay {
 
     pub fn notice_expired(&mut self) {
         self.notice = None;
+        if !self.settings.status.enabled {
+            self.messages.push(ClientMessage::Redraw);
+        }
         self.chrome_dirty = true;
     }
 
@@ -332,6 +337,10 @@ impl Relay {
     }
 
     fn open_prompt(&mut self, purpose: PromptPurpose, label: impl Into<String>, initial: &str) {
+        let callback = match purpose {
+            PromptPurpose::Callback(id) => Some(id),
+            PromptPurpose::RenameWindow | PromptPurpose::RenameSession => None,
+        };
         let prompt = Prompt::new(
             purpose,
             label,
@@ -340,11 +349,25 @@ impl Relay {
             &self.settings.theme,
         );
         self.show(Box::new(prompt));
+        self.prompt_callback = callback;
     }
 
     fn show(&mut self, panel: Box<dyn Panel>) {
+        self.release_prompt_callback();
         self.panel = Some(panel);
         self.chrome_dirty = true;
+    }
+
+    fn release_prompt_callback(&mut self) {
+        if let Some(id) = self.prompt_callback.take() {
+            self.release_callback(id);
+        }
+    }
+
+    fn release_callback(&mut self, id: CallbackId) {
+        if let Some(scripting) = self.scripting.as_deref_mut() {
+            scripting.release(id);
+        }
     }
 
     fn cluster_listed(&mut self, servers: &[ServerView]) {
@@ -374,8 +397,10 @@ impl Relay {
                 self.close_panel();
             }
             PanelEvent::Callback(id, text) => {
+                self.prompt_callback = None;
                 self.close_panel();
                 self.run_callback(id, Some(&text));
+                self.release_callback(id);
             }
             PanelEvent::Replace(panel, input) => {
                 self.show(panel);
@@ -385,6 +410,7 @@ impl Relay {
     }
 
     fn close_panel(&mut self) {
+        self.release_prompt_callback();
         self.panel = None;
         self.escape_at = None;
         self.messages.push(ClientMessage::Redraw);
@@ -402,6 +428,7 @@ impl Relay {
     fn draw_chrome(&mut self) {
         let above = self.above_status();
         let status_row = self.status_row();
+        let shows_status = self.settings.status.enabled || self.notice.is_some();
         if let Some(panel) = self.placed(Placement::SessionArea) {
             let drawn = panel.render(above);
             self.output.extend(drawn);
@@ -422,7 +449,8 @@ impl Relay {
                 let drawn = panel.render(status_row);
                 self.output.extend(drawn);
             }
-            None => self.draw_status(),
+            None if shows_status => self.draw_status(),
+            None => {}
         }
     }
 
@@ -513,11 +541,10 @@ impl Relay {
     }
 
     fn status_row(&self) -> Rect {
-        let above = self.above_status();
         Rect {
-            row: above.rows,
+            row: self.size.rows.saturating_sub(1),
             col: 0,
-            rows: self.settings.status.rows(),
+            rows: 1,
             cols: self.size.cols,
         }
     }
@@ -664,10 +691,13 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::time::{Duration, SystemTime};
 
     use super::*;
     use crate::client::chrome::testing::{row_text, screen_text, terminal};
+    use crate::client::scripting::StatusSpan;
     use crate::identity::Incarnation;
     use crate::protocol::{
         Direction, ServerStatus, SessionCommand, SessionId, SessionInfo, WindowSummary,
@@ -1171,6 +1201,137 @@ mod tests {
         }));
         draw(&mut relay, &mut parser);
         assert!(parser.screen().contents().contains("Ctrl-a d detaches"));
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Scripted {
+        Called(usize),
+        Released(usize),
+    }
+
+    struct Prompting {
+        log: Rc<RefCell<Vec<Scripted>>>,
+        next: usize,
+    }
+
+    impl Prompting {
+        fn prompt(&mut self) -> Effect {
+            self.next += 1;
+            Effect::Prompt {
+                label: "find".into(),
+                initial: String::new(),
+                submit: CallbackId(self.next),
+            }
+        }
+    }
+
+    impl Scripting for Prompting {
+        fn call(
+            &mut self,
+            id: CallbackId,
+            input: Option<&str>,
+            _: &ClientContext,
+        ) -> Result<Vec<Effect>, String> {
+            self.log.borrow_mut().push(Scripted::Called(id.0));
+            Ok(match input {
+                None | Some("again") => vec![self.prompt()],
+                Some("twice") => vec![self.prompt(), self.prompt()],
+                Some(_) => Vec::new(),
+            })
+        }
+
+        fn status(
+            &mut self,
+            _: CallbackId,
+            _: &StatusContext,
+        ) -> Result<Option<Vec<StatusSpan>>, String> {
+            Ok(None)
+        }
+
+        fn release(&mut self, id: CallbackId) {
+            self.log.borrow_mut().push(Scripted::Released(id.0));
+        }
+    }
+
+    #[test]
+    fn a_prompt_callback_is_released_once_its_prompt_closes() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let scripting = Prompting {
+            log: Rc::clone(&log),
+            next: 1,
+        };
+        let mut keymap = Keymap::default();
+        keymap
+            .prefix
+            .insert("g".parse().unwrap(), Binding::Callback(CallbackId(1)));
+        let mut relay = Relay::new(
+            "laptop".into(),
+            attached("work", "laptop"),
+            SIZE,
+            Arc::new(Settings::default()),
+            Arc::new(keymap),
+            Some(Box::new(scripting)),
+        );
+        let take = || mem::take(&mut *log.borrow_mut());
+
+        relay.input(b"\x02g\x03");
+        assert_eq!(take(), [Scripted::Called(1), Scripted::Released(2)]);
+
+        relay.input(b"\x02gagain\r");
+        assert_eq!(
+            take(),
+            [
+                Scripted::Called(1),
+                Scripted::Called(3),
+                Scripted::Released(3)
+            ]
+        );
+        relay.input(b"done\r");
+        assert_eq!(take(), [Scripted::Called(4), Scripted::Released(4)]);
+
+        relay.input(b"\x02gtwice\r");
+        assert_eq!(
+            take(),
+            [
+                Scripted::Called(1),
+                Scripted::Called(5),
+                Scripted::Released(6),
+                Scripted::Released(5)
+            ]
+        );
+        relay.input(b"\x03");
+        assert_eq!(take(), [Scripted::Released(7)]);
+    }
+
+    #[test]
+    fn without_the_status_bar_notices_and_prompts_borrow_the_last_row() {
+        let mut settings = Settings::default();
+        settings.status.enabled = false;
+        let mut relay = relay_with(settings, Keymap::default());
+        let mut parser = terminal(SIZE.rows, SIZE.cols);
+        relay.server_message(Some(state("work", 1)));
+        let last_row = format!("\x1b[{};1Hbottom\x1b[1;1H", SIZE.rows).into_bytes();
+        relay.server_message(Some(ServerMessage::Output(last_row.clone())));
+        assert_eq!(relay.take_output(), last_row);
+        parser.process(&last_row);
+        assert_eq!(row_text(&parser, BOTTOM), "bottom");
+
+        relay.resize(SIZE);
+        assert_eq!(relay.take_messages(), vec![ClientMessage::Resize(SIZE)]);
+        assert!(relay.take_output().is_empty());
+
+        relay.server_message(Some(ServerMessage::Error("boom".into())));
+        assert_eq!(bottom(&mut relay, &mut parser), "boom");
+        assert_eq!(parser.screen().cursor_position(), (0, 0));
+        relay.notice_expired();
+        assert_eq!(relay.take_messages(), vec![ClientMessage::Redraw]);
+        assert!(relay.take_output().is_empty());
+
+        relay.input(b"\x02,");
+        assert_eq!(bottom(&mut relay, &mut parser), "rename window: vim");
+        relay.input(b"\x03");
+        assert_eq!(relay.take_messages(), vec![ClientMessage::Redraw]);
+        assert!(relay.take_output().is_empty());
     }
 
     #[test]

@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use crate::cli::{Grouping, NewArgs};
 use crate::cluster::{Address, LAN_PORT_FILE};
 use crate::config;
-use crate::lua::ConfigPaths;
+use crate::lua::{self, ConfigPaths, LuaScripting, Process};
 use crate::paths;
 use crate::project::{self, Detected};
 use crate::protocol::{
@@ -34,6 +34,7 @@ use crate::protocol::{
 use crate::settings::{Keymap, ServerConfig, Settings};
 use crate::target::{self, Target};
 use relay::Relay;
+use scripting::Scripting;
 use terminal::RawTerminal;
 
 const SERVER_START_ATTEMPTS: u32 = 50;
@@ -48,17 +49,38 @@ pub struct Endpoint {
     pub config: Option<PathBuf>,
 }
 
+struct ClientConfig {
+    settings: Arc<Settings>,
+    keymap: Arc<Keymap>,
+    scripting: Box<dyn Scripting>,
+}
+
+impl ClientConfig {
+    fn load(endpoint: &Endpoint) -> Result<Self> {
+        let loaded = lua::load(&config_paths(endpoint)?, Process::Client)?;
+        Ok(Self {
+            settings: Arc::new(loaded.settings.clone()),
+            keymap: Arc::new(loaded.keymap.clone()),
+            scripting: Box::new(LuaScripting::new(loaded)),
+        })
+    }
+}
+
 pub async fn attach_or_create(endpoint: &Endpoint) -> Result<()> {
+    let config = ClientConfig::load(endpoint)?;
     let server = handshake(connect_or_start_server(endpoint).await?).await?;
     if request_sessions(server).await?.is_empty() {
-        new_session(endpoint, NewArgs::default()).await
+        new_session_with(endpoint, NewArgs::default(), config).await
     } else {
-        attach_session(endpoint, None).await
+        attach_session_with(endpoint, None, config).await
     }
 }
 
 pub async fn new_session(endpoint: &Endpoint, args: NewArgs) -> Result<()> {
-    let settings = Arc::new(Settings::default());
+    new_session_with(endpoint, args, ClientConfig::load(endpoint)?).await
+}
+
+async fn new_session_with(endpoint: &Endpoint, args: NewArgs, config: ClientConfig) -> Result<()> {
     if let Some(name) = &args.name {
         target::validate_session_name(name)?;
     }
@@ -72,9 +94,9 @@ pub async fn new_session(endpoint: &Endpoint, args: NewArgs) -> Result<()> {
         project,
         branch,
         clone: args.clone,
-        ..NewSession::new(args.name, terminal::session_size(&settings.status)?)
+        ..NewSession::new(args.name, terminal::session_size(&config.settings.status)?)
     });
-    attach(server, &welcome.server_name, request, settings).await
+    attach(server, &welcome.server_name, request, config).await
 }
 
 async fn binding(
@@ -134,14 +156,21 @@ async fn detect(cwd: &Path) -> Result<Option<Detected>> {
 }
 
 pub async fn attach_session(endpoint: &Endpoint, target: Option<String>) -> Result<()> {
-    let settings = Arc::new(Settings::default());
+    attach_session_with(endpoint, target, ClientConfig::load(endpoint)?).await
+}
+
+async fn attach_session_with(
+    endpoint: &Endpoint,
+    target: Option<String>,
+    config: ClientConfig,
+) -> Result<()> {
     let target = parse_target(target)?;
     let (welcome, server) = greet_server(connect_stream(&endpoint.socket).await?).await?;
     let request = ClientMessage::Attach {
         target,
-        size: terminal::session_size(&settings.status)?,
+        size: terminal::session_size(&config.settings.status)?,
     };
-    attach(server, &welcome.server_name, request, settings).await
+    attach(server, &welcome.server_name, request, config).await
 }
 
 pub async fn kill_session(
@@ -432,7 +461,7 @@ async fn attach(
     server: ServerConnection,
     local: &str,
     request: ClientMessage,
-    settings: Arc<Settings>,
+    config: ClientConfig,
 ) -> Result<()> {
     let Duplex {
         mut incoming,
@@ -450,9 +479,9 @@ async fn attach(
         local.to_owned(),
         attached,
         terminal::size()?,
-        settings,
-        Arc::new(Keymap::default()),
-        None,
+        config.settings,
+        config.keymap,
+        Some(config.scripting),
     );
     let outcome = {
         let _terminal = RawTerminal::enter()?;

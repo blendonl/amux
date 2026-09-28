@@ -51,6 +51,10 @@ impl Scanner {
         self.state == State::Ground
     }
 
+    pub fn is_pasting(&self) -> bool {
+        self.paste
+    }
+
     pub fn starts_sequence(&self, byte: u8) -> bool {
         is_control(byte)
             || match self.state {
@@ -150,6 +154,25 @@ mod tests {
             [
                 true, false, false, false, false, false, true, true, false, false, false, false,
                 false, false, false, false, true,
+            ]
+        );
+    }
+
+    #[test]
+    fn pasting_lasts_from_the_start_marker_through_the_end_marker() {
+        let mut scanner = Scanner::default();
+        let pasting: Vec<bool> = b"a\x1b[200~b\x1b[201~c"
+            .iter()
+            .map(|&byte| {
+                scanner.feed(byte);
+                scanner.is_pasting()
+            })
+            .collect();
+        assert_eq!(
+            pasting,
+            [
+                false, false, false, false, false, false, true, true, true, true, true, true, true,
+                false, false,
             ]
         );
     }
