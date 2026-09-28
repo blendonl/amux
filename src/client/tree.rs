@@ -1,23 +1,15 @@
 use std::collections::BTreeMap;
 use std::mem;
+use std::sync::Arc;
 
 use super::chrome::{self, draw_row, Panel, PanelEvent, Placement, Rect, Span, Style};
 use crate::keys::{Decoded, KeyDecoder};
 use crate::project::ProjectId;
 use crate::protocol::{ClientMessage, ServerStatus, ServerView, SessionInfo, WindowSummary};
-use crate::settings::{Table, TreeAction};
+use crate::settings::{Settings, Table, TreeAction};
 use crate::target::Target;
 
-const INDENT: &str = "  ";
-const EXPANDED: &str = "- ";
-const COLLAPSED: &str = "+ ";
-const LEAF: &str = "  ";
-const DETAIL_GAP: &str = "  ";
 const NO_PROJECT: &str = "(no project)";
-
-const ENTRY: Style = Style::PLAIN;
-const SERVER: Style = Style::PLAIN.bold();
-const STALE: Style = Style::PLAIN.dim();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TreeEvent {
@@ -59,7 +51,7 @@ impl Entry {
 struct Node {
     entry: Entry,
     label: String,
-    detail: String,
+    details: Vec<String>,
     stale: bool,
     expanded: bool,
     parent: Option<usize>,
@@ -67,12 +59,12 @@ struct Node {
 }
 
 impl Node {
-    fn new(entry: Entry, label: String, detail: String, stale: bool) -> Self {
+    fn new(entry: Entry, label: String, details: Vec<String>, stale: bool) -> Self {
         Self {
             expanded: !matches!(entry, Entry::Session(_)),
             entry,
             label,
-            detail,
+            details,
             stale,
             parent: None,
             has_children: false,
@@ -91,6 +83,7 @@ pub struct ClusterTree {
     scroll: usize,
     keys: KeyDecoder,
     bindings: Table<TreeAction>,
+    settings: Arc<Settings>,
 }
 
 impl ClusterTree {
@@ -98,6 +91,7 @@ impl ClusterTree {
         servers: &[ServerView],
         attached: Option<&Target>,
         bindings: Table<TreeAction>,
+        settings: Arc<Settings>,
     ) -> Self {
         let nodes = build(servers);
         let cursor = attached
@@ -113,6 +107,7 @@ impl ClusterTree {
             scroll: 0,
             keys: KeyDecoder::default(),
             bindings,
+            settings,
         }
     }
 
@@ -223,30 +218,32 @@ impl ClusterTree {
 
     fn row(&self, index: usize) -> (Vec<Span>, Style) {
         let node = &self.nodes[index];
+        let theme = &self.settings.theme;
         let base = if node.stale {
-            STALE
+            theme.tree.merge(theme.tree_stale)
         } else if node.entry == Entry::Server {
-            SERVER
+            theme.tree.merge(theme.tree_server)
         } else {
-            ENTRY
+            theme.tree
         };
-        let style = if index == self.cursor {
-            base.reverse()
+        let style = Style::from(if index == self.cursor {
+            base.merge(theme.tree_cursor)
         } else {
             base
-        };
+        });
 
+        let tree = &self.settings.tree;
         let marker = if !node.has_children && node.entry != Entry::Server {
-            LEAF
+            &tree.leaf_marker
         } else if node.expanded {
-            EXPANDED
+            &tree.expanded_marker
         } else {
-            COLLAPSED
+            &tree.collapsed_marker
         };
-        let mut text = format!("{}{marker}{}", INDENT.repeat(node.depth()), node.label);
-        if !node.detail.is_empty() {
-            text.push_str(DETAIL_GAP);
-            text.push_str(&node.detail);
+        let mut text = format!("{}{marker}{}", tree.indent.repeat(node.depth()), node.label);
+        for detail in &node.details {
+            text.push_str(&tree.detail_gap);
+            text.push_str(detail);
         }
         (vec![Span::new(text, style)], style)
     }
@@ -278,7 +275,7 @@ impl Panel for ClusterTree {
         for line in 0..height {
             let (spans, fill) = match visible.get(self.scroll + line) {
                 Some(&index) => self.row(index),
-                None => (Vec::new(), ENTRY),
+                None => (Vec::new(), Style::from(self.settings.theme.tree)),
             };
             let row = usize::from(rect.row) + line;
             draw_row(
@@ -306,13 +303,15 @@ impl Panel for ClusterTree {
 pub struct Loading {
     pending: Vec<u8>,
     bindings: Table<TreeAction>,
+    settings: Arc<Settings>,
 }
 
 impl Loading {
-    pub fn new(bindings: Table<TreeAction>) -> Self {
+    pub fn new(bindings: Table<TreeAction>, settings: Arc<Settings>) -> Self {
         Self {
             pending: Vec::new(),
             bindings,
+            settings,
         }
     }
 }
@@ -344,7 +343,12 @@ impl Panel for Loading {
     }
 
     fn cluster_listed(&mut self, servers: &[ServerView], attached: &Target) -> PanelEvent {
-        let tree = ClusterTree::new(servers, Some(attached), self.bindings.clone());
+        let tree = ClusterTree::new(
+            servers,
+            Some(attached),
+            self.bindings.clone(),
+            Arc::clone(&self.settings),
+        );
         PanelEvent::Replace(Box::new(tree), mem::take(&mut self.pending))
     }
 }
@@ -359,10 +363,15 @@ fn build(servers: &[ServerView]) -> Vec<Node> {
             server.status,
             ServerStatus::Local | ServerStatus::Online { .. }
         );
-        let detail = server_detail(&server.status);
-        nodes.push(Node::new(Entry::Server, server.name.clone(), detail, stale));
+        let details = vec![server_detail(&server.status)];
+        nodes.push(Node::new(
+            Entry::Server,
+            server.name.clone(),
+            details,
+            stale,
+        ));
         for (project, sessions) in project_groups(server) {
-            nodes.push(Node::new(Entry::Project, project, String::new(), stale));
+            nodes.push(Node::new(Entry::Project, project, Vec::new(), stale));
             for session in sessions {
                 session_nodes(&mut nodes, server, session, stale);
             }
@@ -379,11 +388,10 @@ fn session_nodes(nodes: &mut Vec<Node>, server: &ServerView, session: &SessionIn
         window: None,
         pane: None,
     };
-    let detail = session_detail(session, stale);
     nodes.push(Node::new(
         Entry::Session(target.clone()),
         session.name.clone(),
-        detail,
+        session_details(session, stale),
         stale,
     ));
 
@@ -398,7 +406,7 @@ fn session_nodes(nodes: &mut Vec<Node>, server: &ServerView, session: &SessionIn
         nodes.push(Node::new(
             Entry::Window(target),
             label,
-            window_detail(window),
+            window_detail(window).into_iter().collect(),
             stale,
         ));
     }
@@ -463,8 +471,8 @@ fn server_detail(status: &ServerStatus) -> String {
     }
 }
 
-fn session_detail(session: &SessionInfo, stale: bool) -> String {
-    let mut detail = match session.windows.len() {
+fn session_details(session: &SessionInfo, stale: bool) -> Vec<String> {
+    let windows = match session.windows.len() {
         1 => "1 window".to_owned(),
         count => format!("{count} windows"),
     };
@@ -473,17 +481,16 @@ fn session_detail(session: &SessionInfo, stale: bool) -> String {
     } else {
         (session.attached_clients > 0).then_some("attached")
     };
-    if let Some(flag) = flag {
-        detail.push_str(DETAIL_GAP);
-        detail.push_str(flag);
-    }
-    detail
+    [windows]
+        .into_iter()
+        .chain(flag.map(str::to_owned))
+        .collect()
 }
 
-fn window_detail(window: &WindowSummary) -> String {
+fn window_detail(window: &WindowSummary) -> Option<String> {
     match window.panes {
-        0 | 1 => String::new(),
-        panes => format!("{panes} panes"),
+        0 | 1 => None,
+        panes => Some(format!("{panes} panes")),
     }
 }
 
@@ -503,7 +510,7 @@ mod tests {
     use super::*;
     use crate::client::chrome::testing::{screen_text, terminal};
     use crate::protocol::{ProjectCheckout, SessionId, Version};
-    use crate::settings::Keymap;
+    use crate::settings::{Keymap, Settings};
 
     const AMUX: &str = "github.com/blendonl/amux";
 
@@ -614,7 +621,12 @@ mod tests {
 
     fn attached_tree() -> ClusterTree {
         let attached: Target = "amux/main@desktop".parse().unwrap();
-        ClusterTree::new(&cluster(), Some(&attached), Keymap::default().tree)
+        ClusterTree::new(
+            &cluster(),
+            Some(&attached),
+            Keymap::default().tree,
+            Arc::new(Settings::default()),
+        )
     }
 
     fn lines(tree: &mut ClusterTree, rows: u16, cols: u16) -> Vec<String> {
@@ -694,7 +706,12 @@ mod tests {
     #[test]
     fn without_an_attached_session_the_cursor_starts_at_the_top() {
         assert_eq!(
-            current(&ClusterTree::new(&cluster(), None, Keymap::default().tree)),
+            current(&ClusterTree::new(
+                &cluster(),
+                None,
+                Keymap::default().tree,
+                Arc::new(Settings::default())
+            )),
             "desktop"
         );
         let elsewhere: Target = "amux/main@laptop".parse().unwrap();
@@ -702,7 +719,8 @@ mod tests {
             current(&ClusterTree::new(
                 &cluster(),
                 Some(&elsewhere),
-                Keymap::default().tree
+                Keymap::default().tree,
+                Arc::new(Settings::default())
             )),
             "desktop"
         );
@@ -711,7 +729,8 @@ mod tests {
             current(&ClusterTree::new(
                 &cluster(),
                 Some(&unqualified),
-                Keymap::default().tree
+                Keymap::default().tree,
+                Arc::new(Settings::default())
             )),
             "notes/main"
         );
@@ -919,7 +938,12 @@ mod tests {
 
     #[test]
     fn an_empty_cluster_renders_blank_and_ignores_keys() {
-        let mut tree = ClusterTree::new(&[], None, Keymap::default().tree);
+        let mut tree = ClusterTree::new(
+            &[],
+            None,
+            Keymap::default().tree,
+            Arc::new(Settings::default()),
+        );
         assert_eq!(lines(&mut tree, 2, 10), vec!["", ""]);
         assert_eq!(tree.handle(b"jkhl\r"), TreeEvent::Pending);
         assert_eq!(tree.handle(b"q"), TreeEvent::Cancel);

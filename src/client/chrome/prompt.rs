@@ -1,12 +1,10 @@
-use super::draw::{self, Color, Rect, Span, Style};
+use super::draw::{self, Rect, Span, Style};
 use super::panel::{Panel, PanelEvent, Placement};
 use crate::keys::{Decoded, Key, KeyDecoder};
 use crate::protocol::{ClientMessage, SessionCommand};
-use crate::settings::{PromptAction, Table};
+use crate::settings::{PromptAction, Table, Theme};
 use crate::target::Target;
 
-const PROMPT: Style = Style::PLAIN.fg(Color::Black).bg(Color::Yellow);
-const LABEL: Style = PROMPT.bold();
 const LABEL_SEPARATOR: &str = ": ";
 const MIN_INPUT_COLUMNS: usize = 10;
 
@@ -46,6 +44,8 @@ pub struct Prompt {
     cursor: usize,
     keys: KeyDecoder,
     bindings: Table<PromptAction>,
+    style: Style,
+    label_style: Style,
 }
 
 impl Prompt {
@@ -54,6 +54,7 @@ impl Prompt {
         label: impl Into<String>,
         initial: &str,
         bindings: Table<PromptAction>,
+        theme: &Theme,
     ) -> Self {
         let text: Vec<char> = initial
             .chars()
@@ -66,6 +67,8 @@ impl Prompt {
             text,
             keys: KeyDecoder::default(),
             bindings,
+            style: theme.prompt.into(),
+            label_style: theme.prompt.merge(theme.prompt_label).into(),
         }
     }
 
@@ -196,8 +199,11 @@ impl Panel for Prompt {
         let (visible, cursor_column) = self.visible_text(columns - label_width);
 
         let (row, col) = (usize::from(area.row), usize::from(area.col));
-        let spans = [Span::new(label, LABEL), Span::new(visible, PROMPT)];
-        draw::draw_row(&mut out, row, col, columns, &spans, PROMPT);
+        let spans = [
+            Span::new(label, self.label_style),
+            Span::new(visible, self.style),
+        ];
+        draw::draw_row(&mut out, row, col, columns, &spans, self.style);
         draw::move_to(&mut out, row, col + label_width + cursor_column);
         out.extend_from_slice(draw::SHOW_CURSOR);
         out
@@ -224,6 +230,7 @@ mod tests {
             label,
             initial,
             Keymap::default().prompt,
+            &Theme::default(),
         )
     }
 

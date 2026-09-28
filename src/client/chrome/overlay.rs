@@ -1,10 +1,8 @@
 use super::draw::{self, Span, Style};
 use crate::keys::Key;
 use crate::protocol::Size;
-use crate::settings::{Binding, Keymap};
+use crate::settings::{Binding, Keymap, Theme};
 
-const TEXT: Style = Style::PLAIN.bold();
-const BORDER: Style = Style::PLAIN;
 const PADDING: usize = 1;
 const FRAME_COLUMNS: usize = 2 * (1 + PADDING);
 const FRAME_ROWS: usize = 2;
@@ -15,7 +13,7 @@ pub fn detach_hint(keymap: &Keymap, prefix: &Key) -> Option<String> {
         .map(|keys| format!("{keys} detaches"))
 }
 
-pub fn render_reconnecting(server: &str, hint: Option<&str>, size: Size) -> Vec<u8> {
+pub fn render_reconnecting(server: &str, hint: Option<&str>, size: Size, theme: &Theme) -> Vec<u8> {
     let title = format!("reconnecting to {server}…");
     let rows = usize::from(size.rows);
     let cols = usize::from(size.cols);
@@ -31,15 +29,17 @@ pub fn render_reconnecting(server: &str, hint: Option<&str>, size: Size) -> Vec<
         _ => vec![&title],
     };
     if rows >= lines.len() + FRAME_ROWS && cols > FRAME_COLUMNS {
-        draw_box(&mut out, &lines, rows, cols);
+        draw_box(&mut out, &lines, rows, cols, theme);
     } else {
-        draw_centered_line(&mut out, &title, rows, cols);
+        draw_centered_line(&mut out, &title, rows, cols, theme);
     }
     out.extend_from_slice(draw::RESTORE_CURSOR);
     out
 }
 
-fn draw_box(out: &mut Vec<u8>, lines: &[&str], rows: usize, cols: usize) {
+fn draw_box(out: &mut Vec<u8>, lines: &[&str], rows: usize, cols: usize, theme: &Theme) {
+    let text_style = Style::from(theme.overlay_text);
+    let border = Style::from(theme.overlay_border);
     let inner = lines
         .iter()
         .map(|line| draw::width(line))
@@ -58,8 +58,8 @@ fn draw_box(out: &mut Vec<u8>, lines: &[&str], rows: usize, cols: usize) {
             row,
             left,
             box_width,
-            &[Span::new(text, BORDER)],
-            BORDER,
+            &[Span::new(text, border)],
+            border,
         );
     };
     edge(out, top, ('┌', '┐'));
@@ -68,25 +68,26 @@ fn draw_box(out: &mut Vec<u8>, lines: &[&str], rows: usize, cols: usize) {
         let slack = inner - draw::width(&text);
         let before = slack / 2;
         let spans = [
-            Span::new(format!("│{}", " ".repeat(PADDING + before)), BORDER),
-            Span::new(text, TEXT),
-            Span::new(format!("{}│", " ".repeat(PADDING + slack - before)), BORDER),
+            Span::new(format!("│{}", " ".repeat(PADDING + before)), border),
+            Span::new(text, text_style),
+            Span::new(format!("{}│", " ".repeat(PADDING + slack - before)), border),
         ];
-        draw::draw_row(out, top + 1 + offset, left, box_width, &spans, BORDER);
+        draw::draw_row(out, top + 1 + offset, left, box_width, &spans, border);
     }
     edge(out, top + lines.len() + 1, ('└', '┘'));
 }
 
-fn draw_centered_line(out: &mut Vec<u8>, text: &str, rows: usize, cols: usize) {
+fn draw_centered_line(out: &mut Vec<u8>, text: &str, rows: usize, cols: usize, theme: &Theme) {
     let text = draw::truncate(text, cols);
     let width = draw::width(&text);
+    let style = Style::from(theme.overlay_text);
     draw::draw_row(
         out,
         rows / 2,
         (cols - width) / 2,
         width,
-        &[Span::new(text, TEXT)],
-        TEXT,
+        &[Span::new(text, style)],
+        style,
     );
 }
 
@@ -107,6 +108,7 @@ mod tests {
             server,
             default_hint().as_deref(),
             Size { rows, cols },
+            &Theme::default(),
         ));
         parser
     }
@@ -178,12 +180,14 @@ mod tests {
             "desktop",
             default_hint().as_deref(),
             Size { rows: 1, cols: 1 },
+            &Theme::default(),
         ));
         assert_eq!(screen_text(&single_cell), vec!["…"]);
         assert!(render_reconnecting(
             "desktop",
             default_hint().as_deref(),
-            Size { rows: 0, cols: 0 }
+            Size { rows: 0, cols: 0 },
+            &Theme::default(),
         )
         .is_empty());
     }
@@ -217,7 +221,12 @@ mod tests {
 
         let size = Size { rows: 24, cols: 80 };
         let mut parser = terminal(size.rows, size.cols);
-        parser.process(&render_reconnecting("desktop", None, size));
+        parser.process(&render_reconnecting(
+            "desktop",
+            None,
+            size,
+            &Theme::default(),
+        ));
         let rows = screen_text(&parser);
         let pad = " ".repeat(26);
         assert_eq!(rows[10], format!("{pad}┌{}┐", "─".repeat(26)));

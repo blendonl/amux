@@ -254,16 +254,21 @@ impl Relay {
                 RENAME_WINDOW,
                 &self.active_window_name(),
                 self.keymap.prompt.clone(),
+                &self.settings.theme,
             )),
             router::Panel::RenameSession => Box::new(Prompt::new(
                 PromptPurpose::RenameSession,
                 RENAME_SESSION,
                 self.session_name(),
                 self.keymap.prompt.clone(),
+                &self.settings.theme,
             )),
             router::Panel::ClusterTree => {
                 self.messages.push(ClientMessage::ListCluster);
-                Box::new(Loading::new(self.keymap.tree.clone()))
+                Box::new(Loading::new(
+                    self.keymap.tree.clone(),
+                    Arc::clone(&self.settings),
+                ))
             }
         };
         self.panel = Some(panel);
@@ -335,6 +340,7 @@ impl Relay {
                 server,
                 self.detach_hint.as_deref(),
                 area,
+                &self.settings.theme,
             ));
         }
         match self.placed(Placement::StatusRow) {
@@ -342,7 +348,11 @@ impl Relay {
                 let drawn = panel.render(status_row);
                 self.output.extend(drawn);
             }
-            None => self.output.extend(status.render(self.size.cols)),
+            None => self.output.extend(status.render(
+                self.size.cols,
+                &self.settings.status,
+                &self.settings.theme,
+            )),
         }
     }
 
@@ -501,7 +511,7 @@ mod tests {
     use crate::protocol::{
         Direction, ServerStatus, SessionCommand, SessionId, SessionInfo, WindowSummary,
     };
-    use crate::settings::Binding;
+    use crate::settings::{Binding, Color, StyleSpec};
 
     const SIZE: Size = Size { rows: 10, cols: 40 };
     const BOTTOM: u16 = SIZE.rows - 1;
@@ -997,5 +1007,60 @@ mod tests {
         }));
         draw(&mut relay, &mut parser);
         assert!(parser.screen().contents().contains("Ctrl-a d detaches"));
+    }
+
+    #[test]
+    fn the_theme_and_chrome_settings_reach_every_panel() {
+        let mut settings = Settings::default();
+        settings.status.window_format = "[{index}]{name} ".into();
+        settings.theme.status.bg = Some(Color::Rgb(0x8e, 0xc0, 0x7c));
+        settings.theme.prompt_label = StyleSpec {
+            underline: Some(true),
+            ..StyleSpec::EMPTY
+        };
+        settings.theme.tree_cursor = StyleSpec {
+            fg: Some(Color::Indexed(11)),
+            ..StyleSpec::EMPTY
+        };
+        settings.theme.overlay_text = StyleSpec {
+            italic: Some(true),
+            ..StyleSpec::EMPTY
+        };
+        settings.tree.expanded_marker = "v ".into();
+        settings.tree.detail_gap = " | ".into();
+        let mut relay = relay_with(settings, Keymap::default());
+        let mut parser = terminal(SIZE.rows, SIZE.cols);
+
+        relay.server_message(Some(state("work", 1)));
+        assert_eq!(bottom(&mut relay, &mut parser), "[work@laptop][0]sh [1]vim");
+        assert_eq!(
+            parser.screen().cell(BOTTOM, 39).unwrap().bgcolor(),
+            vt100::Color::Rgb(0x8e, 0xc0, 0x7c)
+        );
+
+        relay.input(b"\x02,");
+        assert_eq!(bottom(&mut relay, &mut parser), "rename window: vim");
+        assert!(parser.screen().cell(BOTTOM, 0).unwrap().underline());
+        assert!(!parser.screen().cell(BOTTOM, 15).unwrap().underline());
+        relay.input(b"\x03");
+
+        relay.input(b"\x02s");
+        relay.server_message(Some(cluster()));
+        draw(&mut relay, &mut parser);
+        let screen = screen_text(&parser);
+        assert_eq!(screen[0], "v laptop | (this server)");
+        assert_eq!(screen[2], "    + work | 1 window");
+        let cursor = parser.screen().cell(2, 6).unwrap();
+        assert_eq!(cursor.fgcolor(), vt100::Color::Idx(11));
+        assert!(!cursor.inverse());
+        relay.input(b"q");
+
+        relay.server_message(Some(ServerMessage::Reconnecting {
+            server: "laptop".into(),
+        }));
+        draw(&mut relay, &mut parser);
+        let title = parser.screen().cell(3, 8).unwrap();
+        assert_eq!(title.contents(), "r");
+        assert!(title.italic() && !title.bold());
     }
 }
