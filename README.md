@@ -458,6 +458,128 @@ notes      4b825dc642cb6eb9a060e54bf8d69288fbee4904
 - When the server has no checkout, `amux new` fails and suggests `--clone` or running `amux project add` on that server. `--clone` makes that server clone the project from its `origin` into `projects_dir/<name>` and register it.
 - Killing a session never deletes its worktree. `amux kill --remove-worktree` kills the session and then deletes its worktree. It refuses, and leaves the session running, when the worktree has uncommitted or untracked files or is the main checkout. The branch stays.
 
+### Android
+
+The Android app is a terminal that runs the real amux binary on the phone. It opens straight into `amux`, which attaches to the most recent session or creates one, and a foreground service keeps the server running while the app is in the background. The phone then joins the cluster like any other machine (see [Joining the cluster from the phone](#joining-the-cluster-from-the-phone)).
+
+The app needs Android 10 (API 29) or later on arm64 or x86_64. Its build, unit tests and lint run in a container and its binary runs in a Termux container, but it hasn't been tried on a real phone yet.
+
+#### Building and installing
+
+The Android SDK and NDK, Rust with the Android targets, and Gradle all live in a Docker image, so the build needs nothing but Docker:
+
+```sh
+./android/build.sh all
+adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+The first run builds the image, which is about 4 GB and takes several minutes. The APK is debug-signed and about 12 MB. It carries amux for arm64-v8a and x86_64 as `lib/<abi>/libamux.so`, because the native library directory is the only place an app on Android 10 and later may run its own files from.
+
+| Command                     | Does                                                                                                      |
+| --------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `./android/build.sh image`  | Builds the `amux-android-build` image when it is missing or `android/docker/Dockerfile` has changed       |
+| `./android/build.sh binary` | Cross-compiles amux with the NDK and writes the stripped binaries to `android/app/src/main/jniLibs/`      |
+| `./android/build.sh smoke`  | Runs the x86_64 binary in a Termux container with the app's environment                                   |
+| `./android/build.sh apk`    | Builds the debug APK from those binaries, runs the JVM unit tests and lint, and prints what the APK holds |
+| `./android/build.sh all`    | `image`, `binary`, `smoke` and `apk`, in that order                                                       |
+
+`binary` and `apk` build the image first when it is out of date. The cargo and Gradle caches live in `android/.cache`, which git ignores.
+
+`smoke` checks that amux runs on Android's libc, bionic, with nothing but what the app gives it. It uses `termux/termux-docker:x86_64` with `/bin` linked to `/system/bin`, as on a phone, and sets only the app's variables (see [The phone's environment](#the-phones-environment)). There it runs `amux --version` and `amux config check`, starts `amux server`, waits up to 10 seconds for `amux ls` to answer, and runs `amux kill-server`. It fails unless every step succeeds and the server exits with status 0, and it prints the server's log at the end. It doesn't run the APK, which needs a phone or an emulator.
+
+#### Using the app
+
+- `Ctrl-b d`, or the end of the session, shows a Detached panel. Reattach attaches again, and starts the server first when it has stopped. Stop amux stops the server, which ends every session on the phone, and closes the app.
+- The service's notification has two actions. Keep awake holds a partial wake lock, which keeps the CPU running while the screen is off, and then reads Allow sleep. Stop runs `amux kill-server` and stops the service. On Android 13 and later the app asks for permission to show notifications when it opens.
+- `amux kill-server` in a pane stops the service too, because the server exits cleanly.
+- A server that fails to start or exits with an error starts again after 1 second, then 2, 4 and 8 seconds. When five starts in a row each fail within 30 seconds, the service gives up and its notification says why.
+- The server's log is `$cacheDir/amux-<uid>/default.log`. Once it passes 1 MiB, the service empties it before the next start.
+- The screen stays on while the terminal shows.
+- Android backups and device transfers leave out the app's data, so the server's key and trust store stay on the phone.
+
+#### Keys
+
+A row of keys sits above the soft keyboard:
+
+| Key             | Sends                                                                                                                        |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `Esc`, `Tab`    | That key                                                                                                                     |
+| `Ctrl`, `Alt`   | The next key with that modifier, from the row or the keyboard. The key shows green while it waits, and a second tap drops it |
+| `←` `↓` `↑` `→` | The arrow keys                                                                                                               |
+| `Prefix`        | `Ctrl-b`, whatever `amux.opt.prefix` is set to                                                                               |
+
+- Pinch to zoom. The app remembers the text size.
+- Long-press to select text on the screen, then pick Copy or Paste from the menu that opens.
+- A tap on the terminal brings the keyboard back. In a window with several panes amux turns on mouse reporting (see [Windows and panes](#windows-and-panes)), so the tap also reaches amux as a click and makes the pane under it active.
+
+#### The phone's environment
+
+Everything amux keeps lives in the app's private storage. Below, `$filesDir` is the app's files directory, `/data/user/0/io.github.blendonl.amux/files` for the phone's main user, and `$cacheDir` is its cache directory. The app starts the server and the client with this environment, and every pane inherits it:
+
+| Variable          | Value                                                                          |
+| ----------------- | ------------------------------------------------------------------------------ |
+| `HOME`            | `$filesDir/home`                                                               |
+| `XDG_CONFIG_HOME` | `$filesDir/config`                                                             |
+| `XDG_STATE_HOME`  | `$filesDir/state`                                                              |
+| `TMPDIR`          | `$cacheDir`, so the socket and the server's log are in `$cacheDir/amux-<uid>/` |
+| `SHELL`           | `/system/bin/sh`                                                               |
+| `PATH`            | `$filesDir/bin:/system/bin`                                                    |
+| `LANG`            | `C.UTF-8`                                                                      |
+
+`ANDROID_ROOT` and `ANDROID_DATA` are passed through from Android, and the client also gets `TERM=xterm-256color` and `COLORTERM=truecolor`.
+
+- Panes run Android's own shell, `/system/bin/sh` (mksh), with the tools in `/system/bin`.
+- `$filesDir/bin/amux` links to the packaged binary. The service renews the link every time it starts, since an update moves the binary. So `amux` works in any pane: `amux ls`, `amux pair`, `amux new` and the rest.
+- The config is `$filesDir/config/amux/init.lua`, the path `amux config path` prints. On its first start the app writes it with one line that names the server after the phone, such as `amux.opt.name = "pixel-8-pro"`. The name is the device name from Settings, or the model when that is empty, or `android`, lowercased, with accents dropped and anything other than `a-z` and `0-9` turned into `-`. The app writes the file only when it is missing, so your changes stay.
+
+Stock Android has no text editor in `/system/bin`, so change the config from a pane with the shell. `>>` adds a line and `>` replaces the file:
+
+```sh
+echo 'amux.opt.window.base_index = 1' >> "$(amux config path)"
+amux config check
+```
+
+`Ctrl-b r` then reloads it. A change to `name`, `discovery` or `lan` needs a restart instead (see [Reloading](#reloading)): run `amux kill-server` in a pane, which ends every session on the phone, then tap Reattach.
+
+The debug APK is debuggable, so from a computer `adb shell run-as io.github.blendonl.amux` runs commands as the app, in its data directory:
+
+```sh
+adb shell run-as io.github.blendonl.amux cat files/config/amux/init.lua
+adb shell "run-as io.github.blendonl.amux sh -c 'cat > files/config/amux/init.lua'" < init.lua
+```
+
+#### Joining the cluster from the phone
+
+Pair the phone with any machine in the cluster, as on a LAN (see [On the LAN, with a pairing code](#on-the-lan-with-a-pairing-code)). Run `amux pair` on the desktop, then the command it prints in a pane on the phone:
+
+```sh
+amux pair k7-4821-9930
+amux pair k7-4821-9930 --host 192.168.0.24:40123
+```
+
+The app holds a Wi-Fi multicast lock while its service runs, because Android drops multicast on Wi-Fi without one, and the phone needs multicast to find the desktop over mDNS. Where multicast doesn't get through anyway, add `--host <addr>:<port>` with the desktop's IP address and the port `amux pair` printed, as in the second line. The phone then saves the desktop as a server at that `tcp://` address.
+
+Once paired, the phone is a member like any other. `amux ls` lists the sessions of every machine, `amux attach -t work@desktop` attaches to one, `amux new --on desktop` starts one there, and `Ctrl-b s` switches between them. The rest of the cluster learns the phone's key (see [Trust](#trust)), and now that the phone trusts a key, its server listens on the LAN like any other (see [Listening ports](#listening-ports)).
+
+#### Limits
+
+- Stock Android has no `git` and no `ssh`, so panes don't either. The phone's server can't dial `ssh://` addresses, and it can't hold project sessions or worktrees: sessions on the phone start without a project, in `$HOME`. `amux new -p amux --on desktop` still works from the phone, since git runs on the desktop.
+- Tailnet auto-linking never dials phones (see [On the same tailnet](#on-the-same-tailnet)). The phone's server has no `tailscale` CLI either, so it never vouches for a peer through `tailscale whois` and doesn't listen on the tailnet. Pair the phone instead. After pairing, a `tcp://` address on the tailnet links too, such as `amux servers add desktop tcp://100.101.7.12:7447`.
+- Android 12 and later limit the processes that apps start, which Android calls phantom processes, and kill them when there are more than 32 across the phone or when one uses a lot of CPU in the background. The server, the client and every pane's shell are such processes, so a pane's shell can stop without warning, and a server that is killed starts again without its sessions. To lift the limit, turn on "Disable child process restrictions" in the developer options on Android 14 and later, or run `adb shell settings put global settings_enable_monitor_phantom_procs false` from a computer on Android 12L and later. Android 12.0 takes `adb shell device_config set_sync_disabled_for_tests persistent` followed by `adb shell device_config put activity_manager max_phantom_processes 2147483647`.
+- Termux's `libtermux.so` v0.118.3, which the terminal view loads, isn't aligned for 16 KB memory pages, so the terminal may fail to load on phones that use them. The amux binary itself is aligned for 16 KB pages.
+
+#### Without the APK
+
+In [Termux](https://termux.dev), amux builds as on any Linux machine:
+
+```sh
+pkg install rust git
+git clone https://github.com/blendonl/amux && cd amux
+cargo install --path .
+```
+
+`cargo install` puts `amux` in `~/.cargo/bin`. Panes of that build have Termux's packages on the `PATH`, so `git` works in them, and `ssh` does after `pkg install openssh`. The phantom-process limit above applies to Termux as well.
+
 ## Architecture
 
 amux uses a client/server model like tmux. The server owns the shells and the client is only a view.
@@ -544,6 +666,9 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 | `tests/common/mod.rs`        | `TestServer`, `TestClient`, a PTY-driven client, linked test clusters and fakes for `ssh`, `tailscale` and the LAN |
 | `tests/common/git.rs`        | Temporary repos with a local bare `origin` for the project tests                                                   |
 | `tests/common/releases.rs`   | A `file://` release mirror for the `amux update` and `install.sh` tests                                            |
+| `android/`                   | The Android app, a Gradle project: the service that runs `amux server` and the terminal that attaches to it        |
+| `android/build.sh`           | Builds the image, cross-compiles amux with the NDK, smoke-tests it in a Termux container and builds the APK        |
+| `android/docker/`            | The build image: JDK 17, the Android SDK and NDK, Rust with the Android targets, and `cargo-ndk`                   |
 
 Set `AMUX_LOG=debug` before the server starts to get more verbose logs.
 
@@ -596,4 +721,5 @@ Beyond the design:
 - [x] Reloading the config without a restart: `Ctrl-b r`, `amux config reload` and `SIGHUP`
 - [x] A which-key popup that lists the keys after the prefix, with descriptions from the config
 - [x] Releases for Linux and macOS, an install script and `amux update`
+- [x] An Android app that runs amux on a phone and joins the cluster
 - [ ] Scrollback and copy mode
