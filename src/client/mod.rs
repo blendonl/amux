@@ -440,6 +440,11 @@ pub async fn handshake(stream: UnixStream) -> Result<ServerConnection> {
     Ok(greet_server(stream).await?.1)
 }
 
+pub async fn greet_and_list_cluster(socket: &Path) -> Result<(protocol::Welcome, Vec<ServerView>)> {
+    let (welcome, server) = greet_server(connect_stream(socket).await?).await?;
+    Ok((welcome, request_cluster(server).await?))
+}
+
 async fn greet_server(mut stream: UnixStream) -> Result<(protocol::Welcome, ServerConnection)> {
     let welcome = protocol::greet(&mut stream, Role::Client, &Version::current()).await?;
     Ok((welcome, into_connection(stream)))

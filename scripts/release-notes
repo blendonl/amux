@@ -1,0 +1,41 @@
+#!/bin/sh
+set -eu
+
+tag=${1:-HEAD}
+previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$tag^" 2>/dev/null || true)
+range=${previous:+$previous..}$tag
+
+git log --no-merges --format='%h%x09%s' "$range" | awk -F '\t' '
+  function strip(subject) {
+    sub(/^[a-z]+(\([^)]*\))?!?: */, "", subject)
+    return subject
+  }
+  function section(title, lines, count,    i) {
+    if (count == 0) return
+    printf "%s## %s\n\n", (printed++ ? "\n" : ""), title
+    for (i = 1; i <= count; i++) print "- " lines[i]
+  }
+  $2 ~ /^chore: release v/ { next }
+  $2 ~ /^[a-z]+(\([^)]*\))?!:/ { breaking[++b] = strip($2) " (" $1 ")"; next }
+  $2 ~ /^feat(\([^)]*\))?:/ { features[++f] = strip($2) " (" $1 ")"; next }
+  $2 ~ /^fix(\([^)]*\))?:/ { fixes[++x] = strip($2) " (" $1 ")"; next }
+  { other[++o] = $2 " (" $1 ")" }
+  END {
+    section("Breaking changes", breaking, b)
+    section("Features", features, f)
+    section("Fixes", fixes, x)
+    section("Other changes", other, o)
+    if (!printed) print "No changes."
+  }
+'
+
+cat <<'EOF'
+
+## Install
+
+```sh
+curl -fsSL https://github.com/blendonl/amux/releases/latest/download/install.sh | sh
+```
+
+An existing install updates with `amux update`.
+EOF

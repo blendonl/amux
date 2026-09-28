@@ -1,5 +1,7 @@
 use std::fmt;
 use std::io;
+use std::str::FromStr;
+use std::sync::LazyLock;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -12,6 +14,12 @@ pub const TCP_MAGIC: [u8; 4] = *b"AMXT";
 pub const PROTOCOL_MAJOR: u16 = 9;
 pub const PROTOCOL_MINOR: u16 = 0;
 pub const RELEASE: &str = env!("CARGO_PKG_VERSION");
+
+pub fn cli_version() -> &'static str {
+    static LINE: LazyLock<String> =
+        LazyLock::new(|| format!("{RELEASE} (protocol {PROTOCOL_MAJOR}.{PROTOCOL_MINOR})"));
+    &LINE
+}
 
 const STOP_THE_SERVER: &str =
     "run `amux kill-server` to stop it (this ends its sessions), then try again";
@@ -85,6 +93,26 @@ impl fmt::Display for Version {
             "amux {} (protocol {}.{})",
             self.release, self.major, self.minor
         )
+    }
+}
+
+impl FromStr for Version {
+    type Err = anyhow::Error;
+
+    fn from_str(line: &str) -> Result<Self> {
+        let parse = || {
+            let (release, protocol) = line
+                .trim()
+                .strip_prefix("amux ")?
+                .split_once(" (protocol ")?;
+            let (major, minor) = protocol.strip_suffix(')')?.split_once('.')?;
+            Some(Self {
+                release: release.to_owned(),
+                major: major.parse().ok()?,
+                minor: minor.parse().ok()?,
+            })
+        };
+        parse().with_context(|| format!("`{}` is not an amux version", line.trim()))
     }
 }
 
@@ -323,6 +351,26 @@ mod tests {
     fn this_build_speaks_protocol_8() {
         assert_eq!(Version::current().major, 9);
         assert_eq!(Version::current().minor, 0);
+    }
+
+    #[test]
+    fn a_version_reads_back_what_it_prints() {
+        let version = version(3, 1);
+        assert_eq!(version.to_string().parse::<Version>().unwrap(), version);
+        assert_eq!(
+            format!("amux {}\n", cli_version())
+                .parse::<Version>()
+                .unwrap(),
+            Version::current()
+        );
+    }
+
+    #[test]
+    fn a_version_without_a_protocol_does_not_parse() {
+        for line in ["amux 0.1.0", "tmux 3.4", "amux 0.1.0 (protocol 9)", ""] {
+            let err = line.parse::<Version>().unwrap_err().to_string();
+            assert!(err.contains("is not an amux version"), "{err}");
+        }
     }
 
     #[test]

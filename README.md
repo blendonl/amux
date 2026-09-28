@@ -2,6 +2,14 @@
 
 A terminal multiplexer written in Rust.
 
+## Install
+
+```sh
+curl -fsSL https://github.com/blendonl/amux/releases/latest/download/install.sh | sh
+```
+
+The script downloads the latest release for Linux or macOS on x86_64 or arm64, checks it against its SHA-256 checksum and puts `amux` in `~/.local/bin`, one of the places amux looks for itself over SSH. Set `AMUX_VERSION=0.2.0` for another release and `AMUX_INSTALL_DIR` for another directory, on the `sh` side of the pipe. The Linux builds are static, so they run on any distribution. To build amux yourself instead, run `cargo install --git https://github.com/blendonl/amux`.
+
 ## Usage
 
 ```sh
@@ -34,6 +42,8 @@ cargo run -- config check                # load init.lua and servers.lua and say
 cargo run -- config defaults             # every default setting, as Lua for a starting init.lua
 cargo run -- config reload               # make the running server load its config again
 cargo run -- kill-server                 # stop the server and all sessions
+cargo run -- update                      # install the latest release in place of this amux
+cargo run -- update --check              # only say whether a newer release is out
 ```
 
 Inside a session, press `Ctrl-b d` to detach and `Ctrl-b Ctrl-b` to send a literal `Ctrl-b`. The other keys after `Ctrl-b` manage windows and panes, as in tmux, and `Ctrl-b s` opens a tree of every session in the cluster. The bottom row is a status bar that shows the session, its server and its windows. The prefix, every binding, the status bar and the colours come from the [config](#config), and text pasted with bracketed paste reaches the pane whole, even when it contains the prefix.
@@ -263,6 +273,12 @@ A rewrite goes to a temporary file first, and replaces `servers.lua` only when t
 Each server also has a random ID, stored in `$XDG_STATE_HOME/amux/<socket name>/server-id`, and a fresh incarnation ID every time it starts. The log shows both. Its Noise key and the keys it trusts live next to the ID (see [Trust](#trust)).
 
 ### Upgrading
+
+`amux update` replaces the `amux` binary with the latest release. It checks the download against its SHA-256 checksum and runs it once before it swaps the file, so a broken download never replaces a working amux. `amux update --check` only says whether a newer release is out, and `amux update 0.2.0` installs that release, older or newer. It downloads with `curl`, unpacks with `tar` and needs write access to the directory `amux` is in, so an amux in `/usr/local/bin` updates with `sudo amux update`.
+
+The update leaves the running server and its sessions alone, on the old binary. When the new release speaks the same protocol major version, amux keeps talking to that server, and `amux kill-server` switches to the new one when it suits you (this ends its sessions). When the major version changed, `amux update` says the server has to stop before you use amux again. It also names the servers in the cluster that run another release, because each machine updates on its own: run `amux update` there too, or `amux servers` to see every server's version.
+
+`AMUX_RELEASES_URL` points `amux update` and `install.sh` at a mirror instead of GitHub. The mirror serves the latest release's tag as JSON at `<url>/latest`, like `{"tag_name": "v0.2.0"}`, and the release files under `<url>/download/v0.2.0/`.
 
 Every connection starts with a greeting that carries the protocol version. When the client and the running server speak different major versions, the client names both and asks you to run `amux kill-server`. `kill-server` also works on a server that is too old to answer the greeting.
 
@@ -524,8 +540,10 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 | `src/client/projects.rs`     | Resolving `-p` against the projects the cluster knows                                                              |
 | `src/client/terminal.rs`     | Raw mode, alternate screen, stdin reader                                                                           |
 | `src/client/keys.rs`         | Prefix key handling and the key bindings                                                                           |
+| `src/update.rs`              | `amux update`: finding, checking and installing a release                                                          |
 | `tests/common/mod.rs`        | `TestServer`, `TestClient`, a PTY-driven client, linked test clusters and fakes for `ssh`, `tailscale` and the LAN |
 | `tests/common/git.rs`        | Temporary repos with a local bare `origin` for the project tests                                                   |
+| `tests/common/releases.rs`   | A `file://` release mirror for the `amux update` and `install.sh` tests                                            |
 
 Set `AMUX_LOG=debug` before the server starts to get more verbose logs.
 
@@ -534,6 +552,19 @@ Set `AMUX_LOG=debug` before the server starts to get more verbose logs.
 `cargo test` runs the unit tests and the integration tests in `tests/`. Each integration test starts its own server with a temporary `HOME`, `XDG_*` directories and socket, so it never touches your real server, config or state. Some tests drive the real `amux` binary inside a PTY. Cluster tests link several such servers on one machine through `exec:` addresses that run `amux bridge` with the other server's environment. Project tests work on temporary repos cloned from a local bare `origin`, and run git with their own identity and no user or system config.
 
 Discovery is off in every test server unless the test turns it on, so no test touches the real tailnet or LAN. A fake `tailscale` (`AMUX_TAILSCALE`) serves `status` and `whois` from JSON files the test rewrites, a directory stands in for mDNS (`AMUX_LAN_DIR`), and a fake `ssh` (`AMUX_SSH`) maps host names to test servers. The one test that pairs over real mDNS, on a random service type set with `AMUX_MDNS_SERVICE`, is ignored by default because loopback has no multicast. `cargo test -- --ignored` runs it on a machine with a real network.
+
+The `amux update` and `install.sh` tests serve fake releases from a `file://` directory through `AMUX_RELEASES_URL`, and update a copy of the binary in a temporary directory.
+
+## Releasing
+
+Pushing a `v*` tag builds and publishes a release with [the release workflow](.github/workflows/release.yml). `scripts/release` makes the tag:
+
+```sh
+scripts/release 0.2.0        # set 0.2.0 in Cargo.toml and Cargo.lock, commit, and tag v0.2.0
+git push origin main v0.2.0  # test, build and publish it
+```
+
+The workflow refuses a tag that doesn't match the version in `Cargo.toml` and runs the tests on Linux. It builds amux with the `dist` profile for `x86_64` and `aarch64` on Linux (static, with musl) and on macOS, and publishes `amux-<target>.tar.gz` for each with a `.sha256` next to it, plus `install.sh`. `scripts/release-notes` writes the release notes from the conventional commits since the previous tag, and `scripts/release-notes HEAD` previews them. A tag with a `-`, like `v0.3.0-rc.1`, becomes a pre-release, which `amux update` only installs when you name it. A push that changes the workflow builds every target without publishing, and so does running it by hand from the Actions tab.
 
 ## Roadmap
 
@@ -564,4 +595,5 @@ Beyond the design:
 - [x] Prefix key and key bindings from the config in the client
 - [x] Reloading the config without a restart: `Ctrl-b r`, `amux config reload` and `SIGHUP`
 - [x] A which-key popup that lists the keys after the prefix, with descriptions from the config
+- [x] Releases for Linux and macOS, an install script and `amux update`
 - [ ] Scrollback and copy mode
