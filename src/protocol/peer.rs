@@ -2,7 +2,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::{ClientMessage, ProjectCheckout, ServerMessage, SessionId, SessionInfo, Version};
+use super::{
+    ClientMessage, ProjectCheckout, PublicKey, ServerMessage, SessionId, SessionInfo, Version,
+};
 use crate::config::{Incarnation, ServerId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -46,6 +48,7 @@ pub enum PeerMessage {
         id: ChannelId,
         from_opener: bool,
     },
+    Trust(TrustUpdate),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +58,7 @@ pub struct Hello {
     pub name: String,
     pub version: Version,
     pub peers: Vec<PeerAddress>,
+    pub public_key: Option<PublicKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +74,8 @@ pub enum Refusal {
     NameTaken,
     Duplicate,
     SelfDial,
+    Untrusted,
+    Forgotten,
 }
 
 impl fmt::Display for Refusal {
@@ -79,8 +85,31 @@ impl fmt::Display for Refusal {
             Self::NameTaken => "the server name is already taken by another server",
             Self::Duplicate => "the servers are already linked",
             Self::SelfDial => "the address leads back to this server",
+            Self::Untrusted => "the server's key is not trusted",
+            Self::Forgotten => "the server was forgotten",
         })
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustUpdate {
+    pub trusted: Vec<TrustedPeer>,
+    pub forgotten: Vec<ForgottenPeer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedPeer {
+    pub id: ServerId,
+    pub name: String,
+    pub key: PublicKey,
+    pub introduced_by: Option<ServerId>,
+    pub direct: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgottenPeer {
+    pub id: ServerId,
+    pub key: Option<PublicKey>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,9 +207,36 @@ mod tests {
             name: "desk".into(),
             version: Version::current(),
             peers: Vec::new(),
+            public_key: Some(PublicKey([7; 32])),
         });
         let bytes = postcard::to_stdvec(&hello).unwrap();
         assert_eq!(postcard::from_bytes::<PeerMessage>(&bytes).unwrap(), hello);
+    }
+
+    #[test]
+    fn new_refusals_and_trust_updates_survive_a_round_trip() {
+        let id = ServerId::random().unwrap();
+        let messages = [
+            PeerMessage::Refused(Refusal::Untrusted),
+            PeerMessage::Refused(Refusal::Forgotten),
+            PeerMessage::Trust(TrustUpdate {
+                trusted: vec![TrustedPeer {
+                    id,
+                    name: "desk".into(),
+                    key: PublicKey([1; 32]),
+                    introduced_by: Some(ServerId::random().unwrap()),
+                    direct: false,
+                }],
+                forgotten: vec![ForgottenPeer { id, key: None }],
+            }),
+        ];
+        for message in messages {
+            let bytes = postcard::to_stdvec(&message).unwrap();
+            assert_eq!(
+                postcard::from_bytes::<PeerMessage>(&bytes).unwrap(),
+                message
+            );
+        }
     }
 
     #[test]

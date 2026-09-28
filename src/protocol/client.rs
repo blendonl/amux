@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use super::Version;
+use super::{PublicKey, Version};
 use crate::config::{Incarnation, ServerConfig, ServerId};
 use crate::project::ProjectId;
 use crate::target::Target;
@@ -101,6 +101,23 @@ pub struct LinkInfo {
     pub dialed: bool,
     pub incarnation: Incarnation,
     pub state: LinkState,
+    pub transport: LinkTransport,
+    pub key: Option<PublicKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkTransport {
+    Ssh,
+    Noise,
+}
+
+impl fmt::Display for LinkTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Ssh => "ssh",
+            Self::Noise => "noise",
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +131,85 @@ impl fmt::Display for LinkState {
         f.write_str(match self {
             Self::Up => "up",
             Self::Closing => "closing",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum Via {
+    Tailscale,
+    Lan,
+}
+
+impl fmt::Display for Via {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Tailscale => "tailscale",
+            Self::Lan => "lan",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryReport {
+    pub sources: Vec<SourceView>,
+    pub peers: Vec<DiscoveryView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceView {
+    pub via: Via,
+    pub state: SourceState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceState {
+    Off,
+    NotRunning,
+    Running,
+    Unavailable(String),
+}
+
+impl fmt::Display for SourceState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Off => f.write_str("off (disabled in the config)"),
+            Self::NotRunning => f.write_str("not running"),
+            Self::Running => f.write_str("running"),
+            Self::Unavailable(reason) => f.write_str(reason),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryView {
+    pub via: Via,
+    pub name: String,
+    pub address: String,
+    pub server: Option<ServerId>,
+    pub status: DiscoveryStatus,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiscoveryStatus {
+    Linked,
+    Trying,
+    Failing,
+    Absent,
+    NotPaired,
+    PairingOpen,
+}
+
+impl fmt::Display for DiscoveryStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Linked => "linked",
+            Self::Trying => "trying",
+            Self::Failing => "failing",
+            Self::Absent => "absent",
+            Self::NotPaired => "not paired",
+            Self::PairingOpen => "pairing open",
         })
     }
 }
@@ -226,6 +322,18 @@ pub enum ClientMessage {
     Switch(Target),
     Redraw,
     Detach,
+    Discover,
+    ForgetServer {
+        name: String,
+    },
+    OpenPairing {
+        new_key: bool,
+    },
+    JoinPairing {
+        code: String,
+        host: Option<String>,
+        new_key: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,8 +376,23 @@ pub enum ServerMessage {
     Output(Vec<u8>),
     SessionState(SessionState),
     ClusterStatus(ClusterStatus),
-    Reconnecting { server: String },
+    Reconnecting {
+        server: String,
+    },
     Detached,
     Exited,
     Error(String),
+    Discovery(DiscoveryReport),
+    PairingOpen {
+        code: String,
+        expires_in_secs: u64,
+    },
+    Paired {
+        name: String,
+        id: ServerId,
+        fingerprint: String,
+    },
+    PairingClosed {
+        reason: String,
+    },
 }

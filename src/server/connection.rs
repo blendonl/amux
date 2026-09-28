@@ -12,6 +12,7 @@ use super::render::GridDiffer;
 use super::session::Session;
 use super::status::StatusFeed;
 use super::{target_index, Resolved, Server};
+use crate::pairing;
 use crate::protocol::{
     AttachedSession, ClientMessage, DebugCommand, Duplex, NewSession, ServerMessage, Size,
 };
@@ -109,6 +110,32 @@ pub async fn handle(
         ClientMessage::RemoveServer { name } => {
             let reply = server.cluster().remove_server(&name);
             return send(&client.outgoing, done_or_error(reply)).await;
+        }
+        ClientMessage::ForgetServer { name } => {
+            let reply = server.forget_server(&name).await;
+            return send(&client.outgoing, done_or_error(reply)).await;
+        }
+        ClientMessage::Discover => {
+            let report = ServerMessage::Discovery(server.discovery().report());
+            return send(&client.outgoing, report).await;
+        }
+        ClientMessage::OpenPairing { new_key } => {
+            let paired = pairing::open(server.discovery(), new_key, &mut client).await;
+            return match paired {
+                Ok(()) => Ok(()),
+                Err(err) => send(&client.outgoing, ServerMessage::Error(format!("{err:#}"))).await,
+            };
+        }
+        ClientMessage::JoinPairing {
+            code,
+            host,
+            new_key,
+        } => {
+            let paired = pairing::join(server.discovery(), code, host, new_key, &mut client).await;
+            return match paired {
+                Ok(()) => Ok(()),
+                Err(err) => send(&client.outgoing, ServerMessage::Error(format!("{err:#}"))).await,
+            };
         }
         ClientMessage::AddProject { path } => {
             let reply = match server.register_project(path).await {

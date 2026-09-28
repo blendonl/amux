@@ -41,7 +41,14 @@ async fn main() -> Result<()> {
                 client::add_server(&endpoint, args.name, server).await
             }
             Some(ServersAction::Remove { name }) => client::remove_server(&endpoint, name).await,
+            Some(ServersAction::Forget { server }) => {
+                client::forget_server(&endpoint, server).await
+            }
         },
+        Some(Command::Discover) => client::discover(&endpoint).await,
+        Some(Command::Pair(args)) => {
+            client::pair(&endpoint, args.code, args.host, args.new_key).await
+        }
         Some(Command::KillServer) => client::kill_server(&endpoint).await,
         Some(Command::Server) => server::run(&endpoint.socket, endpoint.config.as_deref()).await,
         Some(Command::Bridge(args)) => ssh::bridge(&endpoint, args.no_start).await,

@@ -3,10 +3,10 @@
 pub mod git;
 
 use std::ffi::OsString;
-use std::fs::{self, DirBuilder, File};
+use std::fs::{self, DirBuilder, File, Permissions};
 use std::io::{Read, Write};
 use std::ops::Range;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{symlink, DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -20,7 +20,7 @@ use amux::protocol::{
     SessionCommand, SessionInfo, SessionState, Size, Version, Welcome, WindowSummary,
 };
 use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
+use nix::unistd::{getuid, Pid};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tempfile::TempDir;
 use tokio::net::UnixStream;
@@ -33,6 +33,45 @@ pub const DETACH: &str = "\x02d";
 const POLL: Duration = Duration::from_millis(10);
 const COMMAND_POLL: Duration = Duration::from_millis(50);
 const SOCKET_NAME: &str = "amux.sock";
+const LAN_PORT_FILE: &str = "lan-port";
+const FAST_DISCOVERY_MS: &str = "100";
+const REMOTE_PATH: &str = "PATH=/usr/bin:/bin";
+pub const DISCOVERY_OFF: &str = "[discovery]\ntailscale = false\nlan = false\n";
+
+const FAKE_SSH: &str = r#"#!/bin/sh
+while [ $# -gt 0 ]; do
+  case $1 in
+    -o|-p|-l|-i|-F|-J) shift 2 ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+host=${1#*@}
+shift
+command="$*"
+hosts=HOSTS
+if [ ! -f "$hosts/$host" ]; then
+  echo "ssh: Could not resolve hostname $host: Name or service not known" >&2
+  exit 255
+fi
+. "$hosts/$host"
+exec env -i "$@" sh -c "$command"
+"#;
+
+const FAKE_TAILSCALE: &str = r#"#!/bin/sh
+dir=DIR
+case $1 in
+  status)
+    exec cat "$dir/status.json" ;;
+  whois)
+    shift
+    [ "$1" = --json ] && shift
+    [ -f "$dir/whois/$1.json" ] || exit 1
+    exec cat "$dir/whois/$1.json" ;;
+esac
+echo "fake tailscale: unsupported command: $*" >&2
+exit 1
+"#;
 
 static SERVER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -48,6 +87,9 @@ pub struct TestServerBuilder {
     name: String,
     config: String,
     env: Vec<(String, String)>,
+    tailscale: bool,
+    lan: bool,
+    tailscale_tags: Vec<String>,
 }
 
 impl TestServerBuilder {
@@ -72,6 +114,27 @@ impl TestServerBuilder {
         self.config(&entry)
     }
 
+    pub fn ssh(self, network: &FakeNetwork) -> Self {
+        self.env("AMUX_SSH", &network.ssh().display().to_string())
+    }
+
+    pub fn tailscale(mut self, tailnet: &FakeTailnet) -> Self {
+        self.tailscale = true;
+        self.env("AMUX_TAILSCALE", &tailnet.program().display().to_string())
+            .env("AMUX_DISCOVERY_INTERVAL_MS", FAST_DISCOVERY_MS)
+    }
+
+    pub fn tailscale_tags(mut self, tags: &[&str]) -> Self {
+        self.tailscale_tags = tags.iter().map(|tag| tag.to_string()).collect();
+        self
+    }
+
+    pub fn lan(mut self, lan: &FakeLan) -> Self {
+        self.lan = true;
+        self.env("AMUX_LAN_DIR", &lan.path().display().to_string())
+            .env("AMUX_DISCOVERY_INTERVAL_MS", FAST_DISCOVERY_MS)
+    }
+
     pub fn start(self) -> TestServer {
         let mut server = self.prepare();
         server.start_process();
@@ -79,6 +142,10 @@ impl TestServerBuilder {
     }
 
     pub fn prepare(self) -> TestServer {
+        assert!(
+            !self.config.contains("[discovery]"),
+            "turn discovery sources on with the builder, not with a [discovery] table"
+        );
         let root = tempfile::tempdir().expect("creating a temp dir");
         let dir = |name: &str| {
             let path = root.path().join(name);
@@ -94,9 +161,13 @@ impl TestServerBuilder {
         let state = dir("state");
         let config = dir("config");
         fs::create_dir_all(config.join("amux")).expect("creating the config dir");
+        let discovery = format!(
+            "[discovery]\ntailscale = {}\nlan = {}\ntailscale_tags = {:?}\n",
+            self.tailscale, self.lan, self.tailscale_tags
+        );
         fs::write(
             config.join("amux").join("config.toml"),
-            format!("name = {:?}\n{}", self.name, self.config),
+            format!("name = {:?}\n{}\n{discovery}", self.name, self.config),
         )
         .expect("writing the config");
 
@@ -108,6 +179,11 @@ impl TestServerBuilder {
             ("SHELL".into(), "/bin/sh".into()),
             ("PATH".into(), std::env::var_os("PATH").unwrap_or_default()),
             ("AMUX_LOG".into(), "debug".into()),
+            (
+                "AMUX_TAILSCALE".into(),
+                root.path().join("no-tailscale").into(),
+            ),
+            ("AMUX_LAN_DIR".into(), root.path().join("no-lan").into()),
         ];
         env.extend(
             self.env
@@ -140,6 +216,7 @@ pub struct LinkLine {
     pub dialed: bool,
     pub incarnation: String,
     pub state: String,
+    pub transport: String,
 }
 
 pub fn linked<const N: usize>(builders: [TestServerBuilder; N]) -> [TestServer; N] {
@@ -185,6 +262,9 @@ impl TestServer {
             name: format!("test-{count}"),
             config: String::new(),
             env: Vec::new(),
+            tailscale: false,
+            lan: false,
+            tailscale_tags: Vec::new(),
         }
     }
 
@@ -226,6 +306,30 @@ impl TestServer {
 
     pub fn log(&self) -> String {
         fs::read_to_string(self.log_path()).unwrap_or_default()
+    }
+
+    pub fn lan_port(&self) -> Option<u16> {
+        fs::read_to_string(self.state_dir().join(LAN_PORT_FILE))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    pub fn wait_for_lan_port(&self) -> u16 {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if let Some(port) = self.lan_port() {
+                return port;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the LAN port in {}:\n{}",
+                self.state_dir().join(LAN_PORT_FILE).display(),
+                self.log()
+            );
+            thread::sleep(POLL);
+        }
     }
 
     pub fn server_id(&self) -> String {
@@ -546,7 +650,7 @@ fn parse_links(output: &str) -> Vec<LinkLine> {
         .lines()
         .map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
-            let [peer, name, direction, incarnation, state] = fields[..] else {
+            let [peer, name, direction, incarnation, state, transport] = fields[..] else {
                 panic!("unexpected link line {line:?}");
             };
             LinkLine {
@@ -555,9 +659,128 @@ fn parse_links(output: &str) -> Vec<LinkLine> {
                 dialed: direction == "dialed",
                 incarnation: incarnation.to_owned(),
                 state: state.to_owned(),
+                transport: transport.to_owned(),
             }
         })
         .collect()
+}
+
+pub struct FakeNetwork {
+    root: TempDir,
+}
+
+impl FakeNetwork {
+    pub fn new() -> Self {
+        let root = tempfile::tempdir().expect("creating the fake network");
+        let hosts = root.path().join("hosts");
+        fs::create_dir_all(&hosts).expect("creating the fake hosts");
+        let script = FAKE_SSH.replace("HOSTS", &shell_words::quote(&hosts.display().to_string()));
+        write_script(&root.path().join("ssh"), &script);
+        Self { root }
+    }
+
+    pub fn ssh(&self) -> PathBuf {
+        self.root.path().join("ssh")
+    }
+
+    pub fn add_host(&self, host: &str, server: &TestServer) {
+        let bin = server.home().join(".cargo").join("bin");
+        fs::create_dir_all(&bin).expect("creating ~/.cargo/bin");
+        link_once(Path::new(AMUX), &bin.join("amux"));
+
+        let runtime = server.root().join("runtime");
+        let sockets = runtime.join(format!("amux-{}", getuid()));
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&sockets)
+            .expect("creating the runtime socket dir");
+        link_once(server.socket(), &sockets.join(SOCKET_NAME));
+
+        let env = [
+            format!("HOME={}", server.home().display()),
+            format!("XDG_RUNTIME_DIR={}", runtime.display()),
+            format!("XDG_STATE_HOME={}", server.root().join("state").display()),
+            format!("XDG_CONFIG_HOME={}", server.root().join("config").display()),
+            format!("AMUX_CONFIG={}", server.config_path().display()),
+            REMOTE_PATH.to_owned(),
+        ];
+        fs::write(
+            self.root.path().join("hosts").join(host),
+            format!("set -- {}\n", shell_words::join(env)),
+        )
+        .expect("registering a fake host");
+    }
+}
+
+pub struct FakeTailnet {
+    root: TempDir,
+}
+
+impl FakeTailnet {
+    pub fn new() -> Self {
+        let root = tempfile::tempdir().expect("creating the fake tailnet");
+        fs::create_dir_all(root.path().join("whois")).expect("creating the whois dir");
+        let dir = shell_words::quote(&root.path().display().to_string()).into_owned();
+        write_script(
+            &root.path().join("tailscale"),
+            &FAKE_TAILSCALE.replace("DIR", &dir),
+        );
+        Self { root }
+    }
+
+    pub fn program(&self) -> PathBuf {
+        self.root.path().join("tailscale")
+    }
+
+    pub fn set_status(&self, status: &serde_json::Value) {
+        replace_json(&self.root.path().join("status.json"), status);
+    }
+
+    pub fn set_whois(&self, ip: &str, whois: &serde_json::Value) {
+        replace_json(&self.whois_path(ip), whois);
+    }
+
+    pub fn remove_whois(&self, ip: &str) {
+        let _ = fs::remove_file(self.whois_path(ip));
+    }
+
+    fn whois_path(&self, ip: &str) -> PathBuf {
+        self.root.path().join("whois").join(format!("{ip}.json"))
+    }
+}
+
+pub struct FakeLan {
+    dir: TempDir,
+}
+
+impl FakeLan {
+    pub fn new() -> Self {
+        Self {
+            dir: tempfile::tempdir().expect("creating the fake LAN"),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+fn write_script(path: &Path, script: &str) {
+    fs::write(path, script).expect("writing a fake program");
+    fs::set_permissions(path, Permissions::from_mode(0o755)).expect("making it executable");
+}
+
+fn link_once(target: &Path, link: &Path) {
+    if fs::symlink_metadata(link).is_err() {
+        symlink(target, link).expect("creating a symlink");
+    }
+}
+
+fn replace_json(path: &Path, value: &serde_json::Value) {
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, value.to_string()).expect("writing fake JSON");
+    fs::rename(&temporary, path).expect("replacing fake JSON");
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

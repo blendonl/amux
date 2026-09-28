@@ -53,6 +53,7 @@ async fn a_peer_greeting_is_answered_with_a_hello() {
         name: "visitor".into(),
         version: Version::current(),
         peers: Vec::new(),
+        public_key: None,
     };
     protocol::write_message(&mut stream, &PeerMessage::Hello(visitor))
         .await
@@ -63,6 +64,7 @@ async fn a_peer_greeting_is_answered_with_a_hello() {
             assert_eq!(hello.name, "desk");
             assert_eq!(hello.id.to_string(), server.server_id());
             assert_eq!(hello.version, Version::current());
+            assert_eq!(hello.public_key, None);
         }
         other => panic!("expected a hello, got {other:?}"),
     }

@@ -1,11 +1,13 @@
+mod cache;
 mod channel;
 mod link;
 pub mod ssh;
+pub mod transport;
+pub mod trust;
 
-use std::collections::BTreeMap;
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, SystemTime};
 
@@ -15,24 +17,26 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{broadcast, watch, Notify};
 use tracing::{debug, info, warn};
 
-use crate::config::{Incarnation, ServerConfig, ServerId, ServerIdentity};
+use crate::config::{DiscoveryConfig, Incarnation, ServerConfig, ServerId, ServerIdentity};
 use crate::protocol::{
-    ClientMessage, Duplex, Event, Farewell, Hello, LinkInfo, LinkState, PeerAddress, PeerMessage,
-    Refusal, ServerMessage, ServerState, ServerStatus, ServerView, Snapshot, StateEvent, Version,
+    ClientMessage, DiscoveryStatus, DiscoveryView, Duplex, Event, Farewell, Hello, LinkInfo,
+    LinkState, LinkTransport, PeerAddress, PeerMessage, PublicKey, Refusal, ServerMessage,
+    ServerState, ServerStatus, ServerView, Snapshot, StateEvent, Version, Via,
 };
+use cache::{Cache, CachedOrigin, CachedTarget, CACHE_FILE};
 pub use channel::{Channel, ChannelEnd, CREDIT_WINDOW};
 pub use link::LinkSettings;
 use link::{Handshake, LinkHandle};
-use ssh::Address;
+pub use transport::{Address, Connect, TransportAuth, Voucher};
+pub use trust::{TrustStore, TRUST_FILE};
 
-const CACHE_FILE: &str = "cluster-cache";
-const CACHE_MAGIC: &[u8; 8] = b"AMUXCL01";
 const SAVE_DELAY: Duration = Duration::from_millis(500);
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
-const GOSSIP_EXPIRY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const MAX_UNVERIFIED_BACKOFF: Duration = Duration::from_secs(10 * 60);
+const ADDRESS_EXPIRY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
-const BRIDGE_EXIT_GRACE: Duration = Duration::from_secs(2);
+const TCP_UNAVAILABLE: &str = "tcp links are not available yet";
 
 pub trait StateSource: Send + Sync {
     fn subscribe(&self) -> (Snapshot, broadcast::Receiver<Event>);
@@ -47,6 +51,8 @@ pub struct ClusterOptions {
     pub settings: LinkSettings,
     pub state_dir: Option<PathBuf>,
     pub servers: BTreeMap<String, ServerConfig>,
+    pub discovery: DiscoveryConfig,
+    pub trust: TrustStore,
 }
 
 pub struct Cluster {
@@ -55,11 +61,13 @@ pub struct Cluster {
     socket_name: String,
     settings: LinkSettings,
     cache_path: Option<PathBuf>,
+    trust_path: Option<PathBuf>,
     source: Weak<dyn StateSource>,
     members: Mutex<Members>,
     changes: watch::Sender<()>,
     dirty: Notify,
     saving: Mutex<()>,
+    saving_trust: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -67,6 +75,7 @@ struct Members {
     links: BTreeMap<ServerId, LinkEntry>,
     peers: BTreeMap<ServerId, Peer>,
     targets: BTreeMap<String, Target>,
+    trust: TrustStore,
     transports: usize,
     last_link: u64,
     generation: u64,
@@ -80,6 +89,8 @@ struct LinkEntry {
     dialed: bool,
     generation: u64,
     closing: bool,
+    transport: LinkTransport,
+    key: Option<PublicKey>,
     handle: LinkHandle,
 }
 
@@ -106,27 +117,54 @@ struct Target {
     last_seen: SystemTime,
     incompatible: Option<Version>,
     is_self: bool,
+    last_error: Option<String>,
+    found: Option<Found>,
     stop: Arc<Notify>,
+    wake: Arc<Notify>,
 }
 
 enum Origin {
     Configured { name: String, server: ServerConfig },
     Gossiped { name: String },
+    Discovered { name: String, via: Via },
 }
 
-#[derive(Default, Serialize, Deserialize)]
-struct Cache {
-    peers: BTreeMap<ServerId, Peer>,
-    targets: Vec<CachedTarget>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub name: String,
+    pub address: String,
+    pub server: Option<ServerId>,
+    pub key: Option<PublicKey>,
+    pub pairing: Option<String>,
+    pub dialable: bool,
+    pub endpoints: Vec<SocketAddr>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct CachedTarget {
-    address: String,
-    peer: Option<ServerId>,
-    gossiped_name: Option<String>,
-    verified: bool,
-    last_seen: SystemTime,
+impl Candidate {
+    pub fn new(name: impl Into<String>, address: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            address: address.into(),
+            server: None,
+            key: None,
+            pairing: None,
+            dialable: true,
+            endpoints: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Found {
+    via: Via,
+    candidate: Candidate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forgotten {
+    pub name: String,
+    pub id: Option<ServerId>,
+    pub configured: Vec<String>,
 }
 
 enum Rejection {
@@ -137,7 +175,10 @@ enum Rejection {
 enum DialPlan {
     Stop,
     Wait,
-    Dial(Vec<String>),
+    Dial {
+        connect: Connect,
+        max_backoff: Duration,
+    },
 }
 
 impl Target {
@@ -149,49 +190,155 @@ impl Target {
             last_seen,
             incompatible: None,
             is_self: false,
+            last_error: None,
+            found: None,
             stop: Arc::new(Notify::new()),
+            wake: Arc::new(Notify::new()),
+        }
+    }
+
+    fn restored(origin: Origin, cached: &CachedTarget) -> Self {
+        Self {
+            is_self: cached.is_self,
+            last_error: cached.last_error.clone(),
+            ..Self::new(origin, cached.peer, cached.verified, cached.last_seen)
         }
     }
 
     fn name(&self) -> &str {
         match &self.origin {
-            Origin::Configured { name, .. } | Origin::Gossiped { name } => name,
+            Origin::Configured { name, .. }
+            | Origin::Gossiped { name }
+            | Origin::Discovered { name, .. } => name,
         }
     }
 
     fn configured_name(&self) -> Option<&str> {
         match &self.origin {
             Origin::Configured { name, .. } => Some(name),
-            Origin::Gossiped { .. } => None,
+            Origin::Gossiped { .. } | Origin::Discovered { .. } => None,
         }
     }
 
-    fn is_expired(&self, now: SystemTime) -> bool {
-        matches!(self.origin, Origin::Gossiped { .. })
-            && now
-                .duration_since(self.last_seen)
-                .is_ok_and(|age| age > GOSSIP_EXPIRY)
+    fn is_configured(&self) -> bool {
+        matches!(self.origin, Origin::Configured { .. })
     }
 
-    fn command(&self, address: &str, socket_name: &str, no_start: bool) -> Result<Vec<String>> {
+    fn is_discovered(&self) -> bool {
+        matches!(self.origin, Origin::Discovered { .. })
+    }
+
+    fn is_absent(&self) -> bool {
+        self.is_discovered() && self.found.is_none()
+    }
+
+    fn is_hidden(&self) -> bool {
+        self.is_discovered() && !self.verified
+    }
+
+    fn is_dialable(&self) -> bool {
+        !self.is_discovered()
+            || self
+                .found
+                .as_ref()
+                .is_some_and(|found| found.candidate.dialable)
+    }
+
+    fn is_expired(&self, now: SystemTime) -> bool {
+        let expires = match self.origin {
+            Origin::Configured { .. } => false,
+            Origin::Gossiped { .. } => true,
+            Origin::Discovered { .. } => self.found.is_none() && !self.is_self,
+        };
+        expires
+            && now
+                .duration_since(self.last_seen)
+                .is_ok_and(|age| age > ADDRESS_EXPIRY)
+    }
+
+    fn connect(&self, address: &str, socket_name: &str, no_start: bool) -> Result<Option<Connect>> {
         let parsed: Address = address.parse()?;
         let (amux_path, socket) = match &self.origin {
             Origin::Configured { server, .. } => {
                 (server.amux_path.as_deref(), server.socket.as_deref())
             }
-            Origin::Gossiped { .. } => (None, None),
+            Origin::Gossiped { .. } | Origin::Discovered { .. } => (None, None),
         };
-        Ok(parsed.bridge_command(amux_path, socket.unwrap_or(socket_name), no_start))
+        let endpoints = self
+            .found
+            .as_ref()
+            .map(|found| found.candidate.endpoints.as_slice())
+            .unwrap_or_default();
+        Ok(parsed.connect(
+            amux_path,
+            socket.unwrap_or(socket_name),
+            no_start,
+            endpoints,
+        ))
+    }
+
+    fn cached(&self, address: &str) -> CachedTarget {
+        CachedTarget {
+            address: address.to_owned(),
+            peer: self.peer,
+            origin: match &self.origin {
+                Origin::Configured { .. } => CachedOrigin::Configured,
+                Origin::Gossiped { name } => CachedOrigin::Gossiped { name: name.clone() },
+                Origin::Discovered { name, via } => CachedOrigin::Discovered {
+                    name: name.clone(),
+                    via: *via,
+                },
+            },
+            verified: self.verified,
+            last_seen: self.last_seen,
+            is_self: self.is_self,
+            last_error: self.last_error.clone(),
+        }
+    }
+
+    fn discovery_view(&self, address: &str, linked: bool) -> Option<DiscoveryView> {
+        let (via, name) = match (&self.found, &self.origin) {
+            (Some(found), _) => (found.via, found.candidate.name.clone()),
+            (None, Origin::Discovered { name, via }) => (*via, name.clone()),
+            (None, _) => return None,
+        };
+        if self.is_self {
+            return None;
+        }
+        let status = match &self.found {
+            _ if linked => DiscoveryStatus::Linked,
+            None => DiscoveryStatus::Absent,
+            Some(found) if !found.candidate.dialable => match found.candidate.pairing {
+                Some(_) => DiscoveryStatus::PairingOpen,
+                None => DiscoveryStatus::NotPaired,
+            },
+            Some(_) if self.last_error.is_some() => DiscoveryStatus::Failing,
+            Some(_) => DiscoveryStatus::Trying,
+        };
+        Some(DiscoveryView {
+            via,
+            name,
+            address: address.to_owned(),
+            server: self.peer,
+            status,
+            last_error: self.last_error.clone(),
+        })
     }
 }
 
 impl Cluster {
     pub fn new(options: ClusterOptions, source: Weak<dyn StateSource>) -> Arc<Self> {
-        let cache_path = options.state_dir.map(|dir| dir.join(CACHE_FILE));
-        let cache = cache_path.as_deref().map(load_cache).unwrap_or_default();
+        let cache_path = options.state_dir.as_ref().map(|dir| dir.join(CACHE_FILE));
+        let trust_path = options.state_dir.as_ref().map(|dir| dir.join(TRUST_FILE));
+        let Cache {
+            mut peers,
+            targets: cached_targets,
+        } = cache_path.as_deref().map(cache::load).unwrap_or_default();
+        peers.retain(|id, _| !options.trust.is_forgotten(*id, None));
         let now = SystemTime::now();
         let mut members = Members {
-            peers: cache.peers,
+            peers,
+            trust: options.trust,
             ..Members::default()
         };
 
@@ -200,38 +347,55 @@ impl Cluster {
                 info!(server = %name, "not dialing a configured server that names this server");
                 continue;
             }
-            let cached = cache
-                .targets
+            let origin = Origin::Configured {
+                name,
+                server: server.clone(),
+            };
+            let target = match cached_targets
                 .iter()
-                .find(|cached| cached.address == server.address);
-            let target = Target::new(
-                Origin::Configured {
-                    name,
-                    server: server.clone(),
+                .find(|cached| cached.address == server.address)
+            {
+                Some(cached) => Target {
+                    last_seen: now,
+                    is_self: false,
+                    ..Target::restored(origin, cached)
                 },
-                cached.and_then(|cached| cached.peer),
-                cached.is_some_and(|cached| cached.verified),
-                now,
-            );
+                None => Target::new(origin, None, false, now),
+            };
             members.targets.insert(server.address, target);
         }
-        for cached in cache.targets {
-            let Some(name) = cached.gossiped_name else {
-                continue;
+        for cached in &cached_targets {
+            let origin = match &cached.origin {
+                CachedOrigin::Configured => continue,
+                CachedOrigin::Gossiped { name } => Origin::Gossiped { name: name.clone() },
+                CachedOrigin::Discovered { name, via } => {
+                    let enabled = match via {
+                        Via::Tailscale => options.discovery.tailscale,
+                        Via::Lan => options.discovery.lan,
+                    };
+                    if !enabled || !(cached.verified || cached.is_self) {
+                        continue;
+                    }
+                    Origin::Discovered {
+                        name: name.clone(),
+                        via: *via,
+                    }
+                }
             };
-            let target = Target::new(
-                Origin::Gossiped { name },
-                cached.peer,
-                cached.verified,
-                cached.last_seen,
-            );
+            let target = Target::restored(origin, cached);
+            let forgotten = cached
+                .peer
+                .is_some_and(|peer| members.trust.is_forgotten(peer, None));
+            let name_configured = matches!(target.origin, Origin::Gossiped { .. })
+                && members.names_configured(target.name());
             if members.targets.contains_key(&cached.address)
-                || members.names_configured(target.name())
+                || forgotten
+                || name_configured
                 || target.is_expired(now)
             {
                 continue;
             }
-            members.targets.insert(cached.address, target);
+            members.targets.insert(cached.address.clone(), target);
         }
 
         Arc::new(Self {
@@ -240,11 +404,13 @@ impl Cluster {
             socket_name: options.socket_name,
             settings: options.settings,
             cache_path,
+            trust_path,
             source,
             members: Mutex::new(members),
             changes: watch::channel(()).0,
             dirty: Notify::new(),
             saving: Mutex::new(()),
+            saving_trust: Mutex::new(()),
         })
     }
 
@@ -259,14 +425,19 @@ impl Cluster {
         self.peers_changed();
     }
 
-    pub async fn accept<R, W>(self: &Arc<Self>, reader: R, writer: W) -> Result<()>
+    pub async fn accept<R, W>(
+        self: &Arc<Self>,
+        reader: R,
+        writer: W,
+        auth: TransportAuth,
+    ) -> Result<()>
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let handshake = tokio::time::timeout(
             self.settings.handshake_timeout,
-            link::accept(self, reader, writer),
+            link::accept(self, reader, writer, auth),
         )
         .await
         .context("the peer handshake timed out")??;
@@ -283,7 +454,8 @@ impl Cluster {
                 let target = members
                     .targets
                     .iter()
-                    .find(|(_, target)| target.peer == Some(*id));
+                    .filter(|(_, target)| target.peer == Some(*id))
+                    .min_by_key(|(_, target)| !target.verified);
                 let incompatible = target.and_then(|(_, target)| target.incompatible.clone());
                 let status = match (members.links.get(id), incompatible) {
                     (Some(link), _) => ServerStatus::Online {
@@ -320,6 +492,7 @@ impl Cluster {
                 .iter()
                 .filter(|(_, target)| {
                     !target.is_self
+                        && !target.is_hidden()
                         && target
                             .peer
                             .is_none_or(|id| !members.peers.contains_key(&id))
@@ -360,8 +533,26 @@ impl Cluster {
                 } else {
                     LinkState::Up
                 },
+                transport: link.transport,
+                key: link.key,
             })
             .collect()
+    }
+
+    pub fn discovery_view(&self) -> Vec<DiscoveryView> {
+        let members = self.members();
+        let mut views: Vec<DiscoveryView> = members
+            .targets
+            .iter()
+            .filter_map(|(address, target)| {
+                let linked = target
+                    .peer
+                    .is_some_and(|peer| members.links.contains_key(&peer));
+                target.discovery_view(address, linked)
+            })
+            .collect();
+        views.sort_by(|a, b| (a.via, &a.name, &a.address).cmp(&(b.via, &b.name, &b.address)));
+        views
     }
 
     pub fn gossip(&self) -> Vec<PeerAddress> {
@@ -369,7 +560,7 @@ impl Cluster {
         members
             .targets
             .iter()
-            .filter(|(_, target)| target.verified && !target.is_self)
+            .filter(|(_, target)| target.verified && !target.is_self && !target.is_discovered())
             .filter_map(|(address, target)| {
                 let id = target.peer?;
                 let name = members
@@ -510,6 +701,212 @@ impl Cluster {
         Ok(())
     }
 
+    pub fn forget(&self, server: &str) -> Result<Forgotten> {
+        let forgotten = {
+            let mut members = self.members();
+            if server == self.identity.name || server == self.identity.id.to_string() {
+                bail!("{server} is this server");
+            }
+            let names = |id: &ServerId, name: &str| name == server || id.to_string() == server;
+            let named: Vec<String> = members
+                .targets
+                .iter()
+                .filter(|(_, target)| {
+                    !target.is_self
+                        && (target.name() == server
+                            || target
+                                .found
+                                .as_ref()
+                                .is_some_and(|found| found.candidate.name == server))
+                })
+                .map(|(address, _)| address.clone())
+                .collect();
+            let mut ids: BTreeSet<ServerId> = members
+                .peers
+                .iter()
+                .filter(|(id, peer)| names(id, &peer.name))
+                .map(|(id, _)| *id)
+                .collect();
+            ids.extend(
+                members
+                    .links
+                    .iter()
+                    .filter(|(id, link)| names(id, &link.name))
+                    .map(|(id, _)| *id),
+            );
+            ids.extend(
+                members
+                    .targets
+                    .iter()
+                    .filter(|(address, target)| {
+                        named.contains(address)
+                            || target.peer.is_some_and(|id| id.to_string() == server)
+                    })
+                    .filter_map(|(_, target)| target.peer),
+            );
+            ids.remove(&self.identity.id);
+            let id = match ids.len() {
+                0 => None,
+                1 => ids.first().copied(),
+                _ => {
+                    let ids: Vec<String> = ids.iter().map(ToString::to_string).collect();
+                    bail!(
+                        "{server} names more than one server, pass one of these ids: {}",
+                        ids.join(", ")
+                    )
+                }
+            };
+            if id.is_none() && named.is_empty() {
+                bail!("no server named {server} is known");
+            }
+
+            let dropped: Vec<String> = members
+                .targets
+                .iter()
+                .filter(|(address, target)| {
+                    !target.is_self
+                        && (named.contains(address) || (id.is_some() && target.peer == id))
+                })
+                .map(|(address, _)| address.clone())
+                .collect();
+            let mut configured = Vec::new();
+            for address in dropped {
+                let target = members
+                    .targets
+                    .remove(&address)
+                    .expect("the target was just found");
+                target.stop.notify_one();
+                if let Some(name) = target.configured_name() {
+                    configured.push(name.to_owned());
+                }
+            }
+            let mut name = server.to_owned();
+            if let Some(id) = id {
+                let key = members
+                    .links
+                    .get(&id)
+                    .and_then(|link| link.key)
+                    .or_else(|| members.trust.key_of(id));
+                if let Some(link) = members.links.get(&id) {
+                    name = link.name.clone();
+                    link.handle.stop.notify_one();
+                }
+                if let Some(peer) = members.peers.remove(&id) {
+                    name = peer.name;
+                }
+                members.trust.forget(id, key);
+            }
+            info!(server = %name, id = ?id, "server forgotten");
+            Forgotten {
+                name,
+                id,
+                configured,
+            }
+        };
+        let saved = self.save_trust();
+        self.changed();
+        self.dirty.notify_one();
+        self.peers_changed();
+        saved.map(|()| forgotten)
+    }
+
+    pub fn discovered(self: &Arc<Self>, via: Via, candidates: Vec<Candidate>) {
+        let mut added = Vec::new();
+        {
+            let mut members = self.members();
+            if members.stopping {
+                return;
+            }
+            let now = SystemTime::now();
+            let mut listed = BTreeSet::new();
+            let mut woken = BTreeSet::new();
+            for candidate in candidates {
+                let forgotten = candidate
+                    .server
+                    .is_some_and(|id| members.trust.is_forgotten(id, candidate.key.as_ref()))
+                    || candidate
+                        .key
+                        .is_some_and(|key| members.trust.is_key_forgotten(&key));
+                if candidate.server == Some(self.identity.id) || forgotten {
+                    continue;
+                }
+                if let Err(err) = candidate.address.parse::<Address>() {
+                    debug!(%via, name = %candidate.name, "ignoring a discovered address: {err:#}");
+                    continue;
+                }
+                if !listed.insert(candidate.address.clone()) {
+                    continue;
+                }
+                let address = candidate.address.clone();
+                let found = Found { via, candidate };
+                match members.targets.get_mut(&address) {
+                    Some(target) => {
+                        match &mut target.origin {
+                            Origin::Gossiped { .. } => {
+                                target.origin = Origin::Discovered {
+                                    name: found.candidate.name.clone(),
+                                    via,
+                                };
+                            }
+                            Origin::Discovered { name, .. } => {
+                                name.clone_from(&found.candidate.name);
+                            }
+                            Origin::Configured { .. } => {}
+                        }
+                        if let Some(id) = found.candidate.server {
+                            target.peer.get_or_insert(id);
+                        }
+                        target.last_seen = now;
+                        if target.found.as_ref() != Some(&found) {
+                            target.wake.notify_one();
+                            woken.extend(target.peer);
+                        }
+                        target.found = Some(found);
+                    }
+                    None => {
+                        let origin = Origin::Discovered {
+                            name: found.candidate.name.clone(),
+                            via,
+                        };
+                        info!(%via, name = %found.candidate.name, %address, "discovered a server");
+                        let mut target = Target::new(origin, found.candidate.server, false, now);
+                        target.found = Some(found);
+                        members.targets.insert(address.clone(), target);
+                        added.push(address);
+                    }
+                }
+            }
+
+            let mut gone = Vec::new();
+            for (address, target) in &mut members.targets {
+                let from_here = target.found.as_ref().is_some_and(|found| found.via == via);
+                if !from_here || listed.contains(address) {
+                    continue;
+                }
+                target.found = None;
+                if target.is_discovered() && !target.verified && !target.is_self {
+                    gone.push(address.clone());
+                }
+            }
+            for address in gone {
+                if let Some(target) = members.targets.remove(&address) {
+                    debug!(%via, %address, "dropping a discovered address that was never reached");
+                    target.stop.notify_one();
+                }
+            }
+            for target in members.targets.values() {
+                if target.peer.is_some_and(|peer| woken.contains(&peer)) {
+                    target.wake.notify_one();
+                }
+            }
+        }
+        self.changed();
+        self.dirty.notify_one();
+        for address in added {
+            self.spawn_dial_loop(address);
+        }
+    }
+
     pub async fn shutdown(&self) {
         let mut changes = self.changes.subscribe();
         {
@@ -571,12 +968,24 @@ impl Cluster {
             name: self.identity.name.clone(),
             version: self.version.clone(),
             peers: self.gossip(),
+            public_key: None,
         }
     }
 
-    fn check(&self, hello: &Hello) -> Result<(), Refusal> {
+    fn check(&self, hello: &Hello, auth: &TransportAuth) -> Result<(), Refusal> {
         if hello.id == self.identity.id {
             return Err(Refusal::SelfDial);
+        }
+        let members = self.members();
+        let key_forgotten = auth
+            .key()
+            .is_some_and(|key| members.trust.is_key_forgotten(&key));
+        if key_forgotten
+            || members
+                .trust
+                .is_forgotten(hello.id, hello.public_key.as_ref())
+        {
+            return Err(Refusal::Forgotten);
         }
         if !self.version.is_compatible_with(hello.version.major) {
             return Err(Refusal::Incompatible);
@@ -584,7 +993,6 @@ impl Cluster {
         if hello.name == self.identity.name {
             return Err(Refusal::NameTaken);
         }
-        let members = self.members();
         if members
             .links
             .iter()
@@ -606,6 +1014,7 @@ impl Cluster {
         hello: &Hello,
         dialed: bool,
         handle: LinkHandle,
+        auth: &TransportAuth,
     ) -> Result<(LinkGuard, u64), Rejection> {
         let mut members = self.members();
         if members.stopping {
@@ -620,7 +1029,7 @@ impl Cluster {
         }
         members.generation += 1;
         let generation = members.generation;
-        let guard = self.register(&mut members, hello, dialed, generation, handle);
+        let guard = self.register(&mut members, hello, dialed, generation, handle, auth);
         Ok((guard, generation))
     }
 
@@ -630,6 +1039,7 @@ impl Cluster {
         dialed: bool,
         generation: u64,
         handle: LinkHandle,
+        auth: &TransportAuth,
     ) -> Result<LinkGuard, Rejection> {
         let mut members = self.members();
         if members.stopping {
@@ -640,7 +1050,7 @@ impl Cluster {
                 return Err(Rejection::Refused(Refusal::Duplicate));
             }
         }
-        Ok(self.register(&mut members, hello, dialed, generation, handle))
+        Ok(self.register(&mut members, hello, dialed, generation, handle, auth))
     }
 
     fn register(
@@ -650,6 +1060,7 @@ impl Cluster {
         dialed: bool,
         generation: u64,
         handle: LinkHandle,
+        auth: &TransportAuth,
     ) -> LinkGuard {
         members.last_link += 1;
         let id = members.last_link;
@@ -666,6 +1077,8 @@ impl Cluster {
                 dialed,
                 generation,
                 closing: false,
+                transport: auth.transport(),
+                key: auth.key().or(hello.public_key),
                 handle,
             },
         );
@@ -685,7 +1098,14 @@ impl Cluster {
                 target.incompatible = None;
             }
         }
-        info!(peer = %hello.name, id = %hello.id, incarnation = %hello.incarnation, dialed, "link up");
+        info!(
+            peer = %hello.name,
+            id = %hello.id,
+            incarnation = %hello.incarnation,
+            dialed,
+            transport = %auth.transport(),
+            "link up"
+        );
         self.changed();
         self.dirty.notify_one();
         LinkGuard {
@@ -783,6 +1203,7 @@ impl Cluster {
                 if peer.id == self.identity.id
                     || peer.name == self.identity.name
                     || members.names_configured(&peer.name)
+                    || members.trust.is_forgotten(peer.id, None)
                 {
                     continue;
                 }
@@ -817,44 +1238,50 @@ impl Cluster {
     }
 
     fn spawn_dial_loop(self: &Arc<Self>, address: String) {
-        let Some(stop) = self
+        let Some((stop, wake)) = self
             .members()
             .targets
             .get(&address)
-            .map(|target| Arc::clone(&target.stop))
+            .map(|target| (Arc::clone(&target.stop), Arc::clone(&target.wake)))
         else {
             return;
         };
-        tokio::spawn(Arc::clone(self).dial_loop(address, stop));
+        tokio::spawn(Arc::clone(self).dial_loop(address, stop, wake));
     }
 
-    async fn dial_loop(self: Arc<Self>, address: String, stop: Arc<Notify>) {
+    async fn dial_loop(self: Arc<Self>, address: String, stop: Arc<Notify>, wake: Arc<Notify>) {
         let mut changes = self.changes.subscribe();
         let mut backoff = MIN_BACKOFF;
         loop {
-            let command = loop {
+            let (connect, max_backoff) = loop {
                 changes.borrow_and_update();
                 match self.dial_plan(&address) {
                     DialPlan::Stop => return,
                     DialPlan::Wait => tokio::select! {
                         _ = changes.changed() => {}
+                        () = wake.notified() => backoff = MIN_BACKOFF,
                         () = stop.notified() => return,
                     },
-                    DialPlan::Dial(command) => break command,
+                    DialPlan::Dial {
+                        connect,
+                        max_backoff,
+                    } => break (connect, max_backoff),
                 }
             };
             let linked = tokio::select! {
-                linked = self.dial(&address, &command) => linked,
+                linked = self.dial(&address, &connect) => linked,
                 () = stop.notified() => return,
             };
             if linked {
                 backoff = MIN_BACKOFF;
             }
             tokio::select! {
-                () = tokio::time::sleep(jittered(backoff)) => {}
+                () = tokio::time::sleep(jittered(backoff)) => {
+                    backoff = (backoff * 2).min(max_backoff);
+                }
+                () = wake.notified() => backoff = MIN_BACKOFF,
                 () = stop.notified() => return,
             }
-            backoff = (backoff * 2).min(MAX_BACKOFF);
         }
     }
 
@@ -870,7 +1297,7 @@ impl Cluster {
             return DialPlan::Stop;
         }
         if target.is_expired(SystemTime::now()) {
-            info!(%address, "forgetting a gossiped address that has not been seen for a week");
+            info!(%address, "forgetting an address that has not been seen for a week");
             members.targets.remove(address);
             self.dirty.notify_one();
             return DialPlan::Stop;
@@ -880,12 +1307,27 @@ impl Cluster {
                 return DialPlan::Wait;
             }
         }
+        let absent = target.is_absent()
+            || (!target.is_configured() && target.peer.is_some_and(|peer| members.is_absent(peer)));
+        if absent || !target.is_dialable() {
+            return DialPlan::Wait;
+        }
         let stopped = target
             .peer
             .and_then(|peer| members.peers.get(&peer))
             .is_some_and(|peer| peer.stopped);
-        match target.command(address, &self.socket_name, stopped) {
-            Ok(command) => DialPlan::Dial(command),
+        let max_backoff = if target.is_hidden() {
+            MAX_UNVERIFIED_BACKOFF
+        } else {
+            MAX_BACKOFF
+        };
+        let no_start = stopped || target.is_discovered();
+        match target.connect(address, &self.socket_name, no_start) {
+            Ok(Some(connect)) => DialPlan::Dial {
+                connect,
+                max_backoff,
+            },
+            Ok(None) => DialPlan::Wait,
             Err(err) => {
                 warn!(%address, "not dialing: {err:#}");
                 DialPlan::Stop
@@ -893,12 +1335,24 @@ impl Cluster {
         }
     }
 
-    async fn dial(self: &Arc<Self>, address: &str, command: &[String]) -> bool {
+    async fn dial(self: &Arc<Self>, address: &str, connect: &Connect) -> bool {
+        match connect {
+            Connect::Command(command) => self.dial_command(address, command).await,
+            Connect::Tcp(_) => {
+                debug!(%address, "not dialing: {TCP_UNAVAILABLE}");
+                self.record_error(address, TCP_UNAVAILABLE.to_owned());
+                false
+            }
+        }
+    }
+
+    async fn dial_command(self: &Arc<Self>, address: &str, command: &[String]) -> bool {
         debug!(%address, command = %shell_words::join(command), "dialing");
         let transport = match ssh::spawn(command, address) {
             Ok(transport) => transport,
             Err(err) => {
                 warn!(%address, "dialing failed: {err:#}");
+                self.record_error(address, format!("{err:#}"));
                 return false;
             }
         };
@@ -906,31 +1360,34 @@ impl Cluster {
             mut child,
             reader,
             writer,
+            stderr,
         } = transport;
 
         let handshake = tokio::time::timeout(
             self.settings.handshake_timeout,
-            link::dial(self, reader, writer),
+            link::dial(self, reader, writer, TransportAuth::Ssh),
         )
         .await;
-        let handshake = match handshake {
-            Ok(Ok(handshake)) => handshake,
+        let failure = match handshake {
+            Ok(Ok(handshake)) if matches!(handshake, Handshake::Linked(_)) => {
+                let _transport = self.count_transport();
+                let linked = self.conclude(handshake, Some(address)).await;
+                let _ = tokio::time::timeout(ssh::BRIDGE_EXIT_GRACE, child.wait()).await;
+                return linked;
+            }
+            Ok(Ok(handshake)) => return self.conclude(handshake, Some(address)).await,
             Ok(Err(err)) => {
                 info!(%address, "linking failed: {err:#}");
-                return false;
+                format!("{err:#}")
             }
             Err(_) => {
                 warn!(%address, "the peer handshake timed out");
-                return false;
+                "the peer handshake timed out".to_owned()
             }
         };
-        if !matches!(handshake, Handshake::Linked(_)) {
-            return self.conclude(handshake, Some(address)).await;
-        }
-        let _transport = self.count_transport();
-        let linked = self.conclude(handshake, Some(address)).await;
-        let _ = tokio::time::timeout(BRIDGE_EXIT_GRACE, child.wait()).await;
-        linked
+        let reason = ssh::last_words(&mut child, stderr).await.unwrap_or(failure);
+        self.record_error(address, reason);
+        false
     }
 
     async fn conclude<R, W>(
@@ -977,6 +1434,9 @@ impl Cluster {
             Handshake::Stopping(peer) => {
                 let name = peer.map(|peer| peer.name).unwrap_or_default();
                 info!(peer = %name, "the peer is shutting down");
+                if let Some(address) = address {
+                    self.record_error(address, "the peer is shutting down".to_owned());
+                }
                 false
             }
             Handshake::Incompatible(welcome) => {
@@ -987,6 +1447,10 @@ impl Cluster {
                 );
                 if let Some(address) = address {
                     if let Some(target) = self.members().targets.get_mut(address) {
+                        target.last_error = Some(format!(
+                            "the peer runs {}, which speaks an incompatible protocol",
+                            welcome.version
+                        ));
                         target.incompatible = Some(welcome.version);
                     }
                 }
@@ -1005,23 +1469,48 @@ impl Cluster {
             target.verified = true;
             target.last_seen = SystemTime::now();
             target.incompatible = None;
+            target.last_error = None;
         }
         self.dirty.notify_one();
         self.peers_changed();
     }
 
     fn target_refused(&self, address: &str, reason: Refusal, peer: Option<&Hello>) {
-        let mut members = self.members();
-        let Some(target) = members.targets.get_mut(address) else {
-            return;
+        let newly_verified = {
+            let mut members = self.members();
+            let Some(target) = members.targets.get_mut(address) else {
+                return;
+            };
+            let mut newly_verified = false;
+            if let Some(peer) = peer {
+                target.peer = Some(peer.id);
+                if reason != Refusal::SelfDial {
+                    newly_verified = !target.verified;
+                    target.verified = true;
+                }
+            }
+            match reason {
+                Refusal::SelfDial => {
+                    info!(%address, "not dialing an address that leads back to this server");
+                    target.is_self = true;
+                }
+                Refusal::Duplicate => {}
+                reason => target.last_error = Some(reason.to_string()),
+            }
+            newly_verified
         };
-        if let Some(peer) = peer {
-            target.peer = Some(peer.id);
+        self.dirty.notify_one();
+        if newly_verified {
+            self.changed();
+            self.peers_changed();
         }
-        if reason == Refusal::SelfDial {
-            info!(%address, "not dialing an address that leads back to this server");
-            target.is_self = true;
+    }
+
+    fn record_error(&self, address: &str, error: String) {
+        if let Some(target) = self.members().targets.get_mut(address) {
+            target.last_error = Some(error);
         }
+        self.dirty.notify_one();
     }
 
     fn count_transport(self: &Arc<Self>) -> TransportGuard {
@@ -1066,22 +1555,25 @@ impl Cluster {
             let targets = members
                 .targets
                 .iter()
-                .map(|(address, target)| CachedTarget {
-                    address: address.clone(),
-                    peer: target.peer,
-                    gossiped_name: match &target.origin {
-                        Origin::Gossiped { name } => Some(name.clone()),
-                        Origin::Configured { .. } => None,
-                    },
-                    verified: target.verified,
-                    last_seen: target.last_seen,
-                })
+                .map(|(address, target)| target.cached(address))
                 .collect();
             Cache { peers, targets }
         };
-        if let Err(err) = write_cache(path, &cache) {
+        if let Err(err) = cache::write(path, &cache) {
             warn!("saving the cluster cache failed: {err:#}");
         }
+    }
+
+    fn save_trust(&self) -> Result<()> {
+        let Some(path) = &self.trust_path else {
+            return Ok(());
+        };
+        let _saving = self
+            .saving_trust
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let trust = self.members().trust.clone();
+        trust.save(path)
     }
 
     fn members(&self) -> MutexGuard<'_, Members> {
@@ -1094,6 +1586,15 @@ impl Members {
         self.targets
             .values()
             .any(|target| target.configured_name() == Some(name))
+    }
+
+    fn is_absent(&self, peer: ServerId) -> bool {
+        let mut discovered = self
+            .targets
+            .values()
+            .filter(|target| target.peer == Some(peer) && target.is_discovered())
+            .peekable();
+        discovered.peek().is_some() && discovered.all(Target::is_absent)
     }
 
     fn forget_gossip_named(&mut self, name: &str) {
@@ -1131,39 +1632,6 @@ impl Drop for TransportGuard {
     }
 }
 
-fn load_cache(path: &Path) -> Cache {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Cache::default(),
-        Err(err) => {
-            warn!(
-                "reading {} failed, starting without it: {err}",
-                path.display()
-            );
-            return Cache::default();
-        }
-    };
-    let decoded = bytes
-        .strip_prefix(CACHE_MAGIC)
-        .context("unknown format")
-        .and_then(|payload| postcard::from_bytes(payload).context("decoding"));
-    match decoded {
-        Ok(cache) => cache,
-        Err(err) => {
-            warn!("dropping the cluster cache {}: {err:#}", path.display());
-            Cache::default()
-        }
-    }
-}
-
-fn write_cache(path: &Path, cache: &Cache) -> Result<()> {
-    let mut bytes = CACHE_MAGIC.to_vec();
-    bytes.extend(postcard::to_stdvec(cache)?);
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, bytes).with_context(|| format!("writing {}", temporary.display()))?;
-    fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))
-}
-
 fn jittered(delay: Duration) -> Duration {
     let mut bytes = [0; 8];
     let fraction = match getrandom::fill(&mut bytes) {
@@ -1171,4 +1639,613 @@ fn jittered(delay: Duration) -> Duration {
         Err(_) => 1.0,
     };
     delay.mul_f64(0.5 + fraction / 2.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    const PATIENCE: Duration = Duration::from_secs(10);
+    const DESK: &str = "000000000000000000000000000000d5";
+    const LAPTOP: &str = "000000000000000000000000000000a7";
+
+    struct Quiet(broadcast::Sender<Event>);
+
+    impl StateSource for Quiet {
+        fn subscribe(&self) -> (Snapshot, broadcast::Receiver<Event>) {
+            let snapshot = Snapshot {
+                incarnation: Incarnation::random().unwrap(),
+                seq: 0,
+                state: ServerState::default(),
+            };
+            (snapshot, self.0.subscribe())
+        }
+
+        fn refresh_peers(&self) {}
+
+        fn serve_channel(self: Arc<Self>, _channel: Duplex<ClientMessage, ServerMessage>) {}
+    }
+
+    struct Fixture {
+        cluster: Arc<Cluster>,
+        _source: Arc<Quiet>,
+    }
+
+    struct Setup {
+        servers: Vec<(&'static str, String)>,
+        trust: TrustStore,
+        discovery: DiscoveryConfig,
+        state_dir: Option<PathBuf>,
+    }
+
+    fn setup() -> Setup {
+        Setup {
+            servers: Vec::new(),
+            trust: TrustStore::default(),
+            discovery: DiscoveryConfig::default(),
+            state_dir: None,
+        }
+    }
+
+    impl Setup {
+        fn server(mut self, name: &'static str, address: &str) -> Self {
+            self.servers.push((name, address.to_owned()));
+            self
+        }
+
+        fn build(self) -> Fixture {
+            let source = Arc::new(Quiet(broadcast::channel(4).0));
+            let weak: Weak<Quiet> = Arc::downgrade(&source);
+            let servers = self
+                .servers
+                .into_iter()
+                .map(|(name, address)| {
+                    let server = ServerConfig {
+                        address,
+                        amux_path: None,
+                        socket: None,
+                    };
+                    (name.to_owned(), server)
+                })
+                .collect();
+            let options = ClusterOptions {
+                identity: ServerIdentity {
+                    id: ServerId::random().unwrap(),
+                    name: "here".into(),
+                    incarnation: Incarnation::random().unwrap(),
+                },
+                version: Version::current(),
+                socket_name: "test".into(),
+                settings: LinkSettings::default(),
+                state_dir: self.state_dir,
+                servers,
+                discovery: self.discovery,
+                trust: self.trust,
+            };
+            Fixture {
+                cluster: Cluster::new(options, weak),
+                _source: source,
+            }
+        }
+    }
+
+    fn id(text: &str) -> ServerId {
+        text.parse().unwrap()
+    }
+
+    fn found_on(server: ServerId, name: &str, address: &str) -> Candidate {
+        Candidate {
+            server: Some(server),
+            ..Candidate::new(name, address)
+        }
+    }
+
+    fn hello(id: ServerId, name: &str) -> Hello {
+        Hello {
+            id,
+            incarnation: Incarnation::random().unwrap(),
+            name: name.into(),
+            version: Version::current(),
+            peers: Vec::new(),
+            public_key: None,
+        }
+    }
+
+    fn peer_record(name: &str) -> Peer {
+        Peer {
+            name: name.into(),
+            version: None,
+            last_seen: None,
+            stopped: false,
+            state: None,
+        }
+    }
+
+    fn statuses(cluster: &Cluster) -> Vec<(String, DiscoveryStatus)> {
+        cluster
+            .discovery_view()
+            .into_iter()
+            .map(|view| (view.address, view.status))
+            .collect()
+    }
+
+    fn plan(cluster: &Cluster, address: &str) -> &'static str {
+        match cluster.dial_plan(address) {
+            DialPlan::Stop => "stop",
+            DialPlan::Wait => "wait",
+            DialPlan::Dial { .. } => "dial",
+        }
+    }
+
+    fn verify(cluster: &Cluster, address: &str, peer: ServerId) {
+        let mut members = cluster.members();
+        let target = members.targets.get_mut(address).unwrap();
+        target.verified = true;
+        target.peer = Some(peer);
+    }
+
+    async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + PATIENCE;
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_discovered_target_is_hidden_and_reports_why() {
+        let fixture = setup().build();
+        let cluster = &fixture.cluster;
+        let script = format!("echo '{}' >&2; exit 127", ssh::NOT_INSTALLED);
+        let address = format!("exec:sh -c {}", shell_words::quote(&script));
+
+        cluster.discovered(Via::Tailscale, vec![Candidate::new("phone", &address)]);
+
+        eventually("the bridge's last stderr line", || {
+            cluster
+                .discovery_view()
+                .first()
+                .is_some_and(|view| view.last_error.as_deref() == Some(ssh::NOT_INSTALLED))
+        })
+        .await;
+        assert_eq!(
+            cluster.discovery_view(),
+            vec![DiscoveryView {
+                via: Via::Tailscale,
+                name: "phone".into(),
+                address,
+                server: None,
+                status: DiscoveryStatus::Failing,
+                last_error: Some(ssh::NOT_INSTALLED.into()),
+            }]
+        );
+        assert!(cluster.view().is_empty());
+        assert!(cluster.gossip().is_empty());
+    }
+
+    #[tokio::test]
+    async fn discovered_tcp_targets_say_tcp_is_not_available_yet() {
+        let fixture = setup().build();
+        let cluster = &fixture.cluster;
+
+        cluster.discovered(
+            Via::Tailscale,
+            vec![Candidate::new("desk", "tcp://100.64.0.2:7447")],
+        );
+
+        eventually("the tcp error", || {
+            cluster
+                .discovery_view()
+                .first()
+                .is_some_and(|view| view.last_error.as_deref() == Some(TCP_UNAVAILABLE))
+        })
+        .await;
+        assert!(cluster.view().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unreached_address_that_leaves_its_source_is_dropped() {
+        let fixture = setup().build();
+        let cluster = &fixture.cluster;
+        let desk = Candidate::new("desk", "tcp://100.64.0.2:7447");
+        cluster.discovered(Via::Tailscale, vec![desk.clone()]);
+        cluster.discovered(Via::Lan, Vec::new());
+        assert_eq!(cluster.discovery_view().len(), 1);
+
+        cluster.discovered(Via::Tailscale, Vec::new());
+
+        assert!(cluster.discovery_view().is_empty());
+        assert!(cluster.members().targets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_peer_whose_discovered_targets_are_all_absent_is_not_dialed() {
+        let desk = id(DESK);
+        let fixture = setup().server("desk", "tcp://192.168.0.5:7447").build();
+        let cluster = &fixture.cluster;
+        let tailnet = "tcp://100.64.0.2:7447";
+        let lan = format!("lan://{desk}");
+        let gossiped = "tcp://desk.example:7447";
+        let configured = "tcp://192.168.0.5:7447";
+        let lan_candidate = Candidate {
+            endpoints: vec!["192.168.0.5:40000".parse().unwrap()],
+            ..found_on(desk, "desk", &lan)
+        };
+        cluster.discovered(Via::Tailscale, vec![found_on(desk, "desk", tailnet)]);
+        cluster.discovered(Via::Lan, vec![lan_candidate]);
+        verify(cluster, tailnet, desk);
+        verify(cluster, configured, desk);
+        cluster.learn(&[PeerAddress {
+            id: desk,
+            name: "desk-elsewhere".into(),
+            address: gossiped.into(),
+        }]);
+        assert_eq!(plan(cluster, gossiped), "dial");
+
+        cluster.discovered(Via::Tailscale, Vec::new());
+        assert_eq!(plan(cluster, gossiped), "dial");
+        assert_eq!(plan(cluster, tailnet), "wait");
+
+        cluster.discovered(Via::Lan, Vec::new());
+        assert_eq!(plan(cluster, gossiped), "wait");
+        assert_eq!(plan(cluster, configured), "dial");
+        assert_eq!(
+            statuses(cluster),
+            vec![(tailnet.to_owned(), DiscoveryStatus::Absent)]
+        );
+
+        cluster.discovered(Via::Tailscale, vec![found_on(desk, "desk", tailnet)]);
+        assert_eq!(plan(cluster, gossiped), "dial");
+        assert_eq!(plan(cluster, tailnet), "dial");
+    }
+
+    #[tokio::test]
+    async fn only_reachable_dialable_candidates_are_dialed() {
+        let desk = id(DESK);
+        let fixture = setup().build();
+        let cluster = &fixture.cluster;
+        let lan = format!("lan://{desk}");
+        let untrusted = format!("lan://{}", id(LAPTOP));
+        let pairing = Candidate {
+            dialable: false,
+            pairing: Some("k7".into()),
+            ..found_on(id(LAPTOP), "laptop", &untrusted)
+        };
+        cluster.discovered(Via::Lan, vec![found_on(desk, "desk", &lan), pairing]);
+
+        assert_eq!(plan(cluster, &lan), "wait");
+        assert_eq!(plan(cluster, &untrusted), "wait");
+        assert_eq!(
+            statuses(cluster),
+            vec![
+                (lan.clone(), DiscoveryStatus::Trying),
+                (untrusted.clone(), DiscoveryStatus::PairingOpen),
+            ]
+        );
+
+        let reachable = Candidate {
+            endpoints: vec!["192.168.0.5:40000".parse().unwrap()],
+            ..found_on(desk, "desk", &lan)
+        };
+        let not_paired = Candidate {
+            dialable: false,
+            ..found_on(id(LAPTOP), "laptop", &untrusted)
+        };
+        cluster.discovered(Via::Lan, vec![reachable, not_paired]);
+
+        match cluster.dial_plan(&lan) {
+            DialPlan::Dial {
+                connect,
+                max_backoff,
+            } => {
+                assert_eq!(connect, Connect::Tcp(vec!["192.168.0.5:40000".into()]));
+                assert_eq!(max_backoff, MAX_UNVERIFIED_BACKOFF);
+            }
+            _ => panic!("expected to dial {lan}"),
+        }
+        assert_eq!(plan(cluster, &untrusted), "wait");
+        assert_eq!(statuses(cluster)[1].1, DiscoveryStatus::NotPaired);
+    }
+
+    async fn woken(cluster: &Cluster, address: &str) -> bool {
+        let wake = Arc::clone(&cluster.members().targets[address].wake);
+        tokio::time::timeout(Duration::ZERO, wake.notified())
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_changed_candidate_wakes_every_target_of_its_peer() {
+        let desk = id(DESK);
+        let fixture = setup()
+            .server("desk", "tcp://10.0.0.1:7447")
+            .server("desk-too", "tcp://10.0.0.2:7447")
+            .build();
+        let cluster = &fixture.cluster;
+        verify(cluster, "tcp://10.0.0.1:7447", desk);
+        verify(cluster, "tcp://10.0.0.2:7447", desk);
+        let candidate = found_on(desk, "desk", "tcp://10.0.0.1:7447");
+
+        cluster.discovered(Via::Tailscale, vec![candidate.clone()]);
+        assert!(woken(cluster, "tcp://10.0.0.1:7447").await);
+        assert!(woken(cluster, "tcp://10.0.0.2:7447").await);
+
+        cluster.discovered(Via::Tailscale, vec![candidate.clone()]);
+        assert!(!woken(cluster, "tcp://10.0.0.1:7447").await);
+        assert!(!woken(cluster, "tcp://10.0.0.2:7447").await);
+
+        cluster.discovered(Via::Tailscale, Vec::new());
+        cluster.discovered(Via::Tailscale, vec![candidate]);
+        assert!(woken(cluster, "tcp://10.0.0.1:7447").await);
+    }
+
+    #[tokio::test]
+    async fn discovered_commands_never_start_a_server() {
+        let fixture = setup().server("desk", "exec:amux bridge").build();
+        let cluster = &fixture.cluster;
+        cluster.discovered(Via::Lan, vec![Candidate::new("desk", "exec:amux  bridge")]);
+
+        let command = |address: &str| match cluster.dial_plan(address) {
+            DialPlan::Dial {
+                connect: Connect::Command(argv),
+                ..
+            } => argv,
+            _ => panic!("expected a command for {address}"),
+        };
+        assert_eq!(command("exec:amux bridge"), ["amux", "bridge"]);
+        assert_eq!(
+            command("exec:amux  bridge"),
+            ["amux", "bridge", "--no-start"]
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_beats_discovered_beats_gossiped() {
+        let desk = id(DESK);
+        let fixture = setup().server("laptop", "tcp://10.0.0.1:7447").build();
+        let cluster = &fixture.cluster;
+        let gossip = |address: &str| PeerAddress {
+            id: desk,
+            name: "desk".into(),
+            address: address.into(),
+        };
+        cluster.learn(&[gossip("tcp://10.0.0.2:7447")]);
+
+        cluster.discovered(
+            Via::Tailscale,
+            vec![
+                Candidate::new("laptop-ts", "tcp://10.0.0.1:7447"),
+                Candidate::new("desk-ts", "tcp://10.0.0.2:7447"),
+            ],
+        );
+        cluster.learn(&[gossip("tcp://10.0.0.2:7447")]);
+
+        {
+            let members = cluster.members();
+            let laptop = &members.targets["tcp://10.0.0.1:7447"];
+            assert_eq!(laptop.configured_name(), Some("laptop"));
+            let desk = &members.targets["tcp://10.0.0.2:7447"];
+            assert!(
+                matches!(&desk.origin, Origin::Discovered { name, via: Via::Tailscale } if name == "desk-ts")
+            );
+        }
+        verify(cluster, "tcp://10.0.0.1:7447", id(LAPTOP));
+        verify(cluster, "tcp://10.0.0.2:7447", desk);
+        let gossiped: Vec<String> = cluster
+            .gossip()
+            .into_iter()
+            .map(|peer| peer.address)
+            .collect();
+        assert_eq!(gossiped, ["tcp://10.0.0.1:7447"]);
+        let names: Vec<String> = cluster
+            .discovery_view()
+            .into_iter()
+            .map(|view| view.name)
+            .collect();
+        assert_eq!(names, ["desk-ts", "laptop-ts"]);
+
+        cluster
+            .add_server(
+                "desk".into(),
+                ServerConfig {
+                    address: "tcp://10.0.0.2:7447".into(),
+                    amux_path: None,
+                    socket: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            cluster.members().targets["tcp://10.0.0.2:7447"].configured_name(),
+            Some("desk")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_with_a_hello_verifies_the_address_but_a_self_dial_does_not() {
+        let fixture = setup().build();
+        let cluster = &fixture.cluster;
+        let addresses = ["tcp://10.0.0.1:1", "tcp://10.0.0.2:1", "tcp://10.0.0.3:1"];
+        let candidates = addresses
+            .iter()
+            .map(|address| Candidate::new("x", *address))
+            .collect();
+        cluster.discovered(Via::Tailscale, candidates);
+        let own = cluster.hello();
+
+        cluster.target_refused(
+            addresses[0],
+            Refusal::Duplicate,
+            Some(&hello(id(DESK), "desk")),
+        );
+        cluster.target_refused(
+            addresses[1],
+            Refusal::NameTaken,
+            Some(&hello(id(LAPTOP), "x")),
+        );
+        cluster.target_refused(addresses[2], Refusal::SelfDial, Some(&own));
+
+        let members = cluster.members();
+        let target = |address: &str| &members.targets[address];
+        assert!(target(addresses[0]).verified);
+        assert_eq!(target(addresses[0]).peer, Some(id(DESK)));
+        assert!(target(addresses[1]).verified);
+        assert_eq!(
+            target(addresses[1]).last_error.as_deref(),
+            Some(Refusal::NameTaken.to_string().as_str())
+        );
+        assert!(!target(addresses[2]).verified);
+        assert!(target(addresses[2]).is_self);
+    }
+
+    #[tokio::test]
+    async fn forgotten_servers_are_refused_and_never_learned_or_discovered() {
+        let desk = id(DESK);
+        let mut trust = TrustStore::default();
+        trust.forget(desk, Some(PublicKey([4; 32])));
+        let fixture = Setup { trust, ..setup() }.build();
+        let cluster = &fixture.cluster;
+
+        cluster.learn(&[PeerAddress {
+            id: desk,
+            name: "desk".into(),
+            address: "tcp://10.0.0.2:7447".into(),
+        }]);
+        cluster.discovered(
+            Via::Lan,
+            vec![
+                found_on(desk, "desk", &format!("lan://{desk}")),
+                Candidate {
+                    key: Some(PublicKey([4; 32])),
+                    ..Candidate::new("desk-again", "tcp://10.0.0.3:7447")
+                },
+            ],
+        );
+
+        assert!(cluster.members().targets.is_empty());
+        assert_eq!(
+            cluster.check(&hello(desk, "desk"), &TransportAuth::Ssh),
+            Err(Refusal::Forgotten)
+        );
+        let rekeyed = TransportAuth::Noise {
+            key: PublicKey([4; 32]),
+            vouched_by: Voucher::Nobody,
+        };
+        assert_eq!(
+            cluster.check(&hello(id(LAPTOP), "laptop"), &rekeyed),
+            Err(Refusal::Forgotten)
+        );
+        assert_eq!(
+            cluster.check(&hello(id(LAPTOP), "laptop"), &TransportAuth::Ssh),
+            Ok(())
+        );
+    }
+
+    #[tokio::test]
+    async fn forgetting_drops_every_target_and_the_peer_record() {
+        let desk = id(DESK);
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Setup {
+            state_dir: Some(dir.path().to_owned()),
+            ..setup().server("desk", "tcp://192.168.0.5:7447")
+        }
+        .build();
+        let cluster = &fixture.cluster;
+        cluster.discovered(
+            Via::Tailscale,
+            vec![found_on(desk, "desk-ts", "tcp://100.64.0.2:7447")],
+        );
+        cluster.learn(&[PeerAddress {
+            id: desk,
+            name: "desk".into(),
+            address: "tcp://desk.example:7447".into(),
+        }]);
+        verify(cluster, "tcp://192.168.0.5:7447", desk);
+        cluster.members().peers.insert(desk, peer_record("desk"));
+        assert!(cluster.forget("here").is_err());
+        assert!(cluster.forget("nobody").is_err());
+
+        let forgotten = cluster.forget("desk").unwrap();
+
+        assert_eq!(
+            forgotten,
+            Forgotten {
+                name: "desk".into(),
+                id: Some(desk),
+                configured: vec!["desk".into()],
+            }
+        );
+        assert!(cluster.members().targets.is_empty());
+        assert!(cluster.view().is_empty());
+        let saved = TrustStore::load(&dir.path().join(TRUST_FILE)).unwrap();
+        assert!(saved.is_forgotten(desk, None));
+    }
+
+    #[tokio::test]
+    async fn a_server_that_was_never_reached_can_be_forgotten_by_its_configured_name() {
+        let fixture = setup().server("nowhere", "tcp://192.0.2.1:7447").build();
+        let cluster = &fixture.cluster;
+
+        let forgotten = cluster.forget("nowhere").unwrap();
+
+        assert_eq!(forgotten.id, None);
+        assert_eq!(forgotten.configured, ["nowhere"]);
+        assert!(cluster.members().trust.forgotten.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cached_discovered_targets_load_absent_and_only_if_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        let target = |address: &str, via: Via, verified: bool, is_self: bool| CachedTarget {
+            address: address.into(),
+            peer: Some(id(DESK)),
+            origin: CachedOrigin::Discovered {
+                name: "desk".into(),
+                via,
+            },
+            verified,
+            last_seen: now,
+            is_self,
+            last_error: Some("connection refused".into()),
+        };
+        let cached = Cache {
+            peers: BTreeMap::from([(id(DESK), peer_record("desk"))]),
+            targets: vec![
+                target("tcp://100.64.0.2:7447", Via::Tailscale, true, false),
+                target("tcp://100.64.0.3:7447", Via::Tailscale, false, false),
+                target("tcp://100.64.0.4:7447", Via::Tailscale, false, true),
+                target(
+                    "lan://000000000000000000000000000000d5",
+                    Via::Lan,
+                    true,
+                    false,
+                ),
+            ],
+        };
+        cache::write(&dir.path().join(CACHE_FILE), &cached).unwrap();
+
+        let fixture = Setup {
+            state_dir: Some(dir.path().to_owned()),
+            discovery: DiscoveryConfig {
+                lan: false,
+                ..DiscoveryConfig::default()
+            },
+            ..setup()
+        }
+        .build();
+
+        let members = fixture.cluster.members();
+        let addresses: Vec<&str> = members.targets.keys().map(String::as_str).collect();
+        assert_eq!(
+            addresses,
+            ["tcp://100.64.0.2:7447", "tcp://100.64.0.4:7447"]
+        );
+        let kept = &members.targets["tcp://100.64.0.2:7447"];
+        assert!(kept.is_absent());
+        assert_eq!(kept.last_error.as_deref(), Some("connection refused"));
+        assert!(members.targets["tcp://100.64.0.4:7447"].is_self);
+        assert!(members.is_absent(id(DESK)));
+    }
 }

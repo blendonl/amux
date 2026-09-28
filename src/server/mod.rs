@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::os::unix::net::UnixStream as StdUnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Instant, SystemTime};
 
@@ -24,8 +24,11 @@ use tokio::sync::{broadcast, Notify};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::cluster::{Cluster, ClusterOptions, LinkSettings, StateSource};
-use crate::config::{Config, Incarnation, ServerId, ServerIdentity};
+use crate::cluster::{
+    Cluster, ClusterOptions, LinkSettings, StateSource, TransportAuth, TrustStore, TRUST_FILE,
+};
+use crate::config::{self, Config, Incarnation, ServerId, ServerIdentity};
+use crate::discovery::{Discovery, DiscoveryOptions};
 use crate::paths;
 use crate::project::Registry;
 use crate::protocol::{
@@ -72,18 +75,37 @@ pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
         "project registry loaded"
     );
 
+    let trust = TrustStore::load(&state_dir.join(TRUST_FILE))?;
     let listener = bind(socket)?;
     let mut terminate = signal(SignalKind::terminate())?;
+    let socket_name = paths::socket_name(socket)?;
+    let discovery = DiscoveryOptions {
+        config: config.discovery.clone(),
+        lan: config.lan.clone(),
+        socket_name: socket_name.clone(),
+        state_dir: Some(state_dir.clone()),
+    };
     let options = ClusterOptions {
         identity: identity.clone(),
         version: Version::current(),
-        socket_name: paths::socket_name(socket)?,
+        socket_name,
         settings: LinkSettings::from_env()?,
         state_dir: Some(state_dir),
         servers: config.servers.clone(),
+        discovery: config.discovery.clone(),
+        trust,
     };
-    let server = Server::new(identity, config, Settings::default(), registry, options);
+    let server = Server::new(
+        identity,
+        config,
+        Settings::default(),
+        config_path,
+        registry,
+        options,
+        discovery,
+    );
     server.cluster.start();
+    server.discovery.start();
     info!(socket = %socket.display(), version = %Version::current(), "server started");
 
     loop {
@@ -104,6 +126,7 @@ pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
         }
     }
 
+    server.discovery.stop().await;
     server.cluster.shutdown().await;
     server.state().sessions.clear();
     if let Err(err) = fs::remove_file(socket) {
@@ -120,7 +143,12 @@ async fn serve(server: Arc<Server>, mut stream: UnixStream) -> Result<()> {
         Some(Role::Client) => {
             connection::handle(server, protocol::duplex(reader, writer), Origin::Local).await
         }
-        Some(Role::Peer) => server.cluster.accept(reader, writer).await,
+        Some(Role::Peer) => {
+            server
+                .cluster
+                .accept(reader, writer, TransportAuth::Ssh)
+                .await
+        }
         None => Ok(()),
     }
 }
@@ -134,9 +162,11 @@ pub struct Server {
     identity: ServerIdentity,
     config: Config,
     settings: Arc<Settings>,
+    config_path: PathBuf,
     state: Mutex<LocalState>,
     events: broadcast::Sender<Event>,
     cluster: Arc<Cluster>,
+    discovery: Discovery,
     projects: Projects,
     shutdown: Notify,
 }
@@ -169,8 +199,10 @@ impl Server {
         identity: ServerIdentity,
         config: Config,
         settings: Settings,
+        config_path: PathBuf,
         registry: Registry,
         options: ClusterOptions,
+        discovery: DiscoveryOptions,
     ) -> Arc<Self> {
         let state = LocalState {
             projects: projects::checkouts(&registry),
@@ -178,13 +210,16 @@ impl Server {
         };
         Arc::new_cyclic(|server: &Weak<Self>| {
             let source: Weak<dyn StateSource> = server.clone();
+            let cluster = Cluster::new(options, source);
             Self {
                 identity,
                 config,
                 settings: Arc::new(settings),
+                config_path,
                 state: Mutex::new(state),
                 events: broadcast::channel(EVENT_CAPACITY).0,
-                cluster: Cluster::new(options, source),
+                discovery: Discovery::new(Arc::clone(&cluster), discovery),
+                cluster,
                 projects: Projects::new(registry),
                 shutdown: Notify::new(),
             }
@@ -201,6 +236,36 @@ impl Server {
 
     pub fn cluster(&self) -> &Arc<Cluster> {
         &self.cluster
+    }
+
+    pub fn discovery(&self) -> &Discovery {
+        &self.discovery
+    }
+
+    async fn forget_server(&self, server: &str) -> Result<()> {
+        let forgotten = self.cluster.forget(server)?;
+        if forgotten.configured.is_empty() {
+            return Ok(());
+        }
+        let path = self.config_path.clone();
+        let names = forgotten.configured.clone();
+        blocking(move || {
+            let config = Config::load(&path)?;
+            for name in names
+                .iter()
+                .filter(|name| config.servers.contains_key(*name))
+            {
+                config::remove_server(&path, name)?;
+            }
+            Ok(())
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "forgot {}, but removing it from the config failed",
+                forgotten.name
+            )
+        })
     }
 
     fn incarnation(&self) -> Incarnation {

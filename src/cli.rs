@@ -80,8 +80,18 @@ pub enum Command {
     #[command(subcommand, about = "Register projects with this server")]
     Project(ProjectAction),
 
-    #[command(about = "List the servers in the cluster, or add and remove them")]
+    #[command(about = "List the servers in the cluster, or add, remove and forget them")]
     Servers(ServersArgs),
+
+    #[command(
+        about = "List the servers that Tailscale and the LAN found, and how linking them goes"
+    )]
+    Discover,
+
+    #[command(
+        about = "Pair with a server on the LAN: run it without a code on one machine, then with the code it prints on the other"
+    )]
+    Pair(PairArgs),
 
     #[command(about = "Stop the server and every session it owns")]
     KillServer,
@@ -219,6 +229,14 @@ pub enum ServersAction {
         #[arg(help = "Name of the server in the config")]
         name: String,
     },
+
+    #[command(
+        about = "Forget a server: drop its link and addresses, remove it from the config and refuse it from now on"
+    )]
+    Forget {
+        #[arg(help = "Name or id of the server")]
+        server: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -240,6 +258,26 @@ pub struct AddServerArgs {
         help = "Socket name of the server on that machine, defaults to this server's"
     )]
     pub socket: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct PairArgs {
+    #[arg(help = "The code that `amux pair` printed on the other machine")]
+    pub code: Option<String>,
+
+    #[arg(
+        long,
+        requires = "code",
+        value_name = "HOST[:PORT]",
+        help = "Address of the other machine, for when multicast does not reach it"
+    )]
+    pub host: Option<String>,
+
+    #[arg(
+        long,
+        help = "Give this server a new key first, so that a server that was forgotten can pair again"
+    )]
+    pub new_key: bool,
 }
 
 #[derive(Debug, Args)]

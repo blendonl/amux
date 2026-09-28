@@ -13,7 +13,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
 
 use super::channel::Channels;
-use super::{Cluster, LinkGuard, Rejection, StateSource};
+use super::{Cluster, LinkGuard, Rejection, StateSource, TransportAuth};
 use crate::config::ServerId;
 use crate::protocol::{
     self, read_frame, write_message, Farewell, Hello, IncompatibleServer, PeerMessage, Refusal,
@@ -134,7 +134,12 @@ fn new_lanes() -> (LinkHandle, Lanes) {
     (handle, lanes)
 }
 
-pub async fn dial<R, W>(cluster: &Arc<Cluster>, reader: R, writer: W) -> Result<Handshake<R, W>>
+pub async fn dial<R, W>(
+    cluster: &Arc<Cluster>,
+    reader: R,
+    writer: W,
+    auth: TransportAuth,
+) -> Result<Handshake<R, W>>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -153,15 +158,20 @@ where
         };
     }
     let (reader, writer) = stream.into_inner();
-    exchange(cluster, reader, writer, true).await
+    exchange(cluster, reader, writer, true, auth).await
 }
 
-pub async fn accept<R, W>(cluster: &Arc<Cluster>, reader: R, writer: W) -> Result<Handshake<R, W>>
+pub async fn accept<R, W>(
+    cluster: &Arc<Cluster>,
+    reader: R,
+    writer: W,
+    auth: TransportAuth,
+) -> Result<Handshake<R, W>>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    exchange(cluster, reader, writer, false).await
+    exchange(cluster, reader, writer, false, auth).await
 }
 
 async fn exchange<R, W>(
@@ -169,6 +179,7 @@ async fn exchange<R, W>(
     mut reader: R,
     mut writer: W,
     dialed: bool,
+    auth: TransportAuth,
 ) -> Result<Handshake<R, W>>
 where
     R: AsyncRead + Unpin,
@@ -182,7 +193,7 @@ where
         other => bail!("expected a hello, got {other:?}"),
     };
 
-    if let Err(reason) = cluster.check(&peer) {
+    if let Err(reason) = cluster.check(&peer, &auth) {
         let _ = write_message(&mut writer, &PeerMessage::Refused(reason)).await;
         return Ok(Handshake::Refused {
             reason,
@@ -197,7 +208,7 @@ where
             return Ok(outcome);
         }
         cluster
-            .decide(&peer, dialed, handle)
+            .decide(&peer, dialed, handle, &auth)
             .map(|(guard, generation)| (guard, Some(generation)))
     } else {
         let generation = cluster.next_generation();
@@ -209,7 +220,7 @@ where
             other => bail!("expected the link verdict, got {other:?}"),
         };
         cluster
-            .adopt(&peer, dialed, generation, handle)
+            .adopt(&peer, dialed, generation, handle, &auth)
             .map(|guard| (guard, None))
     };
 
@@ -468,6 +479,15 @@ where
                 channels.closed(id, from_opener);
                 true
             }
+            PeerMessage::Trust(update) => {
+                debug!(
+                    %peer,
+                    trusted = update.trusted.len(),
+                    forgotten = update.forgotten.len(),
+                    "ignoring a trust update"
+                );
+                true
+            }
             other => {
                 warn!(%peer, "ignoring {other:?} on an established link");
                 true
@@ -593,8 +613,8 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::*;
-    use crate::cluster::{Channel, ChannelEnd, ClusterOptions, CREDIT_WINDOW};
-    use crate::config::{Incarnation, ServerIdentity};
+    use crate::cluster::{Channel, ChannelEnd, ClusterOptions, TrustStore, CREDIT_WINDOW};
+    use crate::config::{DiscoveryConfig, Incarnation, ServerIdentity};
     use crate::protocol::{
         ClientMessage, Duplex, Event, ServerMessage, ServerState, ServerStatus, SessionId,
         SessionInfo, Snapshot, StateEvent, Version, WindowSummary, PROTOCOL_MAJOR,
@@ -705,6 +725,8 @@ mod tests {
                 settings: self.settings,
                 state_dir: None,
                 servers: BTreeMap::new(),
+                discovery: DiscoveryConfig::default(),
+                trust: TrustStore::default(),
             };
             Node {
                 cluster: Cluster::new(options, weak),
@@ -754,7 +776,9 @@ mod tests {
                 .unwrap();
             assert_eq!(role, Some(Role::Peer));
             let (reader, writer) = split(stream);
-            accept(&acceptor, reader, writer).await.unwrap()
+            accept(&acceptor, reader, writer, TransportAuth::Ssh)
+                .await
+                .unwrap()
         })
     }
 
@@ -762,7 +786,9 @@ mod tests {
         let (dial_end, accept_end) = duplex(PIPE_CAPACITY);
         let accepted = accepting(&acceptor.cluster, accept_end);
         let (reader, writer) = split(dial_end);
-        let dialed = dial(&dialer.cluster, reader, writer).await.unwrap();
+        let dialed = dial(&dialer.cluster, reader, writer, TransportAuth::Ssh)
+            .await
+            .unwrap();
         (dialed, accepted.await.unwrap())
     }
 
@@ -827,6 +853,7 @@ mod tests {
             name: name.into(),
             version,
             peers: Vec::new(),
+            public_key: None,
         })
     }
 
@@ -894,7 +921,10 @@ mod tests {
         });
 
         let (reader, writer) = split(dial_end);
-        match dial(&dialer.cluster, reader, writer).await.unwrap() {
+        match dial(&dialer.cluster, reader, writer, TransportAuth::Ssh)
+            .await
+            .unwrap()
+        {
             Handshake::Incompatible(welcome) => {
                 assert_eq!(welcome.server_name, "current");
                 assert_eq!(welcome.version, Version::current());
@@ -1032,10 +1062,15 @@ mod tests {
         let higher = node(HIGHER, "high").build();
         let hello = lower.cluster.hello();
 
+        let ssh = TransportAuth::Ssh;
         let (handle, _newer_lanes) = new_lanes();
-        let _newer = higher.cluster.adopt(&hello, false, 7, handle).ok().unwrap();
+        let _newer = higher
+            .cluster
+            .adopt(&hello, false, 7, handle, &ssh)
+            .ok()
+            .unwrap();
         let (handle, _stale_lanes) = new_lanes();
-        let stale = higher.cluster.adopt(&hello, true, 3, handle);
+        let stale = higher.cluster.adopt(&hello, true, 3, handle, &ssh);
 
         assert!(matches!(stale, Err(Rejection::Refused(Refusal::Duplicate))));
         assert_eq!(
@@ -1087,11 +1122,15 @@ mod tests {
                     .await
                     .unwrap();
                 let (reader, writer) = split(stream);
-                accept(&lower, reader, writer).await.map(|_| ())
+                accept(&lower, reader, writer, TransportAuth::Ssh)
+                    .await
+                    .map(|_| ())
             }
         });
         let (reader, writer) = split(dial_end);
-        let outcome = dial(&higher.cluster, reader, writer).await.unwrap();
+        let outcome = dial(&higher.cluster, reader, writer, TransportAuth::Ssh)
+            .await
+            .unwrap();
 
         assert!(matches!(outcome, Handshake::Stopping(Some(_))));
         assert!(refused.await.unwrap().is_err());

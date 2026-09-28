@@ -21,7 +21,7 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use crate::cli::{Grouping, NewArgs};
-use crate::cluster::ssh::Address;
+use crate::cluster::Address;
 use crate::config::{self, ServerConfig};
 use crate::paths;
 use crate::project::{self, Detected};
@@ -232,6 +232,66 @@ pub async fn remove_server(endpoint: &Endpoint, name: String) -> Result<()> {
     notify_running_server(endpoint, ClientMessage::RemoveServer { name }).await
 }
 
+pub async fn forget_server(endpoint: &Endpoint, server: String) -> Result<()> {
+    let connection = handshake(connect_or_start_server(endpoint).await?).await?;
+    expect_done(request_reply(connection, ClientMessage::ForgetServer { name: server }).await?)
+}
+
+pub async fn discover(endpoint: &Endpoint) -> Result<()> {
+    let server = connect(&endpoint.socket).await?;
+    match request_reply(server, ClientMessage::Discover).await? {
+        ServerMessage::Discovery(report) => {
+            print!("{}", listing::discovery(&report));
+            Ok(())
+        }
+        other => bail!("unexpected reply from server: {other:?}"),
+    }
+}
+
+pub async fn pair(
+    endpoint: &Endpoint,
+    code: Option<String>,
+    host: Option<String>,
+    new_key: bool,
+) -> Result<()> {
+    let request = match code {
+        Some(code) => ClientMessage::JoinPairing {
+            code,
+            host,
+            new_key,
+        },
+        None => ClientMessage::OpenPairing { new_key },
+    };
+    let Duplex {
+        mut incoming,
+        outgoing,
+    } = handshake(connect_or_start_server(endpoint).await?).await?;
+    send(&outgoing, request).await?;
+    loop {
+        match incoming.recv().await {
+            Some(ServerMessage::PairingOpen {
+                code,
+                expires_in_secs,
+            }) => println!(
+                "pairing code {code}, valid for {}; run `amux pair {code}` on the other machine",
+                listing::duration(expires_in_secs)
+            ),
+            Some(ServerMessage::Paired {
+                name,
+                id,
+                fingerprint,
+            }) => {
+                println!("paired with {name} ({id}), key {fingerprint}");
+                return Ok(());
+            }
+            Some(ServerMessage::PairingClosed { reason }) => bail!(reason),
+            Some(ServerMessage::Error(message)) => bail!(message),
+            Some(other) => bail!("unexpected reply from server: {other:?}"),
+            None => bail!("server closed the connection"),
+        }
+    }
+}
+
 pub async fn debug_links(endpoint: &Endpoint) -> Result<()> {
     let server = connect(&endpoint.socket).await?;
     let ServerMessage::Links(links) =
@@ -242,8 +302,8 @@ pub async fn debug_links(endpoint: &Endpoint) -> Result<()> {
     for link in links {
         let direction = if link.dialed { "dialed" } else { "accepted" };
         println!(
-            "{} {} {direction} {} {}",
-            link.peer, link.name, link.incarnation, link.state
+            "{} {} {direction} {} {} {}",
+            link.peer, link.name, link.incarnation, link.state, link.transport
         );
     }
     Ok(())

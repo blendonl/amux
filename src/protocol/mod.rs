@@ -1,5 +1,6 @@
 mod client;
 mod greeting;
+mod key;
 mod peer;
 
 use std::io;
@@ -13,17 +14,19 @@ use tracing::{debug, warn};
 
 pub use client::{
     is_locale_variable, AttachedSession, ClientMessage, ClusterStatus, DebugCommand, Direction,
-    LinkInfo, LinkState, NewSession, ProjectCheckout, ProjectRef, ServerMessage, ServerStatus,
-    ServerView, SessionCommand, SessionId, SessionInfo, SessionState, Size, Split, WindowSummary,
-    MIN_COLS, MIN_ROWS,
+    DiscoveryReport, DiscoveryStatus, DiscoveryView, LinkInfo, LinkState, LinkTransport,
+    NewSession, ProjectCheckout, ProjectRef, ServerMessage, ServerStatus, ServerView,
+    SessionCommand, SessionId, SessionInfo, SessionState, Size, SourceState, SourceView, Split,
+    Via, WindowSummary, MIN_COLS, MIN_ROWS,
 };
 pub use greeting::{
     accept, greet, Greeting, IncompatibleServer, Role, Version, Welcome, MAGIC, PROTOCOL_MAJOR,
     PROTOCOL_MINOR, RELEASE,
 };
+pub use key::{PublicKey, PUBLIC_KEY_LEN};
 pub use peer::{
-    ChannelId, Event, Farewell, Hello, PeerAddress, PeerMessage, Refusal, ServerState, Snapshot,
-    StateEvent,
+    ChannelId, Event, Farewell, ForgottenPeer, Hello, PeerAddress, PeerMessage, Refusal,
+    ServerState, Snapshot, StateEvent, TrustUpdate, TrustedPeer,
 };
 
 const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
@@ -183,6 +186,16 @@ mod tests {
             ClientMessage::Command(SessionCommand::RenameWindow("logs".into())),
             ClientMessage::Input(b"ls\r".to_vec()),
             ClientMessage::Detach,
+            ClientMessage::Discover,
+            ClientMessage::ForgetServer {
+                name: "laptop".into(),
+            },
+            ClientMessage::OpenPairing { new_key: true },
+            ClientMessage::JoinPairing {
+                code: "k7-4821-9930".into(),
+                host: Some("192.168.0.10".into()),
+                new_key: false,
+            },
         ];
 
         for message in &sent {
@@ -216,6 +229,56 @@ mod tests {
                 latency: Some(std::time::Duration::from_millis(12)),
                 offline: vec!["home-server".into()],
             }),
+        ];
+        for message in &sent {
+            write_message(&mut server, message).await.unwrap();
+        }
+        drop(server);
+
+        let mut received = Vec::new();
+        while let Some(message) = read_message::<_, ServerMessage>(&mut client).await.unwrap() {
+            received.push(message);
+        }
+        assert_eq!(received, sent);
+    }
+
+    #[tokio::test]
+    async fn discovery_and_pairing_replies_survive_a_round_trip() {
+        let (mut server, mut client) = byte_pipe(1024);
+        let id = crate::config::ServerId::random().unwrap();
+        let sent = vec![
+            ServerMessage::Discovery(DiscoveryReport {
+                sources: vec![
+                    SourceView {
+                        via: Via::Tailscale,
+                        state: SourceState::Unavailable("tailscale is not installed".into()),
+                    },
+                    SourceView {
+                        via: Via::Lan,
+                        state: SourceState::Running,
+                    },
+                ],
+                peers: vec![DiscoveryView {
+                    via: Via::Lan,
+                    name: "laptop".into(),
+                    address: format!("lan://{id}"),
+                    server: Some(id),
+                    status: DiscoveryStatus::Failing,
+                    last_error: Some("connection refused".into()),
+                }],
+            }),
+            ServerMessage::PairingOpen {
+                code: "k7-4821-9930".into(),
+                expires_in_secs: 300,
+            },
+            ServerMessage::Paired {
+                name: "laptop".into(),
+                id,
+                fingerprint: PublicKey([3; PUBLIC_KEY_LEN]).fingerprint(),
+            },
+            ServerMessage::PairingClosed {
+                reason: "the code expired".into(),
+            },
         ];
         for message in &sent {
             write_message(&mut server, message).await.unwrap();

@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use toml_edit::{DocumentMut, Item, Table};
 
 use crate::paths;
@@ -24,6 +25,8 @@ pub struct Config {
     pub projects_dir: PathBuf,
     pub servers: BTreeMap<String, ServerConfig>,
     pub projects: BTreeMap<String, ProjectConfig>,
+    pub discovery: DiscoveryConfig,
+    pub lan: LanConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +44,30 @@ pub struct ProjectConfig {
     pub worktrees_dir: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DiscoveryConfig {
+    pub tailscale: bool,
+    pub lan: bool,
+    pub tailscale_tags: Vec<String>,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            tailscale: true,
+            lan: true,
+            tailscale_tags: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LanConfig {
+    pub port: u16,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
@@ -50,6 +77,10 @@ struct ConfigFile {
     servers: BTreeMap<String, ServerConfig>,
     #[serde(default)]
     projects: BTreeMap<String, ProjectConfig>,
+    #[serde(default)]
+    discovery: DiscoveryConfig,
+    #[serde(default)]
+    lan: LanConfig,
 }
 
 impl Config {
@@ -88,6 +119,8 @@ impl Config {
             projects_dir: expand_home(projects_dir, home),
             servers: file.servers,
             projects,
+            discovery: file.discovery,
+            lan: file.lan,
         })
     }
 }
@@ -167,7 +200,7 @@ impl ServerIdentity {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ServerId(u128);
 
 impl ServerId {
@@ -223,6 +256,27 @@ impl FromStr for ServerId {
             bail!("{text:?} is not a {SERVER_ID_HEX_DIGITS} digit hex server id");
         }
         Ok(Self(u128::from_str_radix(text, 16)?))
+    }
+}
+
+impl Serialize for ServerId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            serializer.collect_str(self)
+        } else {
+            self.0.serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ServerId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            let text = String::deserialize(deserializer)?;
+            text.parse().map_err(D::Error::custom)
+        } else {
+            u128::deserialize(deserializer).map(Self)
+        }
     }
 }
 
@@ -290,8 +344,39 @@ mod tests {
                 projects_dir: PathBuf::from("/home/tester/projects"),
                 servers: BTreeMap::new(),
                 projects: BTreeMap::new(),
+                discovery: DiscoveryConfig {
+                    tailscale: true,
+                    lan: true,
+                    tailscale_tags: Vec::new(),
+                },
+                lan: LanConfig { port: 0 },
             }
         );
+    }
+
+    #[test]
+    fn discovery_sources_can_be_turned_off_and_tuned() {
+        let config = parse(
+            r#"
+            [discovery]
+            tailscale = false
+            tailscale_tags = ["tag:amux"]
+
+            [lan]
+            port = 7448
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.discovery,
+            DiscoveryConfig {
+                tailscale: false,
+                lan: true,
+                tailscale_tags: vec!["tag:amux".into()],
+            }
+        );
+        assert_eq!(config.lan, LanConfig { port: 7448 });
     }
 
     #[test]
@@ -360,6 +445,8 @@ mod tests {
         assert!(parse("prefix = \"C-a\"").is_err());
         assert!(parse("[servers.laptop]\naddress = \"ssh://laptop\"\nport = 22").is_err());
         assert!(parse("[projects.amux]\nbranch = \"main\"").is_err());
+        assert!(parse("[discovery]\nmdns = true").is_err());
+        assert!(parse("[lan]\naddress = \"0.0.0.0\"").is_err());
     }
 
     #[test]
@@ -480,6 +567,19 @@ mod tests {
 
         assert!(add_server(&path, "laptop", &laptop()).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "servers = 3\n");
+    }
+
+    #[test]
+    fn server_ids_are_a_number_on_the_wire_and_hex_in_text() {
+        let id: ServerId = "0123456789abcdef0123456789abcdef".parse().unwrap();
+        let wire = postcard::to_stdvec(&id).unwrap();
+        assert_eq!(wire, postcard::to_stdvec(&id.0).unwrap());
+        assert_eq!(postcard::from_bytes::<ServerId>(&wire).unwrap(), id);
+
+        let text = serde_json::to_string(&id).unwrap();
+        assert_eq!(text, "\"0123456789abcdef0123456789abcdef\"");
+        assert_eq!(serde_json::from_str::<ServerId>(&text).unwrap(), id);
+        assert!(serde_json::from_str::<ServerId>("\"nope\"").is_err());
     }
 
     #[test]

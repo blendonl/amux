@@ -1,140 +1,104 @@
+use std::env;
 use std::process::{self, Stdio};
-use std::str::FromStr;
+use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::client::{self, Endpoint};
 
-const SSH_SCHEME: &str = "ssh://";
-const EXEC_SCHEME: &str = "exec:";
-const DEFAULT_AMUX_PATH: &str = "amux";
+pub const BRIDGE_EXIT_GRACE: Duration = Duration::from_secs(2);
+pub const NOT_INSTALLED: &str = "amux is not installed on this machine";
+const SSH_ENV: &str = "AMUX_SSH";
+const DEFAULT_SSH: &str = "ssh";
 const BRIDGE_COMMAND: &str = "bridge";
 const NO_START_FLAG: &str = "--no-start";
 const SSH_OPTIONS: [&str; 5] = ["-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15"];
+const AMUX_LOCATIONS: [&str; 4] = [
+    "\"$HOME/.cargo/bin/amux\"",
+    "\"$HOME/.local/bin/amux\"",
+    "/usr/local/bin/amux",
+    "/opt/homebrew/bin/amux",
+];
+const NOT_INSTALLED_STATUS: u8 = 127;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Address {
-    Ssh {
-        user: Option<String>,
-        host: String,
-        port: Option<u16>,
-    },
-    Exec(Vec<String>),
-}
-
-impl FromStr for Address {
-    type Err = anyhow::Error;
-
-    fn from_str(text: &str) -> Result<Self> {
-        if let Some(rest) = text.strip_prefix(SSH_SCHEME) {
-            return parse_ssh(rest).with_context(|| format!("parsing the address {text:?}"));
-        }
-        if let Some(command) = text.strip_prefix(EXEC_SCHEME) {
-            let argv = shell_words::split(command)
-                .with_context(|| format!("splitting the address {text:?}"))?;
-            if argv.is_empty() {
-                bail!("the address {text:?} names no command");
+pub fn command(
+    user: Option<&str>,
+    host: &str,
+    port: Option<u16>,
+    amux_path: Option<&str>,
+    socket: &str,
+    no_start: bool,
+) -> Vec<String> {
+    let mut argv = vec![program()];
+    argv.extend(SSH_OPTIONS.map(str::to_owned));
+    if let Some(port) = port {
+        argv.extend(["-p".to_owned(), port.to_string()]);
+    }
+    argv.push(match user {
+        Some(user) => format!("{user}@{host}"),
+        None => host.to_owned(),
+    });
+    match amux_path {
+        Some(amux_path) => {
+            argv.extend([
+                amux_path.to_owned(),
+                "-L".to_owned(),
+                shell_words::quote(socket).into_owned(),
+                BRIDGE_COMMAND.to_owned(),
+            ]);
+            if no_start {
+                argv.push(NO_START_FLAG.to_owned());
             }
-            return Ok(Self::Exec(argv));
         }
-        bail!("{text:?} is neither an ssh://[user@]host[:port] nor an exec:<command> address")
+        None => argv.push(format!(
+            "sh -c {}",
+            shell_words::quote(&probe(socket, no_start))
+        )),
     }
+    argv
 }
 
-impl Address {
-    pub fn bridge_command(
-        &self,
-        amux_path: Option<&str>,
-        socket: &str,
-        no_start: bool,
-    ) -> Vec<String> {
-        let mut argv = match self {
-            Self::Ssh { user, host, port } => {
-                let mut argv: Vec<String> = ["ssh"]
-                    .into_iter()
-                    .chain(SSH_OPTIONS)
-                    .map(str::to_owned)
-                    .collect();
-                if let Some(port) = port {
-                    argv.extend(["-p".to_owned(), port.to_string()]);
-                }
-                argv.push(match user {
-                    Some(user) => format!("{user}@{host}"),
-                    None => host.clone(),
-                });
-                argv.extend([
-                    amux_path.unwrap_or(DEFAULT_AMUX_PATH).to_owned(),
-                    "-L".to_owned(),
-                    shell_words::quote(socket).into_owned(),
-                    BRIDGE_COMMAND.to_owned(),
-                ]);
-                argv
-            }
-            Self::Exec(argv) => argv.clone(),
-        };
-        if no_start {
-            argv.push(NO_START_FLAG.to_owned());
-        }
-        argv
+pub fn exec(argv: &[String], no_start: bool) -> Vec<String> {
+    let mut argv = argv.to_vec();
+    if no_start {
+        argv.push(NO_START_FLAG.to_owned());
     }
+    argv
 }
 
-fn parse_ssh(text: &str) -> Result<Address> {
-    let (user, host_and_port) = match text.split_once('@') {
-        Some((user, rest)) => (Some(user), rest),
-        None => (None, text),
-    };
-    let (host, port) = match host_and_port.strip_prefix('[') {
-        Some(bracketed) => {
-            let (host, rest) = bracketed.split_once(']').context("missing `]`")?;
-            let port = match rest {
-                "" => None,
-                rest => Some(rest.strip_prefix(':').context("expected `:` after `]`")?),
-            };
-            (host, port)
-        }
-        None => match host_and_port.split_once(':') {
-            Some((host, port)) => (host, Some(port)),
-            None => (host_and_port, None),
-        },
-    };
-
-    if let Some(user) = user {
-        if user.is_empty() || user.starts_with('-') || !is_plain(user) {
-            bail!("invalid user {user:?}");
-        }
-    }
-    if host.is_empty() || host.starts_with('-') || !is_plain(host) {
-        bail!("invalid host {host:?}");
-    }
-    let port = port
-        .map(|port| match port.parse::<u16>() {
-            Ok(port) if port > 0 => Ok(port),
-            _ => bail!("invalid port {port:?}"),
-        })
-        .transpose()?;
-
-    Ok(Address::Ssh {
-        user: user.map(str::to_owned),
-        host: host.to_owned(),
-        port,
-    })
+fn program() -> String {
+    env::var(SSH_ENV)
+        .ok()
+        .filter(|program| !program.is_empty())
+        .unwrap_or_else(|| DEFAULT_SSH.to_owned())
 }
 
-fn is_plain(text: &str) -> bool {
-    !text
-        .chars()
-        .any(|char| char.is_whitespace() || char.is_control() || matches!(char, '@' | '/'))
+fn probe(socket: &str, no_start: bool) -> String {
+    let mut bridge = format!("-L {} {BRIDGE_COMMAND}", shell_words::quote(socket));
+    if no_start {
+        bridge.push(' ');
+        bridge.push_str(NO_START_FLAG);
+    }
+    format!(
+        "command -v amux >/dev/null 2>&1 && exec amux {bridge}; \
+         for amux in {}; do [ -x \"$amux\" ] && exec \"$amux\" {bridge}; done; \
+         echo '{NOT_INSTALLED}' >&2; exit {NOT_INSTALLED_STATUS}",
+        AMUX_LOCATIONS.join(" ")
+    )
 }
 
 pub struct Transport {
     pub child: Child,
     pub reader: ChildStdout,
     pub writer: ChildStdin,
+    pub stderr: StderrTail,
 }
+
+pub struct StderrTail(Option<JoinHandle<Option<String>>>);
 
 pub fn spawn(argv: &[String], address: &str) -> Result<Transport> {
     let (program, args) = argv.split_first().context("the bridge command is empty")?;
@@ -149,20 +113,40 @@ pub fn spawn(argv: &[String], address: &str) -> Result<Transport> {
 
     let reader = child.stdout.take().context("the bridge has no stdout")?;
     let writer = child.stdin.take().context("the bridge has no stdin")?;
-    if let Some(stderr) = child.stderr.take() {
+    let stderr = child.stderr.take().map(|stderr| {
         let address = address.to_owned();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
+            let mut last = None;
             while let Ok(Some(line)) = lines.next_line().await {
                 info!(%address, "bridge: {line}");
+                if !line.trim().is_empty() {
+                    last = Some(line);
+                }
             }
-        });
-    }
+            last
+        })
+    });
     Ok(Transport {
         child,
         reader,
         writer,
+        stderr: StderrTail(stderr),
     })
+}
+
+pub async fn last_words(child: &mut Child, stderr: StderrTail) -> Option<String> {
+    if tokio::time::timeout(BRIDGE_EXIT_GRACE, child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.start_kill();
+    }
+    let reader = stderr.0?;
+    tokio::time::timeout(BRIDGE_EXIT_GRACE, reader)
+        .await
+        .ok()?
+        .ok()?
 }
 
 pub async fn bridge(endpoint: &Endpoint, no_start: bool) -> Result<()> {
@@ -200,70 +184,46 @@ pub async fn bridge(endpoint: &Endpoint, no_start: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::process::Output;
 
-    fn ssh(user: Option<&str>, host: &str, port: Option<u16>) -> Address {
-        Address::Ssh {
-            user: user.map(str::to_owned),
-            host: host.to_owned(),
-            port,
-        }
-    }
+    use super::*;
 
     fn argv(words: &[&str]) -> Vec<String> {
         words.iter().map(|word| word.to_string()).collect()
     }
 
-    #[test]
-    fn ssh_addresses_parse_user_host_and_port() {
-        assert_eq!(
-            "ssh://laptop".parse::<Address>().unwrap(),
-            ssh(None, "laptop", None)
-        );
-        assert_eq!(
-            "ssh://notpc@home-server".parse::<Address>().unwrap(),
-            ssh(Some("notpc"), "home-server", None)
-        );
-        assert_eq!(
-            "ssh://me@desk.tail0.ts.net:2222"
-                .parse::<Address>()
-                .unwrap(),
-            ssh(Some("me"), "desk.tail0.ts.net", Some(2222))
-        );
-        assert_eq!(
-            "ssh://[fe80::1]:22".parse::<Address>().unwrap(),
-            ssh(None, "fe80::1", Some(22))
-        );
+    fn fake_amux(path: &Path, marker: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, format!("#!/bin/sh\necho {marker} \"$@\"\n")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn run_remotely(remote: &str, home: &Path, path: &str) -> Output {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(remote)
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", path)
+            .output()
+            .unwrap()
+    }
+
+    fn remote_command(socket: &str, no_start: bool) -> String {
+        command(None, "laptop", None, None, socket, no_start)
+            .pop()
+            .unwrap()
     }
 
     #[test]
-    fn malformed_addresses_are_rejected() {
-        for address in [
-            "laptop",
-            "ssh://",
-            "ssh://@laptop",
-            "ssh://-oProxyCommand=x",
-            "ssh://-oProxyCommand=x@host",
-            "ssh://laptop:0",
-            "ssh://laptop:ssh",
-            "ssh://laptop/path",
-            "ssh://a b",
-            "ssh://a@b@c",
-            "ssh://[::1",
-            "exec:",
-            "exec:   ",
-            "exec:'unterminated",
-        ] {
-            assert!(address.parse::<Address>().is_err(), "{address} parsed");
-        }
-    }
-
-    #[test]
-    fn the_ssh_bridge_command_defaults_to_amux_on_the_path() {
-        let address: Address = "ssh://laptop".parse().unwrap();
+    fn without_an_amux_path_ssh_runs_one_quoted_probe() {
+        let argv = command(None, "laptop", None, None, "default", false);
         assert_eq!(
-            address.bridge_command(None, "default", false),
-            argv(&[
+            argv[..argv.len() - 1],
+            [
                 "ssh",
                 "-T",
                 "-o",
@@ -271,19 +231,32 @@ mod tests {
                 "-o",
                 "ServerAliveInterval=15",
                 "laptop",
-                "amux",
-                "-L",
-                "default",
-                "bridge",
-            ])
+            ]
         );
+        let remote = argv.last().unwrap();
+        let words = shell_words::split(remote).unwrap();
+        assert_eq!(words[..2], ["sh", "-c"]);
+        assert_eq!(words.len(), 3, "{remote}");
+        assert!(
+            words[2].contains("exec amux -L default bridge;"),
+            "{remote}"
+        );
+        assert!(words[2].contains("$HOME/.cargo/bin/amux"), "{remote}");
+        assert!(words[2].contains("/opt/homebrew/bin/amux"), "{remote}");
+        assert!(words[2].ends_with("exit 127"), "{remote}");
     }
 
     #[test]
-    fn the_ssh_bridge_command_carries_user_port_amux_path_and_socket() {
-        let address: Address = "ssh://notpc@home-server:2222".parse().unwrap();
+    fn an_amux_path_is_passed_to_the_remote_shell_as_written() {
         assert_eq!(
-            address.bridge_command(Some("~/.cargo/bin/amux"), "dev box", true),
+            command(
+                Some("notpc"),
+                "home-server",
+                Some(2222),
+                Some("~/.cargo/bin/amux"),
+                "dev box",
+                true
+            ),
             argv(&[
                 "ssh",
                 "-T",
@@ -304,32 +277,80 @@ mod tests {
     }
 
     #[test]
-    fn exec_addresses_split_like_a_shell_without_running_one() {
-        let address: Address = "exec:env 'HOME=/tmp/a b' amux -S /tmp/b.sock bridge"
-            .parse()
-            .unwrap();
+    fn the_probe_finds_amux_outside_the_path() {
+        let home = tempfile::tempdir().unwrap();
+        fake_amux(&home.path().join(".local/bin/amux"), "local");
+
+        let output = run_remotely(
+            &remote_command("dev box", true),
+            home.path(),
+            "/usr/bin:/bin",
+        );
+
+        assert!(output.status.success(), "{output:?}");
         assert_eq!(
-            address,
-            Address::Exec(argv(&[
-                "env",
-                "HOME=/tmp/a b",
-                "amux",
-                "-S",
-                "/tmp/b.sock",
-                "bridge"
-            ]))
+            String::from_utf8_lossy(&output.stdout),
+            "local -L dev box bridge --no-start\n"
+        );
+    }
+
+    #[test]
+    fn the_probe_prefers_amux_on_the_path_then_cargo_bin() {
+        let home = tempfile::tempdir().unwrap();
+        let on_path = home.path().join("bin");
+        fake_amux(&on_path.join("amux"), "path");
+        fake_amux(&home.path().join(".cargo/bin/amux"), "cargo");
+        fake_amux(&home.path().join(".local/bin/amux"), "local");
+        let remote = remote_command("default", false);
+
+        let output = run_remotely(
+            &remote,
+            home.path(),
+            &format!("{}:/usr/bin:/bin", on_path.display()),
         );
         assert_eq!(
-            address.bridge_command(Some("ignored"), "ignored", true),
-            argv(&[
-                "env",
-                "HOME=/tmp/a b",
-                "amux",
-                "-S",
-                "/tmp/b.sock",
-                "bridge",
-                "--no-start"
-            ])
+            String::from_utf8_lossy(&output.stdout),
+            "path -L default bridge\n"
+        );
+
+        let output = run_remotely(&remote, home.path(), "/usr/bin:/bin");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "cargo -L default bridge\n"
+        );
+    }
+
+    #[test]
+    fn the_probe_says_when_amux_is_missing() {
+        let system_wide = ["/usr/local/bin/amux", "/opt/homebrew/bin/amux"];
+        if system_wide.iter().any(|path| Path::new(path).exists()) {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+
+        let output = run_remotely(
+            &remote_command("default", false),
+            home.path(),
+            "/usr/bin:/bin",
+        );
+
+        assert_eq!(output.status.code(), Some(i32::from(NOT_INSTALLED_STATUS)));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("{NOT_INSTALLED}\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_last_stderr_line_of_a_failed_bridge_is_kept() {
+        let script = "echo starting >&2; echo 'no server running' >&2; echo >&2; exit 1";
+        let Transport {
+            mut child, stderr, ..
+        } = spawn(&argv(&["sh", "-c", script]), "exec:test").unwrap();
+
+        assert_eq!(
+            last_words(&mut child, stderr).await.as_deref(),
+            Some("no server running")
         );
     }
 }

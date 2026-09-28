@@ -17,6 +17,7 @@ nix = { version = "0.31.3", features = ["hostname", "process", "signal", "user"]
 portable-pty = "0.9.0"
 postcard = { version = "1.1.3", features = ["use-std"] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 serde_path_to_error = "0.1.20"
 shell-words = "1.1.1"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time", "process", "io-std"] }

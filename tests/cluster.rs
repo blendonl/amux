@@ -6,7 +6,7 @@ use std::os::unix::net::UnixListener;
 use std::thread;
 
 use amux::protocol::{Version, Welcome, PROTOCOL_MAJOR};
-use common::{linked, Listing, Resume, TestServer};
+use common::{linked, FakeNetwork, Listing, Resume, TestServer, DISCOVERY_OFF};
 use nix::sys::signal::{kill, Signal};
 
 fn is_stopped(ls: &Listing, server: &str) -> bool {
@@ -242,7 +242,7 @@ fn a_peer_with_another_protocol_major_is_listed_as_incompatible() {
     );
     fs::write(
         a.config_path(),
-        format!("name = \"a\"\n[servers.future]\naddress = {address:?}\n"),
+        format!("name = \"a\"\n{DISCOVERY_OFF}[servers.future]\naddress = {address:?}\n"),
     )
     .unwrap();
     let mut a = a;
@@ -292,4 +292,81 @@ fn debug_drop_link_drops_the_link_and_it_comes_back() {
     assert_eq!(first[0].peer, second[0].peer);
     let missing = a.run(&["debug", "drop-link", "nobody"]);
     assert!(!missing.status.success());
+}
+
+const FORGOTTEN: &str = "the server was forgotten";
+
+fn lists_server(servers: &str, name: &str) -> bool {
+    servers
+        .lines()
+        .any(|line| line.starts_with(&format!("{name} ")))
+}
+
+#[test]
+fn an_ssh_peer_links_when_amux_is_only_in_its_cargo_bin() {
+    let network = FakeNetwork::new();
+    let b = TestServer::builder().name("b").start();
+    network.add_host("b", &b);
+    let a = TestServer::builder()
+        .name("a")
+        .ssh(&network)
+        .config("[servers.b]\naddress = \"ssh://me@b\"")
+        .start();
+
+    a.wait_for_ls("b over ssh", |ls| ls.is_online("b"));
+
+    let links = a.wait_for_links("the link to b", |links| {
+        links.len() == 1 && links[0].state == "up"
+    });
+    assert_eq!(links[0].name, "b");
+    assert_eq!(links[0].transport, "ssh");
+    let servers = a.run_ok(&["servers"]);
+    assert!(
+        servers
+            .lines()
+            .any(|line| line.starts_with("b ") && line.ends_with("ssh://me@b")),
+        "{servers}"
+    );
+}
+
+#[test]
+fn servers_forget_drops_a_gossiped_peer_and_keeps_refusing_it() {
+    let c = TestServer::builder().name("c").start();
+    let b = TestServer::builder().name("b").peer(&c).start();
+    let a = TestServer::builder().name("a").peer(&b).start();
+    a.wait_for_ls("c, learned through b", |ls| ls.is_online("c"));
+    c.run_ok(&["servers", "add", "a", &a.bridge_address()]);
+
+    a.run_ok(&["servers", "forget", &c.server_id()]);
+
+    a.wait_for_log(&format!("refused a link: {FORGOTTEN}"));
+    c.wait_for_log(&format!("the peer refused the link: {FORGOTTEN}"));
+    let ls = a.wait_for_ls("c to be gone", |ls| ls.server("c").is_none());
+    assert!(ls.is_online("b"), "{ls:?}");
+    assert!(!lists_server(&a.run_ok(&["servers"]), "c"));
+    assert!(a.links().iter().all(|link| link.name != "c"));
+    let trust = fs::read_to_string(a.state_dir().join("trust.toml")).unwrap();
+    assert!(trust.contains(&c.server_id()), "{trust}");
+}
+
+#[test]
+fn servers_forget_removes_a_configured_peer_from_the_config() {
+    let [a, b] = linked([
+        TestServer::builder().name("a"),
+        TestServer::builder().name("b"),
+    ]);
+    a.wait_for_ls("b", |ls| ls.is_online("b"));
+
+    a.run_ok(&["servers", "forget", "b"]);
+
+    let config = fs::read_to_string(a.config_path()).unwrap();
+    assert!(!config.contains("servers.b"), "{config}");
+    b.wait_for_log(&format!("the peer refused the link: {FORGOTTEN}"));
+    a.wait_for_ls("b to be gone", |ls| ls.server("b").is_none());
+    assert!(!lists_server(&a.run_ok(&["servers"]), "b"));
+
+    let again = a.run(&["servers", "forget", "b"]);
+    assert!(!again.status.success());
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(stderr.contains("no server named b is known"), "{stderr}");
 }

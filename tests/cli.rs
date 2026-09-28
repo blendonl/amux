@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{Listing, TestServer, DETACH, TIMEOUT};
+use common::{Listing, TestServer, DETACH, DISCOVERY_OFF, TIMEOUT};
 
 const FAKE_OLD_SERVER_SOCKET: &str = "AMUX_TEST_FAKE_OLD_SERVER_SOCKET";
 
@@ -75,7 +75,7 @@ fn the_readme_commands_work() {
 fn a_server_started_by_the_client_uses_the_client_config() {
     let server = TestServer::builder().prepare();
     let custom = server.root().join("custom.toml");
-    fs::write(&custom, "name = \"custom\"\n").unwrap();
+    fs::write(&custom, format!("name = \"custom\"\n{DISCOVERY_OFF}")).unwrap();
 
     let mut client = server.terminal(&["--config", custom.to_str().unwrap(), "new"]);
     server.wait_for_log("name=custom");

@@ -3,7 +3,9 @@ use std::fmt::Write;
 use std::time::{Duration, SystemTime};
 
 use crate::project::ProjectId;
-use crate::protocol::{ServerStatus, ServerView, SessionInfo};
+use crate::protocol::{
+    DiscoveryReport, DiscoveryStatus, DiscoveryView, ServerStatus, ServerView, SessionInfo,
+};
 
 const MIN_NAME_COLUMN: usize = 25;
 const WINDOWS_COLUMN: usize = 12;
@@ -230,6 +232,62 @@ pub fn servers(servers: &[ServerView], now: SystemTime) -> String {
     out
 }
 
+pub fn discovery(report: &DiscoveryReport) -> String {
+    let name_column = report
+        .sources
+        .iter()
+        .map(|source| width(&source.via.to_string()))
+        .chain(
+            report
+                .peers
+                .iter()
+                .map(|peer| SESSION_INDENT.len() + width(&peer.name)),
+        )
+        .max()
+        .unwrap_or_default()
+        + COLUMN_GAP;
+    let address_column = report
+        .peers
+        .iter()
+        .map(|peer| width(&peer.address) + TABLE_GAP.len())
+        .max()
+        .unwrap_or_default();
+
+    let mut out = String::new();
+    for source in &report.sources {
+        let header = pad(&source.via.to_string(), name_column) + &source.state.to_string();
+        push_line(&mut out, &header);
+        for peer in report.peers.iter().filter(|peer| peer.via == source.via) {
+            let line = format!(
+                "{SESSION_INDENT}{}{}{}",
+                pad(&peer.name, name_column - SESSION_INDENT.len()),
+                pad(&peer.address, address_column),
+                discovery_status(peer)
+            );
+            push_line(&mut out, &line);
+        }
+    }
+    out
+}
+
+fn discovery_status(peer: &DiscoveryView) -> String {
+    match (&peer.status, &peer.last_error) {
+        (DiscoveryStatus::Linked, _) | (_, None) => peer.status.to_string(),
+        (status, Some(error)) => format!("{status}: {error}"),
+    }
+}
+
+pub fn duration(secs: u64) -> String {
+    let plural = |count: u64, unit: &str| match count {
+        1 => format!("1 {unit}"),
+        count => format!("{count} {unit}s"),
+    };
+    match secs {
+        0..60 => plural(secs, "second"),
+        _ => plural(secs.div_ceil(60), "minute"),
+    }
+}
+
 fn cluster_status(status: &ServerStatus, now: SystemTime) -> String {
     match status {
         ServerStatus::Online {
@@ -313,7 +371,9 @@ fn push_line(out: &mut String, line: &str) {
 
 #[cfg(test)]
 mod tests {
-    use crate::protocol::{ProjectCheckout, SessionId, Version, WindowSummary};
+    use crate::protocol::{
+        ProjectCheckout, SessionId, SourceState, SourceView, Version, Via, WindowSummary,
+    };
 
     use super::*;
 
@@ -515,6 +575,112 @@ laptop        online, <1 ms                                  amux 0.1.0 (protoco
 home-server   incompatible, runs amux 0.3.0 (protocol 3.1)   unknown version
 "
         );
+    }
+
+    fn candidate(
+        via: Via,
+        name: &str,
+        address: &str,
+        status: DiscoveryStatus,
+        last_error: Option<&str>,
+    ) -> DiscoveryView {
+        DiscoveryView {
+            via,
+            name: name.into(),
+            address: address.into(),
+            server: None,
+            status,
+            last_error: last_error.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn discover_groups_candidates_by_source_with_their_last_error() {
+        let report = DiscoveryReport {
+            sources: vec![
+                SourceView {
+                    via: Via::Tailscale,
+                    state: SourceState::Running,
+                },
+                SourceView {
+                    via: Via::Lan,
+                    state: SourceState::Running,
+                },
+            ],
+            peers: vec![
+                candidate(
+                    Via::Tailscale,
+                    "desk",
+                    "tcp://100.64.0.2:7447",
+                    DiscoveryStatus::Linked,
+                    None,
+                ),
+                candidate(
+                    Via::Tailscale,
+                    "phone",
+                    "tcp://100.64.0.9:7447",
+                    DiscoveryStatus::Failing,
+                    Some("connection refused"),
+                ),
+                candidate(
+                    Via::Tailscale,
+                    "nas",
+                    "tcp://100.64.0.4:7447",
+                    DiscoveryStatus::Absent,
+                    None,
+                ),
+                candidate(
+                    Via::Lan,
+                    "laptop",
+                    "lan://000000000000000000000000000000a7",
+                    DiscoveryStatus::NotPaired,
+                    None,
+                ),
+            ],
+        };
+
+        assert_eq!(
+            discovery(&report),
+            "\
+tailscale  running
+  desk     tcp://100.64.0.2:7447                    linked
+  phone    tcp://100.64.0.9:7447                    failing: connection refused
+  nas      tcp://100.64.0.4:7447                    absent
+lan        running
+  laptop   lan://000000000000000000000000000000a7   not paired
+"
+        );
+    }
+
+    #[test]
+    fn discover_says_which_sources_are_off_or_not_running() {
+        let report = DiscoveryReport {
+            sources: vec![
+                SourceView {
+                    via: Via::Tailscale,
+                    state: SourceState::Off,
+                },
+                SourceView {
+                    via: Via::Lan,
+                    state: SourceState::NotRunning,
+                },
+            ],
+            peers: Vec::new(),
+        };
+
+        assert_eq!(
+            discovery(&report),
+            "tailscale  off (disabled in the config)\nlan        not running\n"
+        );
+    }
+
+    #[test]
+    fn durations_round_up_to_whole_minutes() {
+        assert_eq!(duration(1), "1 second");
+        assert_eq!(duration(45), "45 seconds");
+        assert_eq!(duration(60), "1 minute");
+        assert_eq!(duration(300), "5 minutes");
+        assert_eq!(duration(299), "5 minutes");
     }
 
     #[test]
