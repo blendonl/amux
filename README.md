@@ -23,6 +23,12 @@ cargo run -- project add [path]          # register the repo at path (default: h
 cargo run -- servers                     # status, latency and version of every server
 cargo run -- servers add laptop ssh://laptop
 cargo run -- servers remove laptop
+cargo run -- servers forget laptop       # drop laptop, its key and its addresses, and refuse that key from now on
+cargo run -- discover                    # what Tailscale and the LAN found, and how linking each machine goes
+cargo run -- pair                        # open a pairing window on this machine and print a one-time code
+cargo run -- pair k7-4821-9930           # on the other machine: pair with the one that printed the code
+cargo run -- pair k7-4821-9930 --host 192.168.0.24:40123  # the same, when multicast does not reach it
+cargo run -- pair --new-key              # pair with a new key, so a forgotten machine can come back
 cargo run -- kill-server                 # stop the server and all sessions
 ```
 
@@ -123,22 +129,45 @@ socket = "default"
 [projects.amux]
 default_server = "desktop"
 worktrees_dir = "~/projects/amux-worktrees"
+
+[discovery]
+tailscale = true
+lan = true
+tailscale_tags = ["tag:server"]
+
+[lan]
+port = 0
 ```
 
 `name` defaults to the hostname and `projects_dir` to `~/projects`. Each entry under `servers` is a peer to link to. Each entry under `projects` is keyed by project name: `default_server` is where `amux new` puts that project's sessions when you don't pass `--on`, and `worktrees_dir` is where its worktrees go instead of the default `<checkout>/../<project>-worktrees`.
 
-A server's `address` is either:
+`[discovery]` controls how servers find each other without a config entry (see [Cluster](#cluster)):
 
-- `ssh://[user@]host[:port]`, which runs `ssh -T -o BatchMode=yes -o ServerAliveInterval=15 [-p port] [user@]host <amux_path> -L <socket> bridge`. `amux_path` defaults to `amux` on the remote `PATH` and is passed to the remote shell as written, so `~` works. `socket` defaults to this server's own socket name.
+| Key              | Default                                    | Means                                                                 |
+| ---------------- | ------------------------------------------ | --------------------------------------------------------------------- |
+| `tailscale`      | `true`                                     | Link to the machines on the tailnet and listen on the tailnet address |
+| `lan`            | `true`                                     | Find servers over mDNS, listen on the LAN and allow `amux pair`       |
+| `tailscale_tags` | `[]`                                       | Tailscale tags whose machines count as yours, such as `"tag:server"`  |
+| `tailscale_port` | 7447, or a port derived from the `-L` name | The port of the tailnet listener, the same on every machine           |
+
+`[lan] port` is the port of the LAN listener. The default, `0`, takes a free port each time the listener opens, which mDNS then advertises. A fixed port helps with firewall rules and with `amux pair --host` without a port.
+
+A server's `address` is one of:
+
+- `ssh://[user@]host[:port]`, which runs `ssh -T -o BatchMode=yes -o ServerAliveInterval=15 [-p port] [user@]host <amux_path> -L <socket> bridge`. `amux_path` is passed to the remote shell as written, so `~` works. Without it, the remote command is a short `sh -c` script that looks for amux on the remote `PATH` and in the usual install locations (see [Over SSH](#over-ssh-configured-by-hand)). `socket` defaults to this server's own socket name.
 - `exec:<command>`, which runs the command directly, split like a shell would split it but without a shell. The command has to end in `amux … bridge`. The tests use it to link servers on one machine.
+- `tcp://host:port`, which links over Noise to that address. The other server's key must already be trusted, or vouched for by the tailnet. Tailscale discovery uses this form.
+- `lan://<server id>`, the form LAN discovery uses. The IP addresses and port come from mDNS each time amux dials.
 
-`amux servers add` and `amux servers remove` edit the config file in place, keeping its comments, and tell a running server about the change.
+`amux servers add` and `amux servers remove` edit the config file in place, keeping its comments, and tell a running server about the change. `amux servers forget` also removes the server from the config.
 
-Each server also has a random ID, stored in `$XDG_STATE_HOME/amux/<socket name>/server-id`, and a fresh incarnation ID every time it starts. The log shows both.
+Each server also has a random ID, stored in `$XDG_STATE_HOME/amux/<socket name>/server-id`, and a fresh incarnation ID every time it starts. The log shows both. Its Noise key and the keys it trusts live next to the ID (see [Trust](#trust)).
 
 ### Upgrading
 
 Every connection starts with a greeting that carries the protocol version. When the client and the running server speak different major versions, the client names both and asks you to run `amux kill-server`. `kill-server` also works on a server that is too old to answer the greeting.
+
+This version speaks protocol 7, which added the Noise keys, trust updates and discovery, so every machine in the cluster needs the new build. Servers on different major versions refuse to link, and `amux servers` lists the older one as `incompatible, runs amux … (protocol 6.0)`. An older build doesn't listen on TCP, so Tailscale and LAN discovery can't reach it either. The cluster cache of the older build still loads.
 
 ### Cluster
 
@@ -154,14 +183,131 @@ home-server              offline, last seen 3h ago
   infra/main             2 windows   stale
 ```
 
-- A server dials every address in its config, and every address its peers have linked over, retrying with a backoff from 1 s up to a minute while a peer is away. Adding one machine on one server is enough for the rest to find it, as long as its address works from every machine. The local config wins over what peers report, and a learned address that isn't seen for a week is forgotten.
-- On the other machine, `amux bridge` connects stdin and stdout to the local server and starts that server if it isn't running. amux opens no ports: SSH handles auth and encryption, and `~/.ssh/config` applies as usual. `BatchMode=yes` means an unknown host key or a passphrase prompt fails the link, and the reason shows in the server log.
+- A server dials every address in its config, every address discovery finds on the tailnet and the LAN, and every address its peers have linked over, retrying with a backoff from 1 s up to a minute while a peer is away. Adding one machine on one server is enough for the rest to find it, as long as its address works from every machine. Peers never pass on the addresses discovery found, since each machine discovers for itself, nor `tcp://` addresses on loopback, which only work on one machine. When one address comes from several places, the local config wins over discovery and discovery wins over what peers report. A learned or discovered address that isn't seen for a week is forgotten.
 - When both sides dial at once, the link dialed by the lower server ID survives. A server that restarts replaces its old link at once. A second server that claims a name another online server already uses is refused until it is renamed.
 - `kill-server` sticks. A stopping server says goodbye on every link, and its peers mark it stopped and only dial it with `amux bridge --no-start`, so they never start it again behind your back. It comes back when you start it.
 - Peers, their addresses, the stopped flag and the last known sessions are kept in `$XDG_STATE_HOME/amux/<socket name>/cluster-cache`, so an offline server still shows its last known sessions after a restart. A cache that fails to decode is dropped.
 - Links send a ping every 5 seconds and drop a peer that stays silent for three of them. `AMUX_PING_INTERVAL_MS` changes the interval, which the tests use to notice a lost link quickly.
 
-A server that `amux bridge` starts over SSH inherits a non-interactive SSH environment and may be killed by logind when the SSH session ends. To keep a machine reachable, run its server from a systemd user unit (`ExecStart=%h/.cargo/bin/amux server`) and allow it to outlive your login with `loginctl enable-linger`.
+Two machines link in one of three ways:
+
+| Where                | What you do                            | How they link                         |
+| -------------------- | -------------------------------------- | ------------------------------------- |
+| On the same tailnet  | Nothing                                | Noise over TCP on the tailnet address |
+| On the same LAN      | `amux pair` once for each new machine  | Noise over TCP, found over mDNS       |
+| Anywhere SSH reaches | `amux servers add laptop ssh://laptop` | `ssh laptop amux bridge`              |
+
+However a machine joins, the rest of the cluster learns its key and links to it wherever it can reach it: on the tailnet, on the LAN or through an address a peer passes on.
+
+Discovery only links servers that are already running, because nothing starts a server on another machine over TCP. A server that `amux bridge` starts over SSH inherits a non-interactive SSH environment and may be killed by logind when the SSH session ends. To keep a machine reachable either way, run its server from a systemd user unit (`ExecStart=%h/.cargo/bin/amux server`) and allow it to outlive your login with `loginctl enable-linger`.
+
+#### On the same tailnet
+
+Servers on one tailnet link on their own. There is nothing to configure, no SSH and no keys to copy, because the tailnet vouches for each machine.
+
+- Every 30 seconds a server reads `tailscale status --json` and dials the peers that are online, run Linux, macOS, FreeBSD or OpenBSD, and either belong to the same Tailscale user as this machine or carry a tag listed in `[discovery] tailscale_tags`. It dials them at `tcp://<tailnet IPv4>:<port>`. Phones, sleeping machines and other users' machines are never dialed.
+- A server listens on its own tailnet IPv4 address and nowhere else, at port 7447 for the default socket. Any other `-L` name gets a port between 7448 and 7947 derived from the name, so servers with the same `-L` name find each other. `[discovery] tailscale_port` sets the port. A server dials its peers at its own port setting, so give every machine the same one. The listener follows the tailnet address as it appears, changes or goes away, and a server dials its tailnet peers from that address.
+- The first time two servers meet, neither trusts the other's key, so each asks `tailscale whois` about the other's tailnet address: the dialing side about the address it dialed, the accepting side about the address the connection came from. The tailnet vouches for a machine of the same user, or one with an allowed tag, as long as it isn't this machine's own node. Each side then trusts the other's key first hand and needs no whois for it again. If whois fails, for example because `tailscaled` is down, the link is refused, so an address in 100.64.0.0/10 that isn't on the tailnet is never trusted.
+- Tailscale gives every tagged machine the same owner, so a tagged machine accepts other machines by tag only. Two tagged machines link when each lists the other's tag in `tailscale_tags`. A tagged and an untagged machine never link on their own, because the untagged one carries no tag the tagged one could accept. Pair them on the LAN or link them over SSH instead.
+- A machine that goes offline or leaves the tailnet is not dialed again, through any address discovery found or a peer passed on, until Tailscale lists it as online again. Addresses in the config are still dialed.
+- A tailnet machine shows up in `amux servers`, `amux ls` and the status bar only once amux has reached an amux server there. Until then only `amux discover` lists it, and its retries back off up to 10 minutes.
+
+`[discovery] tailscale = false` turns this off. When Tailscale isn't installed, the server logs it once and stops looking. `AMUX_DISCOVERY_INTERVAL_MS` changes how often it reads the status, which the tests use to see changes quickly.
+
+#### On the LAN, with a pairing code
+
+Servers on one LAN find each other over mDNS. A new machine needs a one-time pairing code, and after that it links over Noise with nothing more to do.
+
+Run `amux pair` on one machine. It prints a code and waits in the foreground:
+
+```
+$ amux pair
+pairing merges this machine's cluster with the other machine's, and gives each machine full access to the other, like ssh as this user
+pairing code k7-4821-9930, valid for 5 minutes and one use
+run this on the other machine:
+  amux pair k7-4821-9930
+or, where multicast does not reach it:
+  amux pair k7-4821-9930 --host <this machine's address>:40123
+waiting for the other machine...
+paired with laptop (5be0c7a1f29d4e8b93a6d10c7e42f851), key fingerprint 3f9a:1c07:88d2:e4b1
+```
+
+The first part of the code, `k7`, names the pairing window, which the server advertises over mDNS while it is open. The eight digits are the secret. `amux pair k7-4821-9930` on the other machine finds the server that advertises `k7`, pairs with it, and prints the same warning and a `paired with` line naming the first machine.
+
+- Where multicast doesn't get through, as on many guest and office networks, add `--host <ip[:port]>` with the first machine's IP address and the port `amux pair` printed. It takes an IP address, not a host name. Without a port, amux uses the port that mDNS saw for that address, or this machine's own `[lan] port` if it is set. The joining machine doesn't need LAN discovery for this.
+- A window is good for one pairing and five minutes. It also closes after three attempts or when you leave `amux pair`, and only one `amux pair` can wait on a server at a time. One pairing connection runs at a time, and an attempt counts as soon as its first pairing message arrives. A wrong code fails on the machine that tried it, and the waiting machine prints how many attempts are left.
+- The code itself never crosses the network. The two machines open a Noise connection and run SPAKE2 inside it, bound to both machines' keys and to that connection's handshake, so the exchange only succeeds between the two machines that hold the code.
+- Pairing merges two clusters. The two machines trust each other first hand, the pairing connection becomes their first link, and trust spreads from there (see [Trust](#trust)): every machine linked to either one learns the keys of the other cluster and links to those machines wherever it can reach them. That is what the warning at the top is about.
+- Afterwards the two find each other over mDNS whenever they share a LAN, even when DHCP moves them. Their address is `lan://<server id>`, and amux looks up the current IP addresses and port each time it dials.
+- `amux pair --new-key`, with or without a code, gives this server a new key before it pairs. That is how a forgotten machine comes back.
+
+A server browses for `_amux._tcp.local.` on every interface except loopback and interfaces named `tailscale*`, `utun*`, `docker*`, `br-*` and `veth*`. It advertises itself only while its LAN listener is open (see [Listening ports](#listening-ports)), with its server ID as the instance name and its name, key, `-L` socket name, protocol version and any open pairing window in the TXT record. Servers with another `-L` name are ignored. `[discovery] lan = false` turns off LAN discovery and the LAN listener, and `amux pair` then only works on the joining side, with `--host`.
+
+#### Over SSH, configured by hand
+
+`amux servers add laptop ssh://laptop` links to any machine that key-based SSH reaches, on the LAN, on the tailnet or across the internet. On the other machine, `amux bridge` connects stdin and stdout to the local server and starts that server if it isn't running. SSH handles auth and encryption, and `~/.ssh/config` applies as usual. `BatchMode=yes` means an unknown host key or a passphrase prompt fails the link, and the reason shows in the server log.
+
+A non-interactive SSH shell often has no `~/.cargo/bin` on its `PATH`, so without `amux_path` the remote command looks for amux: `amux` on the `PATH`, then `~/.cargo/bin/amux`, `~/.local/bin/amux`, `/usr/local/bin/amux` and `/opt/homebrew/bin/amux`. When none of them is there, the link fails with "amux is not installed on this machine". Set `amux_path` when amux lives anywhere else.
+
+Both servers record each other's key on the first SSH link, and the cluster learns it, so members that reach that machine on the tailnet or the LAN can link to it over Noise without SSH.
+
+#### Trust
+
+Cluster membership means full trust: any member can open a shell on any other, as the user that runs amux there, just like SSH to that machine. So nothing links without authentication.
+
+- Every server has a Noise key in `$XDG_STATE_HOME/amux/<socket name>/noise-key`, created with mode 0600 on first start, and sends its public key in its hello. The keys it trusts are in `trust.toml` in the same directory, one key per server ID, together with the servers it has forgotten.
+- A server trusts a key first hand when it sees the key itself: over an SSH or `exec:` link, from a tailnet peer that `tailscale whois` vouched for, or by pairing. A key seen first hand replaces an older key for that server.
+- Trust spreads through the cluster. Linked servers send each other their trust store when the link comes up and whenever it changes. A key learned this way records its introducer, the member that saw it first hand, and never replaces a key the server already knows. Once a machine joins through one member, every member trusts it and can link to it over Noise.
+- A Noise link must present the key the trust store holds for the server ID in its hello, unless the tailnet or a pairing vouches for it. A server refuses an unknown key right after the Noise handshake, before it sends its own hello.
+
+`amux servers forget <name or id>` takes a machine out of the cluster for good:
+
+- It drops the link, the server's record, every address of it, its entry in the config and its key.
+- It records a tombstone for that server ID and key and sends it through the cluster, so every member forgets the machine too and closes its links to it.
+- The keys the forgotten server introduced go as well, unless a member saw them first hand.
+- From then on the server is refused on every transport and discovery skips it. This is permanent for that key. To bring the machine back, run `amux pair --new-key` on it and pair it with any member: it gets a new key and rejoins the whole cluster, and its old key stays out.
+
+A known limitation: a member that trusted the old key second hand and missed the tombstone, for example because it was offline when you ran `servers forget`, won't accept the new key until the member that paired with the machine sends it another trust update.
+
+#### Why a machine doesn't show up
+
+`amux discover` lists what Tailscale and the LAN found and how linking each machine goes. When a machine is missing from `amux servers`, look here:
+
+```
+tailscale      running with 2 machines
+  desk         tcp://100.101.7.12:7447                  linked
+  nas          tcp://100.88.20.4:7447                   failing: connecting to 100.88.20.4:7447: Connection refused (os error 111)
+  work-laptop  tcp://100.97.3.8:7447                    absent
+lan            running
+  mini         lan://5be0c7a1f29d4e8b93a6d10c7e42f851   paired, linked
+  pi           lan://c41e07b9d2a85f3e6b1c0a9d8e7f6a5b   not paired
+```
+
+Each source first says how it is doing: `off (disabled in the config)`, `not running`, `tailscale is not installed`, `running with 2 machines` (the tailnet machines it would dial right now), `running`, or the error that stopped it, such as `mDNS failed: …`. Under it, each machine it found has one of these statuses:
+
+| Status             | Means                                                                                     |
+| ------------------ | ----------------------------------------------------------------------------------------- |
+| `linked`           | Linked right now                                                                          |
+| `trying`           | amux is dialing it and no attempt has failed yet                                          |
+| `failing: <error>` | The last attempt failed. `Connection refused` means no amux server listens there          |
+| `absent`           | The source no longer lists it, for example because it is offline, so amux doesn't dial it |
+| `not paired`       | A server on the LAN whose key this machine doesn't trust. Run `amux pair` to pair them    |
+| `pairing open`     | A server on the LAN that is waiting in `amux pair`                                        |
+
+LAN servers this machine trusts show `paired, ` before their status. A refusal shows as the error, for example when another server already uses the machine's name. A machine that has never linked or paired with anything doesn't advertise itself on the LAN, so it appears only once `amux pair` runs on it. `amux discover` needs a running server.
+
+#### Listening ports
+
+With both discovery sources off, amux opens no ports. Otherwise it listens on TCP in two cases, and only for other amux servers: clients always use the unix socket, and a TCP connection that greets as a client is refused.
+
+| Listener | Address                                                    | Open while                                                                           | Turn it off                     |
+| -------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------ | ------------------------------- |
+| Tailnet  | This machine's tailnet IPv4, port 7447 or `tailscale_port` | Tailscale discovery runs and Tailscale is up with an IPv4 address for this machine   | `[discovery] tailscale = false` |
+| LAN      | Every interface (`0.0.0.0`), `[lan] port` or a free port   | LAN discovery is on and the trust store holds a key or an `amux pair` window is open | `[discovery] lan = false`       |
+
+- The LAN listener writes its port to `$XDG_STATE_HOME/amux/<socket name>/lan-port` while it is open and advertises it over mDNS. It closes again when the trust store is empty and no window is open.
+- LAN discovery also takes part in mDNS on UDP port 5353 whenever it is on, to browse for other servers, and answers for this server only while the LAN listener is open.
+- Before a connection is authenticated, it has 10 seconds to finish its handshake, at most 16 such handshakes run at once and further connections are dropped, and one pairing connection runs at a time. A pairing connection that arrives with no window open is closed.
 
 ### Remote sessions
 
@@ -201,7 +347,7 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
   (raw mode)                            ║     │           │          └─ pane ── PTY ── $SHELL
                                         ║     │           └─ window ─── pane ── PTY ── $SHELL
                                         ║     └─ session ─── window ─── pane ── PTY ── $SHELL
-                                        ║ peer link (ssh … amux bridge)
+                                        ║ peer link (ssh … amux bridge, or Noise over TCP)
                                         ╚══════════ server on another machine
 ```
 
@@ -212,60 +358,75 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 - Each attached **client** has its own differ, which compares the new grid with the last one that client was sent, clipped to that client's terminal size, and sends only the changed cells. It moves the cursor and clears line by line, never the whole screen. Frames are pulled, not pushed: output in a visible pane or a layout change only marks the client dirty, and the server composes a frame when the connection has room for one. A slow client skips intermediate screens, and its keystrokes never wait behind output. Keystrokes go back as raw bytes, key bindings as commands, and resizes are sent when `SIGWINCH` arrives.
 - The host decodes **mouse** reports from the client's input. A click focuses the pane under the pointer, and a report only reaches a pane whose program asked for that kind of event, re-encoded in that pane's coordinates and format. A lone `Escape` that could start a report is held for at most 25 ms, so it never gets stuck.
 - The **protocol** uses length-prefixed `postcard` frames. A connection opens with a `Greeting` and a `Welcome` whose layout never changes, then carries `ClientMessage` and `ServerMessage`. Any change to those messages bumps the major version. The server handles a connection as a `Duplex`, a pair of message channels, so it doesn't care what transport sits underneath.
-- A **peer link** carries the same frames. After the greeting both servers send a `Hello`, the lower ID decides whether the link is a duplicate, and then each side sends a snapshot of its sessions followed by events stamped with its incarnation and a sequence number, so stale or repeated updates are dropped. One writer drains a control lane (pongs, credit, goodbyes) ahead of a bulk lane (snapshots, events and channel data), and the reader never waits on anything the other side controls, so a peer that stops reading cannot stall this one.
+- A **peer link** carries the same frames. After the greeting both servers send a `Hello`, the lower ID decides whether the link is a duplicate, and then each side sends a snapshot of its sessions followed by events stamped with its incarnation and a sequence number, so stale or repeated updates are dropped. One writer drains a control lane (pongs, credit, goodbyes, trust updates) ahead of a bulk lane (snapshots, events and channel data), and the reader never waits on anything the other side controls, so a peer that stops reading cannot stall this one.
+- Over **TCP**, a connection opens with a `TcpOpen` frame that says whether it is a link or a pairing, then runs a `Noise_XX_25519_ChaChaPoly_BLAKE2s` handshake whose prologue binds that frame. A pump seals and opens the Noise messages between the socket and an in-memory duplex stream, so the peer link runs its usual framing on top. A pairing runs SPAKE2 over the same kind of connection first and then carries on as a link.
 - A **channel** tunnels one client connection through a peer link. Each server numbers the channels it opens, and the server hosting the session runs the channel through the same connection handler as a local client, except that it only ever looks up its own sessions. The host sends at most four frames ahead and waits for the opening server to pass each one on to its client, so frames stay pulled end to end. Each channel has its own capped queue on the receiving side: a channel that overflows is closed on its own and the link stays up. The opening server forwards client messages without reading them, apart from detaching, switching sessions and listing the cluster, and reattaches by the host's incarnation and session ID when a dropped link comes back.
 - The client draws its own **chrome**: the status bar, the reconnect overlay, the prompts and the cluster tree. It sends the host its terminal size without the status row, in the first request, on every resize and on a reattach, so the host never draws there. The host sends the session's name, windows and active window when the client attaches and whenever they change. The server the client is connected to adds a cluster status (its own name, the session's server, the link latency and the offline servers) on attach, whenever the cluster changes and every two seconds. A channel never carries a cluster status, since the server at the client's end knows it best. The status bar is drawn again after each batch of output, saving and restoring the cursor around it. While the tree is open the client drops the session's output, and closing the tree or a prompt asks the host for a full redraw.
 - A client's terminal size is clamped to at least 2 rows by 2 columns, on the client and on the server, because the terminal emulator can't handle anything smaller.
 - **Git** runs through the `git` CLI in blocking tasks, never while the server holds its sessions lock. Registry changes are serialized and saved before they are published as a `ProjectsChanged` event, and creates for the same project and branch wait on a per-worktree lock, so concurrent `amux new`s share one session.
 
-| Path                       | Responsibility                                                           |
-| -------------------------- | ------------------------------------------------------------------------ |
-| `src/main.rs`              | Parses the command line and dispatches                                   |
-| `src/lib.rs`               | The library the binary and the tests share                               |
-| `src/cli.rs`               | Command-line interface                                                   |
-| `src/paths.rs`             | Runtime, config and state paths                                          |
-| `src/config.rs`            | Config file, server ID and incarnation                                   |
-| `src/target.rs`            | `session@server` targets: parsing, validation and resolution             |
-| `src/project/id.rs`        | Project ids from origin URLs, local paths and root commits               |
-| `src/project/detect.rs`    | Finding the project, branch and main checkout of a directory             |
-| `src/project/registry.rs`  | The `projects.toml` registry of local checkouts                          |
-| `src/project/worktree.rs`  | Default branch, worktrees, fetch, clone and removal                      |
-| `src/project/git.rs`       | Running `git` without prompts, with an optional timeout                  |
-| `src/protocol/mod.rs`      | Framing and the `Duplex` message channels                                |
-| `src/protocol/greeting.rs` | Greeting, version constants and the version check                        |
-| `src/protocol/client.rs`   | Client and server messages                                               |
-| `src/protocol/peer.rs`     | Peer messages, snapshots and state events                                |
-| `src/cluster/mod.rs`       | Membership, dial loops, peer cache                                       |
-| `src/cluster/link.rs`      | Peer handshake, link lanes, pings                                        |
-| `src/cluster/channel.rs`   | Channels over a link: ids, credit, capped inbound queues                 |
-| `src/cluster/ssh.rs`       | Addresses, the SSH and exec transport, `amux bridge`                     |
-| `src/server/mod.rs`        | Accept loop, session registry, state events, shutdown                    |
-| `src/server/connection.rs` | Per-client requests, target routing and the attach loop                  |
-| `src/server/status.rs`     | The cluster status sent to attached clients                              |
-| `src/server/forward.rs`    | Forwarding a client to a session on another server, reconnects           |
-| `src/server/projects.rs`   | Project registry, checkouts, clones, worktree sessions and removal       |
-| `src/server/session.rs`    | Session state, its windows and the commands that change them             |
-| `src/server/window.rs`     | A window's layout, panes, active pane and mouse routing                  |
-| `src/server/layout.rs`     | The pane layout tree: splits, rectangles, borders and neighbours         |
-| `src/server/render/`       | The compositor, the per-client differ and escape sequences               |
-| `src/server/mouse.rs`      | Decoding and re-encoding mouse reports                                   |
-| `src/server/pane.rs`       | PTY, shell process, terminal emulation                                   |
-| `src/client/mod.rs`        | Commands, server bootstrap, attaching                                    |
-| `src/client/relay.rs`      | The attached client: keys, panels, chrome and switching sessions         |
-| `src/client/chrome/`       | Status bar, prompt, reconnect overlay, key decoding and drawing helpers  |
-| `src/client/tree.rs`       | The `Ctrl-b s` cluster tree                                              |
-| `src/client/listing.rs`    | `amux ls`, `amux projects` and `amux servers` output                     |
-| `src/client/projects.rs`   | Resolving `-p` against the projects the cluster knows                    |
-| `src/client/terminal.rs`   | Raw mode, alternate screen, stdin reader                                 |
-| `src/client/keys.rs`       | Prefix key handling and the key bindings                                 |
-| `tests/common/mod.rs`      | `TestServer`, `TestClient`, a PTY-driven client and linked test clusters |
-| `tests/common/git.rs`      | Temporary repos with a local bare `origin` for the project tests         |
+| Path                         | Responsibility                                                                                                     |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `src/main.rs`                | Parses the command line and dispatches                                                                             |
+| `src/lib.rs`                 | The library the binary and the tests share                                                                         |
+| `src/cli.rs`                 | Command-line interface                                                                                             |
+| `src/paths.rs`               | Runtime, config and state paths                                                                                    |
+| `src/config.rs`              | Config file, server ID and incarnation                                                                             |
+| `src/target.rs`              | `session@server` targets: parsing, validation and resolution                                                       |
+| `src/project/id.rs`          | Project ids from origin URLs, local paths and root commits                                                         |
+| `src/project/detect.rs`      | Finding the project, branch and main checkout of a directory                                                       |
+| `src/project/registry.rs`    | The `projects.toml` registry of local checkouts                                                                    |
+| `src/project/worktree.rs`    | Default branch, worktrees, fetch, clone and removal                                                                |
+| `src/project/git.rs`         | Running `git` without prompts, with an optional timeout                                                            |
+| `src/protocol/mod.rs`        | Framing and the `Duplex` message channels                                                                          |
+| `src/protocol/greeting.rs`   | Greeting, version constants and the version check                                                                  |
+| `src/protocol/client.rs`     | Client and server messages                                                                                         |
+| `src/protocol/peer.rs`       | Peer messages, snapshots and state events                                                                          |
+| `src/protocol/key.rs`        | Public keys, their hex form and fingerprints                                                                       |
+| `src/cluster/mod.rs`         | Membership, dial loops, peer cache                                                                                 |
+| `src/cluster/link.rs`        | Peer handshake, link lanes, pings                                                                                  |
+| `src/cluster/channel.rs`     | Channels over a link: ids, credit, capped inbound queues                                                           |
+| `src/cluster/transport.rs`   | Addresses, how to dial each one, and how a link was authenticated                                                  |
+| `src/cluster/ssh.rs`         | The SSH and exec transport, the remote amux lookup, `amux bridge`                                                  |
+| `src/cluster/noise.rs`       | Noise keys, the TCP opening, the Noise handshake and the pump                                                      |
+| `src/cluster/listener.rs`    | The tailnet and LAN listeners and the limits before authentication                                                 |
+| `src/cluster/trust.rs`       | The `trust.toml` store and the rules for trust updates and tombstones                                              |
+| `src/cluster/cache.rs`       | The cluster cache and reading older versions of it                                                                 |
+| `src/discovery/mod.rs`       | Discovery sources, their state and the `amux discover` report                                                      |
+| `src/discovery/tailscale.rs` | Reading `tailscale status`, the tailnet listener and `tailscale whois`                                             |
+| `src/discovery/lan.rs`       | LAN candidates, the advertisement and `lan://` endpoints                                                           |
+| `src/discovery/mdns.rs`      | Advertising and browsing over mDNS                                                                                 |
+| `src/discovery/directory.rs` | A directory that stands in for mDNS in the tests                                                                   |
+| `src/pairing.rs`             | Pairing codes and windows, and SPAKE2 inside Noise                                                                 |
+| `src/server/mod.rs`          | Accept loop, session registry, state events, shutdown                                                              |
+| `src/server/connection.rs`   | Per-client requests, target routing and the attach loop                                                            |
+| `src/server/status.rs`       | The cluster status sent to attached clients                                                                        |
+| `src/server/forward.rs`      | Forwarding a client to a session on another server, reconnects                                                     |
+| `src/server/projects.rs`     | Project registry, checkouts, clones, worktree sessions and removal                                                 |
+| `src/server/session.rs`      | Session state, its windows and the commands that change them                                                       |
+| `src/server/window.rs`       | A window's layout, panes, active pane and mouse routing                                                            |
+| `src/server/layout.rs`       | The pane layout tree: splits, rectangles, borders and neighbours                                                   |
+| `src/server/render/`         | The compositor, the per-client differ and escape sequences                                                         |
+| `src/server/mouse.rs`        | Decoding and re-encoding mouse reports                                                                             |
+| `src/server/pane.rs`         | PTY, shell process, terminal emulation                                                                             |
+| `src/client/mod.rs`          | Commands, server bootstrap, attaching                                                                              |
+| `src/client/relay.rs`        | The attached client: keys, panels, chrome and switching sessions                                                   |
+| `src/client/chrome/`         | Status bar, prompt, reconnect overlay, key decoding and drawing helpers                                            |
+| `src/client/tree.rs`         | The `Ctrl-b s` cluster tree                                                                                        |
+| `src/client/listing.rs`      | `amux ls`, `amux projects`, `amux servers`, `amux discover` and `amux pair` output                                 |
+| `src/client/projects.rs`     | Resolving `-p` against the projects the cluster knows                                                              |
+| `src/client/terminal.rs`     | Raw mode, alternate screen, stdin reader                                                                           |
+| `src/client/keys.rs`         | Prefix key handling and the key bindings                                                                           |
+| `tests/common/mod.rs`        | `TestServer`, `TestClient`, a PTY-driven client, linked test clusters and fakes for `ssh`, `tailscale` and the LAN |
+| `tests/common/git.rs`        | Temporary repos with a local bare `origin` for the project tests                                                   |
 
 Set `AMUX_LOG=debug` before the server starts to get more verbose logs.
 
 ## Tests
 
 `cargo test` runs the unit tests and the integration tests in `tests/`. Each integration test starts its own server with a temporary `HOME`, `XDG_*` directories and socket, so it never touches your real server, config or state. Some tests drive the real `amux` binary inside a PTY. Cluster tests link several such servers on one machine through `exec:` addresses that run `amux bridge` with the other server's environment. Project tests work on temporary repos cloned from a local bare `origin`, and run git with their own identity and no user or system config.
+
+Discovery is off in every test server unless the test turns it on, so no test touches the real tailnet or LAN. A fake `tailscale` (`AMUX_TAILSCALE`) serves `status` and `whois` from JSON files the test rewrites, a directory stands in for mDNS (`AMUX_LAN_DIR`), and a fake `ssh` (`AMUX_SSH`) maps host names to test servers. The one test that pairs over real mDNS, on a random service type set with `AMUX_MDNS_SERVICE`, is ignored by default because loopback has no multicast. `cargo test -- --ignored` runs it on a machine with a real network.
 
 ## Roadmap
 
@@ -281,13 +442,14 @@ amux is growing into a multiplexer that spans machines, following [docs/design.m
 - [x] Windows within a session (`Ctrl-b c`, `n`, `p`)
 - [x] Pane splits with a layout tree and a cell-level compositor
 - [x] Status bar with cluster information, rename prompts and the `Ctrl-b s` cluster tree
+- [x] A direct TCP transport with a keypair for each server (Noise), so links don't need sshd
+- [x] Finding peers from `tailscale status`, LAN discovery over mDNS and `amux pair`
+- [x] A trust store shared across the cluster, `amux servers forget` and `amux discover`
 
-Phases 1 to 6 of the design are done. What remains is its phase 7, "Later":
+Phases 1 to 7 of the design are done. What remains is its phase 8, "Later":
 
-- [ ] A direct TCP transport with a keypair for each server (Noise), so links don't need sshd
 - [ ] Session persistence: layouts and working directories that survive a server restart
 - [ ] Predictive local echo for high-latency links, like mosh
-- [ ] Finding peers from `tailscale status`
 
 Beyond the design:
 

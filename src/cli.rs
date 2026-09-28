@@ -244,12 +244,12 @@ pub struct AddServerArgs {
     #[arg(help = "Name for the server")]
     pub name: String,
 
-    #[arg(help = "ssh://[user@]host[:port] or exec:<command>")]
+    #[arg(help = "ssh://[user@]host[:port], tcp://host:port, lan://<server id> or exec:<command>")]
     pub address: String,
 
     #[arg(
         long,
-        help = "Path of amux on that machine, defaults to amux on its PATH"
+        help = "Path of amux on that machine, defaults to the first of amux on its PATH, ~/.cargo/bin, ~/.local/bin, /usr/local/bin and /opt/homebrew/bin"
     )]
     pub amux_path: Option<String>,
 
