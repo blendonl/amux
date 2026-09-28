@@ -351,8 +351,8 @@ mod tests {
         assert!(
             error.contains(
                 "borders, cluster, discovery, escape_time_ms, lan, mouse, name, notice_ms, pane, \
-                 prefix, projects, projects_dir, servers, session, status, theme, tree, window, \
-                 worktrees"
+                 prefix, projects, projects_dir, servers, session, status, theme, tree, which_key, \
+                 window, worktrees"
             ),
             "{error}"
         );

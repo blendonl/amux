@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::keys::{Decoded, Key, KeyDecoder, Scanner, ESC};
+use crate::keys::{Decoded, Key, KeyCode, KeyDecoder, Scanner, ESC};
 use crate::protocol::SessionCommand;
 use crate::settings::{Binding, CallbackId, Keymap, PREFIX_TABLE, ROOT_TABLE};
 
@@ -19,6 +19,8 @@ pub enum Action {
     Open(Panel),
     Callback(CallbackId),
     ReloadConfig,
+    ShowKeys,
+    TurnPage(Page),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +30,18 @@ pub enum Panel {
     ClusterTree,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Page {
+    Next,
+    Previous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Level {
+    pub table: String,
+    pub key: Option<Key>,
+}
+
 pub struct KeyRouter {
     prefix: Key,
     keymap: Arc<Keymap>,
@@ -35,7 +49,8 @@ pub struct KeyRouter {
     trie: Trie,
     scanner: Scanner,
     held: Held,
-    table: Option<String>,
+    levels: Vec<Level>,
+    showing_keys: bool,
     decoder: KeyDecoder,
     escape_at: Option<Instant>,
 }
@@ -49,10 +64,19 @@ impl KeyRouter {
             escape_time,
             scanner: Scanner::default(),
             held: Held::default(),
-            table: None,
+            levels: Vec::new(),
+            showing_keys: false,
             decoder: KeyDecoder::default(),
             escape_at: None,
         }
+    }
+
+    pub fn pending(&self) -> &[Level] {
+        &self.levels
+    }
+
+    pub fn set_showing_keys(&mut self, showing: bool) {
+        self.showing_keys = showing;
     }
 
     pub fn route(&mut self, input: &[u8]) -> (Vec<Action>, Vec<u8>) {
@@ -74,7 +98,12 @@ impl KeyRouter {
 
     pub fn run_binding(&mut self, binding: Binding) -> Vec<Action> {
         let mut routed = Routed::default();
-        if let Some(action) = self.perform(binding, &mut routed) {
+        let pressed = Pressed {
+            binding,
+            key: None,
+            path: Vec::new(),
+        };
+        if let Some(action) = self.perform(pressed, &mut routed) {
             routed.act(action);
         }
         routed.finish()
@@ -83,10 +112,13 @@ impl KeyRouter {
     pub fn set_keymap(&mut self, keymap: Arc<Keymap>) -> Vec<u8> {
         let held = self.flush();
         self.trie = Trie::root(self.prefix, &keymap);
-        self.table = self
-            .table
-            .take()
-            .filter(|table| keymap.table(table).is_some());
+        if !self
+            .levels
+            .iter()
+            .all(|level| keymap.table(&level.table).is_some())
+        {
+            self.levels.clear();
+        }
         self.keymap = keymap;
         held
     }
@@ -94,26 +126,32 @@ impl KeyRouter {
     fn run(&mut self, mut queue: VecDeque<u8>, expire: bool) -> (Vec<Action>, Vec<u8>) {
         let mut routed = Routed::default();
         loop {
-            let binding = if self.table.is_some() {
-                if queue.is_empty() {
+            let pressed = if !self.levels.is_empty() {
+                if !queue.is_empty() {
+                    self.table_input(&mut queue, &mut routed)
+                } else if expire && self.decoder.holds_escape() {
+                    let decoded = self.decoder.time_out();
+                    decoded.and_then(|decoded| self.read_table(decoded, &mut queue, &mut routed))
+                } else {
                     break;
                 }
-                self.table_input(&mut queue, &mut routed)
             } else if let Some(byte) = queue.pop_front() {
                 self.root_byte(byte, &mut queue, &mut routed)
+                    .map(Pressed::root)
             } else if expire && self.holds_escape() {
                 self.release(&mut queue, &mut routed, None)
+                    .map(Pressed::root)
             } else {
                 break;
             };
-            if let Some(action) = binding.and_then(|binding| self.perform(binding, &mut routed)) {
+            if let Some(action) = pressed.and_then(|pressed| self.perform(pressed, &mut routed)) {
                 routed.act(action);
                 break;
             }
         }
-        self.escape_at = self
-            .holds_escape()
-            .then(|| Instant::now() + self.escape_time);
+        let table_escape = !self.levels.is_empty() && self.decoder.holds_escape();
+        self.escape_at =
+            (self.holds_escape() || table_escape).then(|| Instant::now() + self.escape_time);
         (routed.finish(), queue.into())
     }
 
@@ -122,7 +160,7 @@ impl KeyRouter {
         byte: u8,
         queue: &mut VecDeque<u8>,
         routed: &mut Routed,
-    ) -> Option<Binding> {
+    ) -> Option<(Key, Binding)> {
         let holding = !self.held.bytes.is_empty();
         if !holding && (self.scanner.is_pasting() || !self.scanner.starts_sequence(byte)) {
             self.pass(byte, routed);
@@ -152,7 +190,7 @@ impl KeyRouter {
         queue: &mut VecDeque<u8>,
         routed: &mut Routed,
         next: Option<u8>,
-    ) -> Option<Binding> {
+    ) -> Option<(Key, Binding)> {
         let held = mem::take(&mut self.held);
         if let Some((len, node)) = held.matched {
             let scanner = self.scanner_after(&held.bytes[..len]);
@@ -189,13 +227,39 @@ impl KeyRouter {
         !self.held.bytes.is_empty() && self.held.bytes.iter().all(|&byte| byte == ESC)
     }
 
-    fn table_input(&mut self, queue: &mut VecDeque<u8>, routed: &mut Routed) -> Option<Binding> {
+    fn table_input(&mut self, queue: &mut VecDeque<u8>, routed: &mut Routed) -> Option<Pressed> {
         self.decoder.push(queue.make_contiguous());
         queue.clear();
         let decoded = self.decoder.next_key()?;
         requeue(queue, &self.decoder.take_pending());
-        let table = self.table.take()?;
-        self.table_key(&table, decoded, queue, routed)
+        self.read_table(decoded, queue, routed)
+    }
+
+    fn read_table(
+        &mut self,
+        decoded: Decoded,
+        queue: &mut VecDeque<u8>,
+        routed: &mut Routed,
+    ) -> Option<Pressed> {
+        let mut path = mem::take(&mut self.levels);
+        let table = path.last()?.table.clone();
+        match self.table_key(&table, decoded, queue, routed)? {
+            Read::Bound(key, binding) => Some(Pressed {
+                binding,
+                key: Some(key),
+                path,
+            }),
+            Read::Back => {
+                path.pop();
+                self.levels = path;
+                None
+            }
+            Read::Page(page) => {
+                self.levels = path;
+                routed.act(Action::TurnPage(page));
+                None
+            }
+        }
     }
 
     fn table_key(
@@ -204,14 +268,14 @@ impl KeyRouter {
         decoded: Decoded,
         queue: &mut VecDeque<u8>,
         routed: &mut Routed,
-    ) -> Option<Binding> {
+    ) -> Option<Read> {
         let bound = self
             .keymap
             .table(table)
             .zip(decoded.key)
-            .and_then(|(bindings, key)| bindings.get(&key));
-        if let Some(binding) = bound {
-            return Some(binding.clone());
+            .and_then(|(bindings, key)| Some((key, bindings.get(&key)?.clone())));
+        if let Some((key, binding)) = bound {
+            return Some(Read::Bound(key, binding));
         }
         if self.scanner_after(&decoded.raw).is_pasting() {
             requeue(queue, &decoded.raw);
@@ -221,6 +285,9 @@ impl KeyRouter {
             routed.forward.extend(decoded.raw);
             return None;
         }
+        if let Some(read) = decoded.key.and_then(|key| self.navigation(key)) {
+            return Some(read);
+        }
         if let Some((escape, rest)) = decoded.split_escape() {
             requeue(queue, &rest.raw);
             return self.table_key(table, escape, queue, routed);
@@ -228,7 +295,32 @@ impl KeyRouter {
         None
     }
 
-    fn perform(&mut self, binding: Binding, routed: &mut Routed) -> Option<Action> {
+    fn navigation(&self, key: Key) -> Option<Read> {
+        if !key.mods.is_empty() {
+            return None;
+        }
+        match key.code {
+            KeyCode::Backspace => Some(Read::Back),
+            KeyCode::PageDown if self.showing_keys => Some(Read::Page(Page::Next)),
+            KeyCode::PageUp if self.showing_keys => Some(Read::Page(Page::Previous)),
+            _ => None,
+        }
+    }
+
+    fn enter(&mut self, mut path: Vec<Level>, table: String, key: Option<Key>) {
+        let known = table != ROOT_TABLE && self.keymap.table(&table).is_some();
+        if !known {
+            self.levels.clear();
+            return;
+        }
+        if path.last().is_none_or(|level| level.table != table) {
+            path.push(Level { table, key });
+        }
+        self.levels = path;
+    }
+
+    fn perform(&mut self, pressed: Pressed, routed: &mut Routed) -> Option<Action> {
+        let Pressed { binding, key, path } = pressed;
         Some(match binding {
             Binding::SendPrefix => {
                 let encoding = self.prefix.encodings().into_iter().next();
@@ -236,9 +328,15 @@ impl KeyRouter {
                 return None;
             }
             Binding::SwitchTable(table) => {
-                let known = table != ROOT_TABLE && self.keymap.table(&table).is_some();
-                self.table = known.then_some(table);
+                self.enter(path, table, key);
                 return None;
+            }
+            Binding::WhichKey(table) => {
+                self.enter(path, table, key);
+                if self.levels.is_empty() {
+                    return None;
+                }
+                Action::ShowKeys
             }
             Binding::Callback(id) => Action::Callback(id),
             Binding::ReloadConfig => Action::ReloadConfig,
@@ -264,6 +362,28 @@ impl KeyRouter {
 fn requeue(queue: &mut VecDeque<u8>, bytes: &[u8]) {
     for &byte in bytes.iter().rev() {
         queue.push_front(byte);
+    }
+}
+
+enum Read {
+    Bound(Key, Binding),
+    Back,
+    Page(Page),
+}
+
+struct Pressed {
+    binding: Binding,
+    key: Option<Key>,
+    path: Vec<Level>,
+}
+
+impl Pressed {
+    fn root((key, binding): (Key, Binding)) -> Self {
+        Self {
+            binding,
+            key: Some(key),
+            path: Vec::new(),
+        }
     }
 }
 
@@ -306,7 +426,7 @@ struct Trie {
 #[derive(Default)]
 struct TrieNode {
     next: BTreeMap<u8, usize>,
-    binding: Option<Binding>,
+    binding: Option<(Key, Binding)>,
 }
 
 impl Trie {
@@ -327,13 +447,13 @@ impl Trie {
         };
         for (key, binding) in bindings {
             for encoding in key.encodings() {
-                trie.insert(&encoding, binding.clone());
+                trie.insert(&encoding, key, binding.clone());
             }
         }
         trie
     }
 
-    fn insert(&mut self, bytes: &[u8], binding: Binding) {
+    fn insert(&mut self, bytes: &[u8], key: Key, binding: Binding) {
         let mut node = TRIE_ROOT;
         for &byte in bytes {
             node = match self.nodes[node].next.get(&byte) {
@@ -346,14 +466,14 @@ impl Trie {
                 }
             };
         }
-        self.nodes[node].binding = Some(binding);
+        self.nodes[node].binding = Some((key, binding));
     }
 
     fn step(&self, node: usize, byte: u8) -> Option<usize> {
         self.nodes[node].next.get(&byte).copied()
     }
 
-    fn binding(&self, node: usize) -> Option<&Binding> {
+    fn binding(&self, node: usize) -> Option<&(Key, Binding)> {
         self.nodes[node].binding.as_ref()
     }
 
@@ -821,6 +941,166 @@ mod tests {
         assert_eq!(route(&mut router, b"\x1bpzz"), vec![forward(b"z")]);
         assert_eq!(route(&mut router, b"\x1bpnd"), vec![Action::Detach]);
         assert_eq!(route(&mut router, b"\x1bqz"), vec![forward(b"z")]);
+    }
+
+    fn level(table: &str, key: Option<&str>) -> Level {
+        Level {
+            table: table.into(),
+            key: key.map(|notation| notation.parse().unwrap()),
+        }
+    }
+
+    fn router_with_resize() -> KeyRouter {
+        let mut keymap = Keymap::default();
+        keymap
+            .prefix
+            .insert(key("r"), Binding::SwitchTable("resize".into()));
+        keymap
+            .root
+            .insert(key("M-r"), Binding::SwitchTable("resize".into()));
+        keymap.custom.insert(
+            "resize".into(),
+            [
+                (key("h"), select_left()),
+                (key("m"), Binding::SwitchTable("more".into())),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        keymap.custom.insert(
+            "more".into(),
+            [(key("x"), Binding::KillPane)].into_iter().collect(),
+        );
+        KeyRouter::new(key("C-b"), Arc::new(keymap), ESCAPE_TIME)
+    }
+
+    #[test]
+    fn the_pending_levels_name_each_table_and_the_key_that_opened_it() {
+        let mut router = router_with_resize();
+        assert_eq!(router.pending(), []);
+        assert_eq!(route(&mut router, b"\x02"), vec![]);
+        assert_eq!(router.pending(), [level(PREFIX_TABLE, Some("C-b"))]);
+        assert_eq!(route(&mut router, b"r"), vec![]);
+        assert_eq!(
+            router.pending(),
+            [level(PREFIX_TABLE, Some("C-b")), level("resize", Some("r"))]
+        );
+        assert_eq!(route(&mut router, b"m"), vec![]);
+        assert_eq!(router.pending().len(), 3);
+        assert_eq!(
+            route(&mut router, b"x"),
+            vec![command(SessionCommand::KillPane)]
+        );
+        assert_eq!(router.pending(), []);
+
+        assert_eq!(route(&mut router, b"\x1br"), vec![]);
+        assert_eq!(router.pending(), [level("resize", Some("M-r"))]);
+        router.run_binding(Binding::SwitchTable("more".into()));
+        assert_eq!(router.pending(), [level("more", None)]);
+        router.run_binding(Binding::SwitchTable("bogus".into()));
+        assert_eq!(router.pending(), []);
+    }
+
+    #[test]
+    fn backspace_goes_back_one_table_and_leaves_the_first_one_for_the_root() {
+        let mut router = router_with_resize();
+        assert_eq!(route(&mut router, b"\x02rm\x7f"), vec![]);
+        assert_eq!(
+            router.pending(),
+            [level(PREFIX_TABLE, Some("C-b")), level("resize", Some("r"))]
+        );
+        assert_eq!(
+            route(&mut router, b"h"),
+            vec![command(SessionCommand::SelectPane(Direction::Left))]
+        );
+
+        assert_eq!(route(&mut router, b"\x02r\x08\x7fab"), vec![forward(b"ab")]);
+        assert_eq!(router.pending(), []);
+
+        let mut keymap = Keymap::default();
+        keymap.prefix.insert(key("Backspace"), Binding::NextPane);
+        let mut router = KeyRouter::new(key("C-b"), Arc::new(keymap), ESCAPE_TIME);
+        assert_eq!(
+            route(&mut router, b"\x02\x7f"),
+            vec![command(SessionCommand::NextPane)]
+        );
+    }
+
+    #[test]
+    fn which_key_enters_its_table_and_asks_to_show_it() {
+        let mut router = router_with_resize();
+        assert_eq!(route(&mut router, b"\x02?"), vec![Action::ShowKeys]);
+        assert_eq!(router.pending(), [level(PREFIX_TABLE, Some("C-b"))]);
+        assert_eq!(route(&mut router, b"d"), vec![Action::Detach]);
+
+        assert_eq!(
+            router.run_binding(Binding::WhichKey("resize".into())),
+            vec![Action::ShowKeys]
+        );
+        assert_eq!(router.pending(), [level("resize", None)]);
+        assert_eq!(
+            router.run_binding(Binding::WhichKey("bogus".into())),
+            vec![]
+        );
+        assert_eq!(router.pending(), []);
+    }
+
+    #[test]
+    fn a_lone_escape_in_a_table_leaves_it_once_the_timeout_expires() {
+        let mut router = router_with_resize();
+        assert_eq!(route(&mut router, b"\x02r\x1b"), vec![]);
+        assert!(router.escape_deadline().is_some());
+        assert_eq!(router.pending().len(), 2);
+        assert_eq!(router.time_out(), (vec![], Vec::new()));
+        assert_eq!(router.pending(), []);
+        assert_eq!(router.escape_deadline(), None);
+
+        assert_eq!(route(&mut router, b"\x02\x1b["), vec![]);
+        assert_eq!(router.escape_deadline(), None);
+        assert_eq!(
+            route(&mut router, b"A"),
+            vec![command(SessionCommand::SelectPane(Direction::Up))]
+        );
+
+        let mut keymap = Keymap::default();
+        keymap.prefix.insert(key("Escape"), Binding::ClusterTree);
+        let mut router = KeyRouter::new(key("C-b"), Arc::new(keymap), ESCAPE_TIME);
+        assert_eq!(route(&mut router, b"\x02\x1b"), vec![]);
+        assert_eq!(
+            router.time_out(),
+            (vec![Action::Open(Panel::ClusterTree)], Vec::new())
+        );
+    }
+
+    #[test]
+    fn page_keys_turn_the_page_only_while_the_keys_show() {
+        let mut router = router_with_resize();
+        assert_eq!(route(&mut router, b"\x02\x1b[6~a"), vec![forward(b"a")]);
+
+        router.set_showing_keys(true);
+        assert_eq!(
+            route(&mut router, b"\x02\x1b[6~\x1b[5~"),
+            vec![
+                Action::TurnPage(Page::Next),
+                Action::TurnPage(Page::Previous)
+            ]
+        );
+        assert_eq!(router.pending(), [level(PREFIX_TABLE, Some("C-b"))]);
+        assert_eq!(route(&mut router, b"d"), vec![Action::Detach]);
+        assert_eq!(route(&mut router, b"\x1b[6~"), vec![forward(b"\x1b[6~")]);
+    }
+
+    #[test]
+    fn a_new_keymap_keeps_the_pending_levels_only_while_their_tables_exist() {
+        let mut router = router_with_resize();
+        route(&mut router, b"\x02r");
+        router.set_keymap(Arc::new(Keymap::default()));
+        assert_eq!(router.pending(), []);
+
+        let mut router = router_with_resize();
+        route(&mut router, b"\x02");
+        router.set_keymap(Arc::new(Keymap::default()));
+        assert_eq!(router.pending(), [level(PREFIX_TABLE, Some("C-b"))]);
     }
 
     #[test]

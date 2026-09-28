@@ -15,6 +15,8 @@ use crate::settings::{
     PROMPT_TABLE, ROOT_TABLE, TREE_TABLE,
 };
 
+const SET_OPTIONS: [&str; 1] = ["desc"];
+
 pub const EVENTS: [&str; 11] = [
     "session_created",
     "session_closed",
@@ -142,16 +144,17 @@ fn keymap(lua: &Lua, constructors: Table) -> mlua::Result<Table> {
         "set",
         function(
             lua,
-            move |lua, (table, key, value): (String, String, Value)| {
+            move |lua, (table, key, value, options): (String, String, Value, Option<Table>)| {
                 let key = parse_key(&key)?;
+                let description = description(options)?;
                 match table.as_str() {
                     PROMPT_TABLE => {
                         let action = panel_action::<PromptAction>(&table, value)?;
-                        registry(lua)?.keymap.prompt.insert(key, action);
+                        bind(&mut registry(lua)?.keymap.prompt, key, action, description);
                     }
                     TREE_TABLE => {
                         let action = panel_action::<TreeAction>(&table, value)?;
-                        registry(lua)?.keymap.tree.insert(key, action);
+                        bind(&mut registry(lua)?.keymap.tree, key, action, description);
                     }
                     name => {
                         let bound = bound(lua, &constructors, value)?;
@@ -166,7 +169,7 @@ fn keymap(lua: &Lua, constructors: Table) -> mlua::Result<Table> {
                                 Binding::Callback(callbacks.register(callback))
                             }
                         };
-                        unbound(callbacks, bindings.insert(key, binding));
+                        unbound(callbacks, bind(bindings, key, binding, description));
                     }
                 }
                 Ok(())
@@ -240,6 +243,40 @@ fn keymap(lua: &Lua, constructors: Table) -> mlua::Result<Table> {
         })?,
     )?;
     Ok(keymap)
+}
+
+fn description(options: Option<Table>) -> mlua::Result<Option<String>> {
+    let Some(options) = options else {
+        return Ok(None);
+    };
+    for pair in options.pairs::<Value, Value>() {
+        let (option, _) = pair?;
+        let known = option
+            .as_string()
+            .and_then(|option| option.to_str().ok())
+            .is_some_and(|option| SET_OPTIONS.contains(&&*option));
+        if !known {
+            return Err(mlua::Error::runtime(format!(
+                "unknown amux.keymap.set option {}, expected {}",
+                option.to_string()?,
+                SET_OPTIONS.join(", ")
+            )));
+        }
+    }
+    options.get("desc")
+}
+
+fn bind<A>(
+    bindings: &mut Bindings<A>,
+    key: Key,
+    action: A,
+    description: Option<String>,
+) -> Option<A> {
+    let replaced = bindings.insert(key, action);
+    if let Some(description) = description {
+        bindings.describe(key, description);
+    }
+    replaced
 }
 
 fn unbound(callbacks: &mut Callbacks, removed: Option<Binding>) -> bool {
@@ -499,7 +536,7 @@ mod tests {
         )
         .keymap;
         assert_eq!(keymap.prefix.get(&key("&")), None);
-        assert_eq!(keymap.prefix.iter().count(), 26);
+        assert_eq!(keymap.prefix.iter().count(), 27);
         assert_eq!(keymap.prompt.get(&key("C-u")), None);
         assert_eq!(keymap.custom["resize"].iter().count(), 0);
         assert!(!keymap.custom.contains_key("gone"));
@@ -507,6 +544,32 @@ mod tests {
             keymap.tree.iter().collect::<Vec<_>>(),
             [(&key("j"), &TreeAction::Down)]
         );
+    }
+
+    #[test]
+    fn keymap_set_takes_a_description() {
+        let keymap = loaded(
+            "amux.keymap.set('prefix', 'g', function() end, { desc = 'show the diff' })\n\
+             amux.keymap.set('prefix', 'r', amux.action.switch_table('resize'), { desc = 'resize' })\n\
+             amux.keymap.set('resize', 'h', 'next_pane', {})\n\
+             amux.keymap.set('prompt', 'C-w', 'delete_line', { desc = 'wipe' })\n\
+             amux.keymap.set('prefix', 'c', 'new_window', { desc = 'shell' })\n\
+             amux.keymap.set('prefix', 'c', 'new_window')",
+        )
+        .keymap;
+        assert_eq!(keymap.prefix.description(&key("g")), Some("show the diff"));
+        assert_eq!(keymap.prefix.description(&key("r")), Some("resize"));
+        assert_eq!(keymap.prefix.description(&key("c")), None);
+        assert_eq!(keymap.custom["resize"].description(&key("h")), None);
+        assert_eq!(keymap.prompt.description(&key("C-w")), Some("wipe"));
+
+        let error = failure("amux.keymap.set('prefix', 'g', 'detach', { descr = 'x' })");
+        assert!(
+            error.contains("init.lua:1: unknown amux.keymap.set option descr, expected desc"),
+            "{error}"
+        );
+        let error = failure("amux.keymap.set('prefix', 'g', 'detach', { desc = {} })");
+        assert!(error.contains("init.lua:1:"), "{error}");
     }
 
     #[test]
@@ -571,7 +634,7 @@ mod tests {
                 "init.lua:1: unknown action zoom, expected one of detach, send_prefix, \
                  new_window, next_window, previous_window, select_window, split_pane, \
                  next_pane, select_pane, kill_pane, kill_window, rename_window, \
-                 rename_session, cluster_tree, switch_table, reload_config"
+                 rename_session, cluster_tree, switch_table, reload_config, which_key"
             ),
             "{error}"
         );
@@ -668,7 +731,7 @@ mod tests {
     #[test]
     fn every_action_constructor_is_exposed() {
         let names = variants::<Binding>();
-        assert_eq!(names.len(), 16);
+        assert_eq!(names.len(), 17);
         assert!(names.contains(&"switch_table"));
         assert!(!names.contains(&"callback"));
         let loaded = loaded("");

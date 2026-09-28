@@ -16,6 +16,12 @@ pub struct Theme {
     pub tree_server: StyleSpec,
     pub tree_stale: StyleSpec,
     pub tree_cursor: StyleSpec,
+    pub which_key: StyleSpec,
+    pub which_key_border: StyleSpec,
+    pub which_key_title: StyleSpec,
+    pub which_key_key: StyleSpec,
+    pub which_key_separator: StyleSpec,
+    pub which_key_group: StyleSpec,
     pub overlay_text: StyleSpec,
     pub overlay_border: StyleSpec,
     pub pane_border: StyleSpec,
@@ -36,6 +42,18 @@ impl Default for Theme {
             tree_server: StyleSpec::BOLD,
             tree_stale: StyleSpec::DIM,
             tree_cursor: StyleSpec::REVERSE,
+            which_key: StyleSpec::EMPTY,
+            which_key_border: StyleSpec::DIM,
+            which_key_title: StyleSpec::BOLD,
+            which_key_key: StyleSpec {
+                fg: Some(Color::CYAN),
+                ..StyleSpec::BOLD
+            },
+            which_key_separator: StyleSpec::DIM,
+            which_key_group: StyleSpec {
+                fg: Some(Color::MAGENTA),
+                ..StyleSpec::EMPTY
+            },
             overlay_text: StyleSpec::BOLD,
             overlay_border: StyleSpec::EMPTY,
             pane_border: StyleSpec::EMPTY,

@@ -30,8 +30,44 @@ pub enum Binding {
     ClusterTree,
     SwitchTable(String),
     ReloadConfig,
+    WhichKey(String),
     #[serde(skip)]
     Callback(CallbackId),
+}
+
+impl Binding {
+    pub fn description(&self) -> String {
+        match self {
+            Self::Detach => "detach".into(),
+            Self::SendPrefix => "send prefix".into(),
+            Self::NewWindow => "new window".into(),
+            Self::NextWindow => "next window".into(),
+            Self::PreviousWindow => "previous window".into(),
+            Self::SelectWindow(index) => format!("window {index}"),
+            Self::SplitPane(Split::LeftRight) => "split left/right".into(),
+            Self::SplitPane(Split::TopBottom) => "split top/bottom".into(),
+            Self::NextPane => "next pane".into(),
+            Self::SelectPane(direction) => format!("pane {}", direction_name(*direction)),
+            Self::KillPane => "kill pane".into(),
+            Self::KillWindow => "kill window".into(),
+            Self::RenameWindow => "rename window".into(),
+            Self::RenameSession => "rename session".into(),
+            Self::ClusterTree => "cluster tree".into(),
+            Self::SwitchTable(table) => table.clone(),
+            Self::ReloadConfig => "reload config".into(),
+            Self::WhichKey(table) => format!("show {table} keys"),
+            Self::Callback(_) => "lua function".into(),
+        }
+    }
+}
+
+fn direction_name(direction: Direction) -> &'static str {
+    match direction {
+        Direction::Left => "left",
+        Direction::Right => "right",
+        Direction::Up => "up",
+        Direction::Down => "down",
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -78,39 +114,58 @@ pub enum TreeAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Table<A>(BTreeMap<Key, A>);
+pub struct Table<A> {
+    bindings: BTreeMap<Key, A>,
+    descriptions: BTreeMap<Key, String>,
+}
 
 impl<A> Default for Table<A> {
     fn default() -> Self {
-        Self(BTreeMap::new())
+        Self {
+            bindings: BTreeMap::new(),
+            descriptions: BTreeMap::new(),
+        }
     }
 }
 
 impl<A> Table<A> {
     pub fn get(&self, key: &Key) -> Option<&A> {
-        self.0.get(key)
+        self.bindings.get(key)
     }
 
     pub fn insert(&mut self, key: Key, action: A) -> Option<A> {
-        self.0.insert(key, action)
+        self.descriptions.remove(&key);
+        self.bindings.insert(key, action)
+    }
+
+    pub fn describe(&mut self, key: Key, description: String) {
+        if self.bindings.contains_key(&key) {
+            self.descriptions.insert(key, description);
+        }
+    }
+
+    pub fn description(&self, key: &Key) -> Option<&str> {
+        self.descriptions.get(key).map(String::as_str)
     }
 
     pub fn remove(&mut self, key: &Key) -> Option<A> {
-        self.0.remove(key)
+        self.descriptions.remove(key);
+        self.bindings.remove(key)
     }
 
     pub fn clear(&mut self) {
-        self.0.clear();
+        self.bindings.clear();
+        self.descriptions.clear();
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&Key, &A)> {
-        self.0.iter()
+        self.bindings.iter()
     }
 }
 
 impl<A: PartialEq> Table<A> {
     pub fn key_for(&self, action: &A) -> Option<&Key> {
-        self.0
+        self.bindings
             .iter()
             .find(|(_, bound)| *bound == action)
             .map(|(key, _)| key)
@@ -141,7 +196,10 @@ impl<A: Clone> Table<A> {
 
 impl<A> FromIterator<(Key, A)> for Table<A> {
     fn from_iter<I: IntoIterator<Item = (Key, A)>>(bindings: I) -> Self {
-        Self(bindings.into_iter().collect())
+        Self {
+            bindings: bindings.into_iter().collect(),
+            descriptions: BTreeMap::new(),
+        }
     }
 }
 
@@ -202,6 +260,7 @@ fn prefix_table() -> Table<Binding> {
         (Key::char('x'), Binding::KillPane),
         (Key::char('&'), Binding::KillWindow),
         (Key::char('r'), Binding::ReloadConfig),
+        (Key::char('?'), Binding::WhichKey(PREFIX_TABLE.to_owned())),
         (Key::from(KeyCode::Up), Binding::SelectPane(Direction::Up)),
         (
             Key::from(KeyCode::Down),
@@ -299,12 +358,13 @@ mod tests {
             ("x", Binding::KillPane),
             ("&", Binding::KillWindow),
             ("r", Binding::ReloadConfig),
+            ("?", Binding::WhichKey(PREFIX_TABLE.into())),
             ("Up", Binding::SelectPane(Direction::Up)),
             ("Left", Binding::SelectPane(Direction::Left)),
         ] {
             assert_eq!(prefix.get(&key(notation)), Some(&binding), "{notation}");
         }
-        assert_eq!(prefix.iter().count(), 27);
+        assert_eq!(prefix.iter().count(), 28);
         assert_eq!(prefix.get(&key("C-b")), None);
         assert_eq!(Keymap::default().root, Table::default());
     }
@@ -328,6 +388,43 @@ mod tests {
             keymap.hint_for(&Binding::Detach, &key("C-b")).as_deref(),
             Some("Alt-d")
         );
+    }
+
+    #[test]
+    fn a_description_lives_until_its_key_is_bound_again_or_removed() {
+        let mut table = Keymap::default().prefix;
+        assert_eq!(table.description(&key("c")), None);
+        table.describe(key("c"), "open a shell".into());
+        assert_eq!(table.description(&key("c")), Some("open a shell"));
+        table.describe(key("z"), "unbound".into());
+        assert_eq!(table.description(&key("z")), None);
+
+        table.insert(key("c"), Binding::NewWindow);
+        assert_eq!(table.description(&key("c")), None);
+        table.describe(key("c"), "open a shell".into());
+        table.remove(&key("c"));
+        table.insert(key("c"), Binding::NewWindow);
+        assert_eq!(table.description(&key("c")), None);
+
+        table.describe(key("d"), "leave".into());
+        table.clear();
+        table.insert(key("d"), Binding::Detach);
+        assert_eq!(table.description(&key("d")), None);
+    }
+
+    #[test]
+    fn every_binding_has_a_short_description() {
+        for (binding, description) in [
+            (Binding::SelectWindow(3), "window 3"),
+            (Binding::SplitPane(Split::LeftRight), "split left/right"),
+            (Binding::SplitPane(Split::TopBottom), "split top/bottom"),
+            (Binding::SelectPane(Direction::Up), "pane up"),
+            (Binding::SwitchTable("resize".into()), "resize"),
+            (Binding::WhichKey(PREFIX_TABLE.into()), "show prefix keys"),
+            (Binding::Callback(CallbackId(4)), "lua function"),
+        ] {
+            assert_eq!(binding.description(), description);
+        }
     }
 
     #[test]
