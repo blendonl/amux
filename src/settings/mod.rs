@@ -14,7 +14,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 pub use callback::{CallbackId, CALLBACK_SLOT};
-pub use client::{StatusSettings, TreeSettings};
+pub use client::{StatusSettings, TreeSettings, WhichKeySettings};
 pub use cluster::{ClusterSettings, DiscoverySettings, LanSettings, ServerConfig, SshSettings};
 pub use host::{
     BorderSettings, MouseSettings, PaneSettings, ProjectConfig, SessionSettings, WindowSettings,
@@ -45,6 +45,7 @@ pub struct Settings {
     pub status: StatusSettings,
     pub theme: Theme,
     pub tree: TreeSettings,
+    pub which_key: WhichKeySettings,
     pub pane: PaneSettings,
     pub window: WindowSettings,
     pub session: SessionSettings,
@@ -139,6 +140,7 @@ impl Default for Settings {
             status: StatusSettings::default(),
             theme: Theme::default(),
             tree: TreeSettings::default(),
+            which_key: WhichKeySettings::default(),
             pane: PaneSettings::default(),
             window: WindowSettings::default(),
             session: SessionSettings::default(),

@@ -11,9 +11,9 @@ use tokio::time::{sleep_until, Instant};
 
 use super::chrome::{
     detach_hint, draw_row, render_reconnecting, Panel, PanelEvent, Placement, Prompt,
-    PromptPurpose, Rect, StatusLine, StatusSides, Style, WindowTab,
+    PromptPurpose, Rect, StatusLine, StatusSides, Style, WhichKey, WindowTab,
 };
-use super::router::{self, Action, KeyRouter};
+use super::router::{self, Action, KeyRouter, Level};
 use super::scripting::{ClientContext, Effect, Scripting, StatusContext};
 use super::terminal;
 use super::tree::Loading;
@@ -65,6 +65,9 @@ pub struct Relay {
     panel: Option<Box<dyn Panel>>,
     prompt_callback: Option<CallbackId>,
     escape_at: Option<Instant>,
+    which_key: Option<WhichKey>,
+    which_key_levels: Vec<Level>,
+    which_key_at: Option<Instant>,
     last_error: Option<String>,
     reload_requested: bool,
     reloading: Option<Result<(), String>>,
@@ -103,6 +106,9 @@ impl Relay {
             panel: None,
             prompt_callback: None,
             escape_at: None,
+            which_key: None,
+            which_key_levels: Vec::new(),
+            which_key_at: None,
             last_error: None,
             reload_requested: false,
             reloading: None,
@@ -204,6 +210,16 @@ impl Relay {
         self.drive_panel(|panel, attached| panel.time_out(attached));
     }
 
+    pub fn which_key_deadline(&self) -> Option<Instant> {
+        self.which_key_at
+    }
+
+    pub fn which_key_due(&mut self) {
+        if self.which_key_at.take().is_some() {
+            self.show_keys();
+        }
+    }
+
     pub fn notice_deadline(&self) -> Option<Instant> {
         self.notice.as_ref().map(|(_, until)| *until)
     }
@@ -265,6 +281,7 @@ impl Relay {
         if self.panel.is_some() {
             self.close_panel();
         }
+        self.hide_keys();
         let ClientConfig {
             settings,
             keymap,
@@ -298,8 +315,71 @@ impl Relay {
                 Action::Open(panel) => self.open(panel),
                 Action::Callback(id) => self.run_callback(id, None),
                 Action::ReloadConfig => self.reload_requested = self.reloading.is_none(),
+                Action::ShowKeys => self.show_keys(),
+                Action::TurnPage(page) => {
+                    if let Some(which_key) = self.which_key.as_mut() {
+                        which_key.turn(page);
+                        self.chrome_dirty = true;
+                    }
+                }
             }
         }
+        self.follow_keys();
+    }
+
+    fn follow_keys(&mut self) {
+        let levels = self.router.pending();
+        if levels.is_empty() {
+            self.hide_keys();
+            return;
+        }
+        if levels == self.which_key_levels.as_slice() {
+            return;
+        }
+        self.which_key_levels = levels.to_vec();
+        if self.which_key.is_some() {
+            self.show_keys();
+            return;
+        }
+        let which_key = &self.settings.which_key;
+        self.which_key_at = which_key
+            .enabled
+            .then(|| Instant::now() + which_key.delay());
+    }
+
+    fn show_keys(&mut self) {
+        self.which_key_at = None;
+        self.which_key_levels = self.router.pending().to_vec();
+        if self.which_key_levels.is_empty() {
+            self.hide_keys();
+            return;
+        }
+        if self.which_key.is_some() {
+            self.messages.push(ClientMessage::Redraw);
+        }
+        self.which_key = Some(WhichKey::new(
+            &self.keymap,
+            &self.which_key_levels,
+            self.settings.prefix,
+            &self.settings.which_key,
+            &self.settings.theme,
+        ));
+        self.router.set_showing_keys(true);
+        self.chrome_dirty = true;
+    }
+
+    fn hide_keys(&mut self) {
+        self.which_key_levels.clear();
+        self.which_key_at = None;
+        if self.which_key.take().is_none() {
+            return;
+        }
+        self.router.set_showing_keys(false);
+        self.messages.push(ClientMessage::Redraw);
+        if self.reconnecting.is_some() {
+            self.clear_above_status();
+        }
+        self.chrome_dirty = true;
     }
 
     fn run_callback(&mut self, id: CallbackId, input: Option<&str>) {
@@ -339,6 +419,11 @@ impl Relay {
         let held = self.router.set_keymap(Arc::clone(&self.keymap));
         if !held.is_empty() {
             self.messages.push(ClientMessage::Input(held));
+        }
+        if self.which_key.is_some() {
+            self.show_keys();
+        } else {
+            self.follow_keys();
         }
     }
 
@@ -482,17 +567,24 @@ impl Relay {
         if let Some(panel) = self.placed(Placement::SessionArea) {
             let drawn = panel.render(above);
             self.output.extend(drawn);
-        } else if let Some(server) = &self.reconnecting {
-            let area = Size {
-                rows: above.rows,
-                cols: above.cols,
-            };
-            self.output.extend(render_reconnecting(
-                server,
-                self.detach_hint.as_deref(),
-                area,
-                &self.settings.theme,
-            ));
+        } else {
+            if let Some(server) = &self.reconnecting {
+                let area = Size {
+                    rows: above.rows,
+                    cols: above.cols,
+                };
+                self.output.extend(render_reconnecting(
+                    server,
+                    self.detach_hint.as_deref(),
+                    area,
+                    &self.settings.theme,
+                ));
+            }
+            let area = self.which_key_area();
+            if let Some(which_key) = self.which_key.as_mut() {
+                let drawn = which_key.render(area);
+                self.output.extend(drawn);
+            }
         }
         match self.placed(Placement::StatusRow) {
             Some(panel) => {
@@ -579,6 +671,19 @@ impl Relay {
                 Style::PLAIN,
             );
         }
+    }
+
+    fn which_key_area(&self) -> Rect {
+        let mut area = self.above_status();
+        let borrows_last_row = self.notice.is_some()
+            || self
+                .panel
+                .as_ref()
+                .is_some_and(|panel| panel.placement() == Some(Placement::StatusRow));
+        if !self.settings.status.enabled && borrows_last_row {
+            area.rows = area.rows.saturating_sub(1);
+        }
+        area
     }
 
     fn above_status(&self) -> Rect {
@@ -733,6 +838,7 @@ pub async fn run(
         }
 
         let escape = relay.escape_deadline();
+        let which_key = relay.which_key_deadline();
         let notice = relay.notice_deadline();
         let status = relay.status_deadline();
         tokio::select! {
@@ -760,6 +866,9 @@ pub async fn run(
             () = sleep_until(escape.unwrap_or_else(Instant::now)), if escape.is_some() => {
                 relay.escape_timeout();
             }
+            () = sleep_until(which_key.unwrap_or_else(Instant::now)), if which_key.is_some() => {
+                relay.which_key_due();
+            }
             () = sleep_until(notice.unwrap_or_else(Instant::now)), if notice.is_some() => {
                 relay.notice_expired();
             }
@@ -783,7 +892,7 @@ mod tests {
     use crate::protocol::{
         Direction, ServerStatus, SessionCommand, SessionId, SessionInfo, WindowSummary,
     };
-    use crate::settings::{Binding, Color, StyleSpec};
+    use crate::settings::{Binding, Color, StyleSpec, PREFIX_TABLE};
 
     const SIZE: Size = Size { rows: 10, cols: 40 };
     const BOTTOM: u16 = SIZE.rows - 1;
@@ -1449,6 +1558,212 @@ mod tests {
         );
     }
 
+    fn which_key_keymap() -> Keymap {
+        let mut keymap = Keymap {
+            prefix: [
+                ("c", Binding::NewWindow),
+                ("r", Binding::SwitchTable("resize".into())),
+                ("?", Binding::WhichKey(PREFIX_TABLE.into())),
+            ]
+            .into_iter()
+            .map(|(notation, binding)| (notation.parse().unwrap(), binding))
+            .collect(),
+            ..Keymap::default()
+        };
+        keymap.custom.insert(
+            "resize".into(),
+            [("h".parse().unwrap(), Binding::SelectPane(Direction::Left))]
+                .into_iter()
+                .collect(),
+        );
+        keymap
+    }
+
+    fn which_key_relay(settings: Settings) -> (Relay, vt100::Parser) {
+        (
+            relay_with(settings, which_key_keymap()),
+            terminal(SIZE.rows, SIZE.cols),
+        )
+    }
+
+    fn rows(relay: &mut Relay, parser: &mut vt100::Parser) -> Vec<String> {
+        draw(relay, parser);
+        screen_text(parser)
+    }
+
+    fn prefix_rule() -> String {
+        format!("─ C-b {}", "─".repeat(34))
+    }
+
+    #[test]
+    fn the_keys_show_after_the_delay_and_the_next_key_runs_and_closes_them() {
+        let (mut relay, mut parser) = which_key_relay(Settings::default());
+        let before = Instant::now();
+        relay.input(b"\x02");
+        let deadline = relay.which_key_deadline().unwrap();
+        assert!(deadline >= before + Duration::from_millis(500));
+        assert!(!rows(&mut relay, &mut parser)
+            .iter()
+            .any(|row| row.starts_with('─')));
+
+        relay.which_key_due();
+        assert_eq!(relay.which_key_deadline(), None);
+        let screen = rows(&mut relay, &mut parser);
+        assert_eq!(screen[4], prefix_rule());
+        assert_eq!(
+            screen[5..9],
+            [
+                " c   → new window",
+                " r   → +resize",
+                " ?   → show prefix keys",
+                " C-b → send prefix",
+            ]
+        );
+        assert_eq!(screen[9], "[work@laptop]");
+        assert_eq!(relay.take_messages(), vec![]);
+
+        relay.input(b"c");
+        assert_eq!(
+            relay.take_messages(),
+            vec![
+                ClientMessage::Command(SessionCommand::NewWindow),
+                ClientMessage::Redraw,
+            ]
+        );
+        assert!(relay.which_key.is_none());
+        relay.which_key_due();
+        assert!(relay.which_key.is_none());
+        assert_eq!(relay.take_messages(), vec![]);
+    }
+
+    #[test]
+    fn a_key_before_the_delay_never_shows_the_keys() {
+        let (mut relay, _) = which_key_relay(Settings::default());
+        relay.input(b"\x02");
+        assert!(relay.which_key_deadline().is_some());
+        relay.input(b"c");
+        assert_eq!(relay.which_key_deadline(), None);
+        assert_eq!(
+            relay.take_messages(),
+            vec![ClientMessage::Command(SessionCommand::NewWindow)]
+        );
+    }
+
+    #[test]
+    fn turned_off_the_keys_show_only_when_asked_for() {
+        let mut settings = Settings::default();
+        settings.which_key.enabled = false;
+        let (mut relay, mut parser) = which_key_relay(settings);
+        relay.input(b"\x02");
+        assert_eq!(relay.which_key_deadline(), None);
+        relay.input(b"?");
+        let screen = rows(&mut relay, &mut parser);
+        assert_eq!(screen[4], prefix_rule());
+        assert_eq!(screen[5], " c   → new window");
+
+        relay.input(b"\x02");
+        assert_eq!(
+            relay.take_messages(),
+            vec![ClientMessage::Input(vec![0x02]), ClientMessage::Redraw]
+        );
+        assert!(relay.which_key.is_none());
+    }
+
+    #[test]
+    fn a_group_opens_in_place_and_backspace_goes_back() {
+        let (mut relay, mut parser) = which_key_relay(Settings::default());
+        relay.input(b"\x02?");
+        rows(&mut relay, &mut parser);
+
+        relay.input(b"r");
+        assert_eq!(relay.which_key_deadline(), None);
+        assert_eq!(relay.take_messages(), vec![ClientMessage::Redraw]);
+        let screen = rows(&mut relay, &mut parser);
+        assert_eq!(screen[7], format!("─ C-b r {}", "─".repeat(32)));
+        assert_eq!(screen[8], " h → pane left");
+
+        relay.input(b"\x7f");
+        assert_eq!(relay.take_messages(), vec![ClientMessage::Redraw]);
+        assert_eq!(rows(&mut relay, &mut parser)[4], prefix_rule());
+
+        relay.input(b"rh");
+        assert_eq!(
+            relay.take_messages(),
+            vec![
+                ClientMessage::Command(SessionCommand::SelectPane(Direction::Left)),
+                ClientMessage::Redraw,
+            ]
+        );
+    }
+
+    #[test]
+    fn page_keys_turn_the_pages_of_a_long_table() {
+        let (mut relay, mut parser) = relay_on("laptop");
+        let rule = |page: usize| format!("─ C-b {} {page}/4 ─", "─".repeat(28));
+        relay.input(b"\x02?");
+        let screen = rows(&mut relay, &mut parser);
+        assert_eq!(screen[0], rule(1));
+        assert_eq!(screen[1], " 0     → window 0");
+
+        relay.input(b"\x1b[6~");
+        let screen = rows(&mut relay, &mut parser);
+        assert_eq!(screen[0], rule(2));
+        assert_eq!(screen[1], " 8     → window 8");
+
+        relay.input(b"\x1b[5~\x1b[5~");
+        let screen = rows(&mut relay, &mut parser);
+        assert_eq!(screen[0], rule(4));
+        assert_eq!(screen[1], " Up    → pane up");
+        assert_eq!(relay.take_messages(), vec![]);
+
+        relay.input(b"d");
+        assert_eq!(
+            relay.take_messages(),
+            vec![ClientMessage::Detach, ClientMessage::Redraw]
+        );
+    }
+
+    #[test]
+    fn output_under_the_keys_is_covered_again() {
+        let (mut relay, mut parser) = which_key_relay(Settings::default());
+        relay.input(b"\x02?");
+        rows(&mut relay, &mut parser);
+        relay.server_message(Some(ServerMessage::Output(
+            b"\x1b[6;1Hoverwritten".to_vec(),
+        )));
+        assert_eq!(rows(&mut relay, &mut parser)[5], " c   → new window");
+    }
+
+    #[test]
+    fn escape_closes_the_keys_once_the_escape_time_passes() {
+        let (mut relay, _) = which_key_relay(Settings::default());
+        relay.input(b"\x02?");
+        relay.input(b"\x1b");
+        assert!(relay.escape_deadline().is_some());
+        assert!(relay.which_key.is_some());
+        relay.escape_timeout();
+        assert!(relay.which_key.is_none());
+        assert_eq!(relay.escape_deadline(), None);
+        assert_eq!(relay.take_messages(), vec![ClientMessage::Redraw]);
+    }
+
+    #[test]
+    fn without_the_status_bar_the_keys_stay_above_a_notice() {
+        let mut settings = Settings::default();
+        settings.status.enabled = false;
+        let (mut relay, mut parser) = which_key_relay(settings);
+        relay.input(b"\x02?");
+        let screen = rows(&mut relay, &mut parser);
+        assert_eq!(screen[5], prefix_rule());
+        assert_eq!(screen[9], " C-b → send prefix");
+
+        relay.server_message(Some(ServerMessage::Error("no room".into())));
+        let screen = rows(&mut relay, &mut parser);
+        assert_eq!(screen[4], prefix_rule());
+        assert_eq!(screen[8], " C-b → send prefix");
+        assert_eq!(screen[9], "no room");
+    }
+
     #[test]
     fn the_theme_and_chrome_settings_reach_every_panel() {
         let mut settings = Settings::default();
@@ -1656,6 +1971,32 @@ mod tests {
             relay.input(b"\x02n\x02j");
             assert_eq!(relay.take_messages(), Vec::new());
             assert_eq!(bottom(&mut relay, &mut parser), "jumped");
+        }
+
+        #[test]
+        fn lua_descriptions_and_delay_reach_the_keys_and_a_reload_closes_them() {
+            let (mut relay, mut parser) = scripted(
+                "amux.opt.which_key.delay_ms = 20\n\
+                 amux.keymap.clear('prefix')\n\
+                 amux.keymap.set('prefix', 'g', function() end, { desc = 'show the log' })",
+            );
+            let before = Instant::now();
+            relay.input(b"\x02");
+            let deadline = relay.which_key_deadline().unwrap();
+            assert!(deadline >= before + Duration::from_millis(20));
+            assert!(deadline <= Instant::now() + Duration::from_millis(20));
+            relay.which_key_due();
+            draw(&mut relay, &mut parser);
+            let screen = screen_text(&parser);
+            assert_eq!(screen[6], format!("─ C-b {}", "─".repeat(34)));
+            assert_eq!(screen[7..9], [" g   → show the log", " C-b → send prefix"]);
+
+            relay.client_reloaded(Ok(config("")));
+            assert!(relay.which_key.is_none());
+            assert_eq!(relay.router.pending(), []);
+            assert!(relay.take_messages().contains(&ClientMessage::Redraw));
+            relay.input(b"\x02d");
+            assert_eq!(relay.take_messages(), vec![ClientMessage::Detach]);
         }
 
         #[test]

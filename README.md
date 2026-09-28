@@ -59,6 +59,7 @@ A session holds numbered windows, and each window splits into panes, each runnin
 | `Ctrl-b $`              | Rename the session                               |
 | `Ctrl-b s`              | Pick a session or window anywhere in the cluster |
 | `Ctrl-b r`              | Reload the config, here and on this server       |
+| `Ctrl-b ?`              | Show every key that works after `Ctrl-b`         |
 | `Ctrl-b d`              | Detach                                           |
 | `Ctrl-b Ctrl-b`         | Send a literal `Ctrl-b`                          |
 
@@ -100,6 +101,27 @@ The client keeps the bottom row of the terminal for a status bar, so a session g
 `Ctrl-b ,` and `Ctrl-b $` open a prompt on the status bar, filled in with the window's or the session's current name. The arrow keys, `Home`, `End`, `Ctrl-a`, `Ctrl-e`, `Backspace`, `Delete` and `Ctrl-u` edit it, `Enter` renames and `Escape` or `Ctrl-c` cancels. Renaming a session works the same when it runs on another server.
 
 While the tree or a prompt is open, keys and mouse clicks go to it and never reach the session. A lone `Escape` closes it after 50 ms, since it could also be the start of an arrow key.
+
+### Which key
+
+Like which-key in Neovim and Emacs, amux shows what the next key can do when you stop to think. Press `Ctrl-b` and wait half a second, and a popup at the bottom of the session lists every key of the prefix table with what it does:
+
+```
+─ C-b ──────────────────────────────────────────────────────────────────────────
+ 0     → window 0           c     → new window         %     → split left/right
+ 1     → window 1           d     → detach             &     → kill window
+ …
+ 8     → window 8           "     → split top/bottom   C-b   → send prefix
+ 9     → window 9           $     → rename session
+```
+
+- The popup never changes what a key does. Pressing one runs it and closes the popup, and a key typed before the delay runs without the popup ever showing, so it stays out of the way once you know the keys.
+- `Ctrl-b ?` shows the popup at once, whether or not it is turned on.
+- A key that switches to another table (`switch_table`) shows as a group, `+resize`, and pressing it shows that table in place. The rule at the top names the keys typed so far, `C-b r`, and `Backspace` goes back one table.
+- `Escape`, or any key the table doesn't bind, closes it. When the keys don't fit, the rule shows the page, `1/3`, and `PageDown` and `PageUp` turn it.
+- The popup covers the bottom of the session while it shows, and the session is drawn again when it closes. Output from the pane keeps coming in around it.
+
+Each key shows a short description of its action, and `amux.keymap.set` takes your own: `amux.keymap.set("prefix", "g", fn, { desc = "show the log" })`. `amux.opt.which_key` turns the popup off and changes its delay and its look, and the theme colours it. [docs/lua.md](docs/lua.md#which-key) has the details.
 
 ### Targets
 
@@ -216,7 +238,7 @@ A config that fails to load changes nothing. The running settings, bindings and 
 
 What a reload changes:
 
-- **The client**: the prefix, the key bindings, the status bar, the tree, the theme, and the notice and escape times, right away. An open prompt or tree closes.
+- **The client**: the prefix, the key bindings, the status bar, the tree, the which-key popup, the theme, and the notice and escape times, right away. An open prompt, tree or which-key popup closes.
 - **Panes and windows**: the ones opened after the reload get the new `pane`, `window` and session naming settings. Panes that are already running keep the shell, `TERM` and environment they started with. Pane borders are drawn again with the new `borders` and theme.
 - **Projects**: `projects` and `projects_dir` apply to the next session.
 - **The cluster**: servers added to `amux.opt.servers` or `servers.lua` are linked, and removed ones are dropped. The status interval applies right away, and the other `cluster` timings to the next dial, backoff and link.
@@ -541,4 +563,5 @@ Beyond the design:
 - [x] A Lua config: `init.lua` and `servers.lua` in place of `config.toml`, and `amux config check`, `defaults` and `path`
 - [x] Prefix key and key bindings from the config in the client
 - [x] Reloading the config without a restart: `Ctrl-b r`, `amux config reload` and `SIGHUP`
+- [x] A which-key popup that lists the keys after the prefix, with descriptions from the config
 - [ ] Scrollback and copy mode

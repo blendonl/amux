@@ -23,13 +23,13 @@ Both run it again in a new Lua state on a reload: `reload_config()` (`Ctrl-b r`)
 
 A key is written like tmux writes it: `C-b` (Ctrl), `M-h` (Alt), `S-Left` (Shift), and combinations such as `C-M-Up`. Single characters stand for themselves (`%`, `"`, `G`), and named keys are `Space`, `Enter`, `Tab`, `BackTab`, `Backspace`, `Escape`, `Up`, `Down`, `Left`, `Right`, `Home`, `End`, `Insert`, `Delete`, `PageUp`, `PageDown` and `F1` to `F12`. tmux's spellings `BSpace`, `Esc`, `IC`, `DC`, `PPage`, `NPage`, `PgUp`, `PgDn` and `BTab` work too.
 
-`amux.opt.prefix` is the prefix key, `"C-b"` by default. `amux.opt.escape_time_ms` (50) is how long a lone `Escape` waits for the rest of a sequence.
+`amux.opt.prefix` is the prefix key, `"C-b"` by default. `amux.opt.escape_time_ms` (50) is how long a lone `Escape` waits for the rest of a sequence. `amux.opt.which_key` sets the popup that lists the keys of a table when you stop after the prefix, see [Which key](#which-key).
 
 ## amux.keymap
 
 | Function                              | Does                                                                   |
 | ------------------------------------- | ---------------------------------------------------------------------- |
-| `amux.keymap.set(table, key, binding)` | Binds `key` in `table`, replacing what it was bound to                 |
+| `amux.keymap.set(table, key, binding, opts)` | Binds `key` in `table`, replacing what it was bound to. `opts` is optional, and `opts.desc` describes the key in the which-key popup |
 | `amux.keymap.del(table, key)`          | Unbinds `key`. It is an error when `key` is not bound there            |
 | `amux.keymap.get(table, key)`          | The action or function bound to `key`, or `nil`                        |
 | `amux.keymap.clear(table)`             | Unbinds every key in `table`, and removes a custom table               |
@@ -40,7 +40,7 @@ The tables are:
 - `prefix`: the key after the prefix. The defaults are the keys in the [README](../README.md#windows-and-panes). A key it doesn't bind is dropped, and the prefix itself, when it isn't bound here, sends a literal prefix.
 - `prompt`: the rename and `amux.prompt` prompts. It binds prompt actions by name: `submit`, `cancel`, `delete_backward`, `delete_forward`, `delete_line`, `cursor_left`, `cursor_right`, `cursor_start` and `cursor_end`.
 - `tree`: the `Ctrl-b s` tree. It binds tree actions by name: `down`, `up`, `top`, `bottom`, `collapse`, `expand`, `pick` and `cancel`.
-- Any other name is a custom table, created by its first `set`. `switch_table(name)` reads the next key from it, then goes back to `root`.
+- Any other name is a custom table, created by its first `set`. `switch_table(name)` reads the next key from it, then goes back to `root`. `Backspace`, when the table doesn't bind it, goes back to the table whose key switched here, or to `root` from the first one.
 
 In the `prompt` and `tree` tables, a modified key that isn't bound acts like the plain key, so `C-Left` moves like `Left`. Text pasted with bracketed paste (`ESC[200~ … ESC[201~`) always goes to the pane whole: root and prefix bindings don't fire inside a paste, and a paste right after the prefix cancels the prefix.
 
@@ -52,8 +52,8 @@ amux.keymap.set("prefix", "-", "next_pane")
 amux.keymap.set("prefix", "N", { select_window = 3 })
 amux.keymap.del("prefix", "&")
 amux.keymap.set("root", "M-h", amux.action.select_pane("left"))
-amux.keymap.set("root", "M-r", amux.action.switch_table("resize"))
-amux.keymap.set("resize", "h", amux.action.select_pane("left"))
+amux.keymap.set("root", "M-r", amux.action.switch_table("resize"), { desc = "resize" })
+amux.keymap.set("resize", "h", amux.action.select_pane("left"), { desc = "left pane" })
 amux.keymap.set("prompt", "C-w", "delete_line")
 amux.keymap.set("tree", "Space", "pick")
 ```
@@ -80,6 +80,7 @@ amux.keymap.set("tree", "Space", "pick")
 | `cluster_tree()`            | Opens the cluster tree                                 |
 | `switch_table(name)`        | Reads the next key from table `name`                   |
 | `reload_config()`           | Reloads the config here and on this machine's server   |
+| `which_key(name)`           | Shows the keys of table `name` at once, then reads the next key from it, `Ctrl-b ?` shows the prefix table |
 
 ## Functions as bindings
 
@@ -125,6 +126,34 @@ amux.keymap.set("prefix", "f", function(ctx)
 end)
 ```
 
+## Which key
+
+After the prefix, or a key bound to `switch_table`, the client waits for the next key. When none comes within `delay_ms`, a popup at the bottom of the session lists every key of the table and what it does, the way which-key does in Neovim and Emacs. The next key works as it would without the popup, and closes it.
+
+| Option         | Default | Is                                                                                  |
+| -------------- | ------- | ----------------------------------------------------------------------------------- |
+| `enabled`      | `true`  | Whether the popup opens on its own. `which_key(name)` shows it even when `false`    |
+| `delay_ms`     | `500`   | How long the client waits for the next key before the popup opens, `0` opens it at once |
+| `separator`    | `"→"`   | Between a key and its description                                                   |
+| `group_marker` | `"+"`   | Before the description of a key that switches to another table                      |
+
+All of them live under `amux.opt.which_key`.
+
+- A key shows the description given with `amux.keymap.set(table, key, binding, { desc = … })`. Without one it shows a short name for its action, such as `new window` or `split left/right`, and `lua function` for a function. Binding the key again without `desc` drops its description.
+- A key bound to `switch_table(name)` is a group. It shows as `+name`, or `+` and its `desc`, and pressing it shows that table in the same popup. The rule at the top names the keys typed so far, such as `C-b r`, or the table's name when an action switched to it.
+- In the `prefix` table, the prefix key itself shows as `send prefix` unless you bind it.
+- `Backspace` goes back one table, `Escape` or a key the table doesn't bind closes the popup, and `PageDown` and `PageUp` turn the pages when the keys don't fit. Each of these does what the table binds it to instead, when it binds it.
+
+The keys are sorted like this: letters and digits, symbols, named keys, then keys with modifiers, and they fill the columns top to bottom.
+
+```lua
+amux.opt.which_key.delay_ms = 300
+amux.opt.theme.which_key_key = { fg = "yellow", bold = true }
+amux.keymap.set("prefix", "R", amux.action.switch_table("resize"), { desc = "resize" })
+amux.keymap.set("resize", "h", amux.action.select_pane("left"), { desc = "go left" })
+amux.keymap.set("resize", "?", amux.action.which_key("resize"))
+```
+
 ## The status bar
 
 | Option                | Default                  | Is                                                                 |
@@ -168,6 +197,12 @@ Each slot under `amux.opt.theme` is a style: `fg`, `bg`, `bold`, `dim`, `italic`
 | `tree_server`          | Server rows, over `tree`                               | bold                 |
 | `tree_stale`           | Sessions of offline servers, over `tree`               | dim                  |
 | `tree_cursor`          | The selected row                                       | reverse              |
+| `which_key`            | The which-key popup, and the base of the other `which_key_` slots | plain     |
+| `which_key_border`     | The rule at the top of the popup, and the page         | dim                  |
+| `which_key_title`      | The keys typed so far, on the rule                     | bold                 |
+| `which_key_key`        | Each key                                               | bold cyan            |
+| `which_key_separator`  | The separator between a key and its description        | dim                  |
+| `which_key_group`      | The description of a key that switches to another table | magenta             |
 | `overlay_text`         | The reconnecting overlay's text                        | bold                 |
 | `overlay_border`       | The reconnecting overlay's border                      | plain                |
 | `pane_border`          | Pane borders, drawn by the host                        | plain                |

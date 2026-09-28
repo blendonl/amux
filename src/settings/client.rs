@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use super::callback::{self, CallbackId};
@@ -64,6 +66,32 @@ impl Default for TreeSettings {
             collapsed_marker: "+ ".into(),
             leaf_marker: "  ".into(),
             detail_gap: "  ".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WhichKeySettings {
+    pub enabled: bool,
+    pub delay_ms: u64,
+    pub separator: String,
+    pub group_marker: String,
+}
+
+impl WhichKeySettings {
+    pub fn delay(&self) -> Duration {
+        Duration::from_millis(self.delay_ms)
+    }
+}
+
+impl Default for WhichKeySettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            delay_ms: 500,
+            separator: "→".into(),
+            group_marker: "+".into(),
         }
     }
 }

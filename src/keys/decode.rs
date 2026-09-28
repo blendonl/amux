@@ -75,6 +75,10 @@ impl KeyDecoder {
         !self.pending.is_empty()
     }
 
+    pub fn holds_escape(&self) -> bool {
+        self.is_partial() && self.pending.iter().all(|&byte| byte == ESC)
+    }
+
     pub fn time_out(&mut self) -> Option<Decoded> {
         let raw = mem::take(&mut self.pending);
         let key = match raw.as_slice() {
