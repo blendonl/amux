@@ -23,6 +23,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{DiscoveryConfig, Incarnation, ServerConfig, ServerId, ServerIdentity};
 use crate::discovery::tailscale::Tailnet;
+use crate::pairing::Pairing;
 use crate::protocol::{
     self, ClientMessage, DiscoveryStatus, DiscoveryView, Duplex, Event, Farewell, Hello, LinkInfo,
     LinkState, LinkTransport, PeerAddress, PeerMessage, PublicKey, Refusal, Role, ServerMessage,
@@ -84,6 +85,7 @@ pub struct Cluster {
     dirty: Notify,
     saving: Mutex<()>,
     saving_trust: Mutex<()>,
+    pairing: Pairing,
 }
 
 #[derive(Default)]
@@ -431,6 +433,7 @@ impl Cluster {
             dirty: Notify::new(),
             saving: Mutex::new(()),
             saving_trust: Mutex::new(()),
+            pairing: Pairing::default(),
         })
     }
 
@@ -479,6 +482,34 @@ impl Cluster {
         let handshake = tokio::time::timeout(
             self.settings.handshake_timeout,
             self.noise_handshake(stream, remote, vouched_by),
+        )
+        .await
+        .context("the peer handshake timed out")??;
+        let _transport = self.count_transport();
+        self.conclude(handshake, None).await;
+        let _ = tokio::time::timeout(FLUSH_GRACE, flushed).await;
+        Ok(())
+    }
+
+    pub async fn dial_secured(
+        self: &Arc<Self>,
+        secured: Secured,
+        vouched_by: Voucher,
+    ) -> Result<()> {
+        let Secured {
+            remote,
+            stream,
+            flushed,
+            ..
+        } = secured;
+        let auth = TransportAuth::Noise {
+            key: remote,
+            vouched_by,
+        };
+        let (reader, writer) = tokio::io::split(stream);
+        let handshake = tokio::time::timeout(
+            self.settings.handshake_timeout,
+            link::dial(self, reader, writer, auth),
         )
         .await
         .context("the peer handshake timed out")??;
@@ -639,6 +670,22 @@ impl Cluster {
 
     pub fn trusts_anyone(&self) -> bool {
         !self.members().trust.trusted.is_empty()
+    }
+
+    pub fn trusts(&self, id: ServerId, key: &PublicKey) -> bool {
+        self.members().trust.key_of(id) == Some(*key)
+    }
+
+    pub fn forgot(&self, key: &PublicKey) -> bool {
+        self.members().trust.is_key_forgotten(key)
+    }
+
+    pub fn identity(&self) -> &ServerIdentity {
+        &self.identity
+    }
+
+    pub fn pairing(&self) -> &Pairing {
+        &self.pairing
     }
 
     pub fn witness(&self, id: ServerId, name: &str, key: PublicKey) -> Witnessed {

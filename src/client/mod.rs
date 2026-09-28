@@ -22,7 +22,7 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use crate::cli::{Grouping, NewArgs};
-use crate::cluster::Address;
+use crate::cluster::{Address, LAN_PORT_FILE};
 use crate::config::{self, ServerConfig};
 use crate::paths;
 use crate::project::{self, Detected};
@@ -267,22 +267,27 @@ pub async fn pair(
         mut incoming,
         outgoing,
     } = handshake(connect_or_start_server(endpoint).await?).await?;
+    println!("{}", listing::PAIRING_WARNING);
     send(&outgoing, request).await?;
     loop {
         match incoming.recv().await {
             Some(ServerMessage::PairingOpen {
                 code,
                 expires_in_secs,
-            }) => println!(
-                "pairing code {code}, valid for {}; run `amux pair {code}` on the other machine",
-                listing::duration(expires_in_secs)
+            }) => print!(
+                "{}",
+                listing::pairing_instructions(&code, expires_in_secs, lan_port(endpoint))
             ),
+            Some(ServerMessage::PairingAttemptFailed {
+                reason,
+                attempts_left,
+            }) => println!("{}", listing::pairing_attempt(&reason, attempts_left)),
             Some(ServerMessage::Paired {
                 name,
                 id,
                 fingerprint,
             }) => {
-                println!("paired with {name} ({id}), key {fingerprint}");
+                println!("paired with {name} ({id}), key fingerprint {fingerprint}");
                 return Ok(());
             }
             Some(ServerMessage::PairingClosed { reason }) => bail!(reason),
@@ -291,6 +296,11 @@ pub async fn pair(
             None => bail!("server closed the connection"),
         }
     }
+}
+
+fn lan_port(endpoint: &Endpoint) -> Option<u16> {
+    let path = paths::state_dir(&endpoint.socket).ok()?.join(LAN_PORT_FILE);
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 pub async fn debug_links(endpoint: &Endpoint) -> Result<()> {

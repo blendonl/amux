@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::project::ProjectId;
 use crate::protocol::{
-    DiscoveryReport, DiscoveryStatus, DiscoveryView, ServerStatus, ServerView, SessionInfo,
+    DiscoveryReport, DiscoveryStatus, DiscoveryView, ServerStatus, ServerView, SessionInfo, Via,
 };
 
 const MIN_NAME_COLUMN: usize = 25;
@@ -271,9 +271,42 @@ pub fn discovery(report: &DiscoveryReport) -> String {
 }
 
 fn discovery_status(peer: &DiscoveryView) -> String {
-    match (&peer.status, &peer.last_error) {
+    let status = match (&peer.status, &peer.last_error) {
         (DiscoveryStatus::Linked, _) | (_, None) => peer.status.to_string(),
         (status, Some(error)) => format!("{status}: {error}"),
+    };
+    let paired = matches!(
+        peer.status,
+        DiscoveryStatus::Linked | DiscoveryStatus::Trying | DiscoveryStatus::Failing
+    );
+    if peer.via == Via::Lan && paired {
+        format!("paired, {status}")
+    } else {
+        status
+    }
+}
+
+pub const PAIRING_WARNING: &str = "pairing merges this machine's cluster with the other \
+    machine's, and gives each machine full access to the other, like ssh as this user";
+
+pub fn pairing_instructions(code: &str, expires_in_secs: u64, port: Option<u16>) -> String {
+    let address = match port {
+        Some(port) => format!("<this machine's address>:{port}"),
+        None => "<this machine's address>:<port>".to_owned(),
+    };
+    format!(
+        "pairing code {code}, valid for {} and one use\n\
+         run this on the other machine:\n  amux pair {code}\n\
+         or, where multicast does not reach it:\n  amux pair {code} --host {address}\n\
+         waiting for the other machine...\n",
+        duration(expires_in_secs)
+    )
+}
+
+pub fn pairing_attempt(reason: &str, attempts_left: u8) -> String {
+    match attempts_left {
+        1 => format!("{reason}, 1 attempt left"),
+        left => format!("{reason}, {left} attempts left"),
     }
 }
 
@@ -653,6 +686,45 @@ lan        running
     }
 
     #[test]
+    fn discover_says_which_lan_servers_are_paired() {
+        let report = DiscoveryReport {
+            sources: vec![SourceView {
+                via: Via::Lan,
+                state: SourceState::Unavailable("mDNS failed: no multicast".into()),
+            }],
+            peers: vec![
+                candidate(Via::Lan, "desk", "lan://d5", DiscoveryStatus::Linked, None),
+                candidate(Via::Lan, "nas", "lan://b3", DiscoveryStatus::Trying, None),
+                candidate(
+                    Via::Lan,
+                    "laptop",
+                    "lan://a7",
+                    DiscoveryStatus::Failing,
+                    Some("connection refused"),
+                ),
+                candidate(
+                    Via::Lan,
+                    "pi",
+                    "lan://c1",
+                    DiscoveryStatus::PairingOpen,
+                    None,
+                ),
+            ],
+        };
+
+        assert_eq!(
+            discovery(&report),
+            "\
+lan       mDNS failed: no multicast
+  desk    lan://d5   paired, linked
+  nas     lan://b3   paired, trying
+  laptop  lan://a7   paired, failing: connection refused
+  pi      lan://c1   pairing open
+"
+        );
+    }
+
+    #[test]
     fn discover_says_which_sources_are_off_or_not_running() {
         let report = DiscoveryReport {
             sources: vec![
@@ -692,6 +764,31 @@ lan        running
         assert_eq!(
             discovery(&report(2)),
             "tailscale  running with 2 machines\n"
+        );
+    }
+
+    #[test]
+    fn pairing_instructions_show_the_code_and_the_fallback_address() {
+        assert_eq!(
+            pairing_instructions("k7-4821-9930", 300, Some(40123)),
+            "\
+pairing code k7-4821-9930, valid for 5 minutes and one use
+run this on the other machine:
+  amux pair k7-4821-9930
+or, where multicast does not reach it:
+  amux pair k7-4821-9930 --host <this machine's address>:40123
+waiting for the other machine...
+"
+        );
+        assert!(pairing_instructions("k7-4821-9930", 300, None)
+            .contains("--host <this machine's address>:<port>\n"));
+        assert_eq!(
+            pairing_attempt("a wrong code was tried", 2),
+            "a wrong code was tried, 2 attempts left"
+        );
+        assert_eq!(
+            pairing_attempt("a wrong code was tried", 1),
+            "a wrong code was tried, 1 attempt left"
         );
     }
 

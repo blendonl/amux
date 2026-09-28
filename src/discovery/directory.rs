@@ -1,5 +1,6 @@
 use std::fs;
 use std::io;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
@@ -69,7 +70,11 @@ impl LanDiscovery for DirectoryLan {
         let temporary = self
             .dir
             .join(format!("{}{TEMPORARY_SUFFIX}", advertisement.id));
-        let text = serde_json::to_string_pretty(advertisement)?;
+        let mut advertisement = advertisement.clone();
+        if advertisement.addresses.is_empty() {
+            advertisement.addresses = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
+        }
+        let text = serde_json::to_string_pretty(&advertisement)?;
         fs::write(&temporary, text).with_context(|| format!("writing {}", temporary.display()))?;
         fs::rename(&temporary, &path).with_context(|| format!("replacing {}", path.display()))?;
         *self.advertised() = Some(advertisement.id);
@@ -200,6 +205,25 @@ mod tests {
         desk.shutdown();
         seen(&mut browsing, &[]).await;
         assert!(!dir.path().join(first.id.to_string()).exists());
+    }
+
+    #[tokio::test]
+    async fn an_advertisement_without_addresses_is_reached_on_this_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let lan = DirectoryLan::start(dir.path().to_owned(), INTERVAL).unwrap();
+        let mut browsing = lan.browse();
+        let local = Advertisement {
+            addresses: Vec::new(),
+            ..advertisement("desk")
+        };
+
+        lan.advertise(&local).unwrap();
+
+        let expected = Advertisement {
+            addresses: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            ..local
+        };
+        seen(&mut browsing, &[expected]).await;
     }
 
     #[test]

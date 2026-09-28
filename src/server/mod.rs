@@ -229,6 +229,7 @@ impl Server {
         Arc::new_cyclic(|server: &Weak<Self>| {
             let source: Weak<dyn StateSource> = server.clone();
             let cluster = Cluster::new(options, source);
+            let lan = LanListener::new(lan);
             Self {
                 identity,
                 config,
@@ -237,9 +238,9 @@ impl Server {
                 state: Mutex::new(state),
                 events: broadcast::channel(EVENT_CAPACITY).0,
                 hooks: HookSink::default(),
-                discovery: Discovery::new(Arc::clone(&cluster), discovery),
+                discovery: Discovery::new(Arc::clone(&cluster), discovery, lan.watch()),
                 cluster,
-                lan: LanListener::new(lan),
+                lan,
                 projects: Projects::new(registry),
                 shutdown: Notify::new(),
             }

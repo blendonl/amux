@@ -141,6 +141,12 @@ impl TestServerBuilder {
             .env("AMUX_DISCOVERY_INTERVAL_MS", FAST_DISCOVERY_MS)
     }
 
+    pub fn mdns(mut self, service: &str) -> Self {
+        self.lan = true;
+        self.env("AMUX_LAN_DIR", "")
+            .env("AMUX_MDNS_SERVICE", service)
+    }
+
     pub fn start(self) -> TestServer {
         let mut server = self.prepare();
         server.start_process();

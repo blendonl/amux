@@ -72,9 +72,14 @@ impl TrustStore {
     }
 
     pub fn is_forgotten(&self, id: ServerId, key: Option<&PublicKey>) -> bool {
-        self.forgotten.iter().any(|forgotten| {
-            forgotten.id == id || key.is_some_and(|key| forgotten.key == Some(*key))
-        })
+        let id_forgotten = self.forgotten.iter().any(|forgotten| forgotten.id == id);
+        key.is_some_and(|key| self.is_key_forgotten(key)) || (id_forgotten && !self.is_repaired(id))
+    }
+
+    fn is_repaired(&self, id: ServerId) -> bool {
+        self.trusted
+            .iter()
+            .any(|trusted| trusted.id == id && !self.is_key_forgotten(&trusted.key))
     }
 
     pub fn is_key_forgotten(&self, key: &PublicKey) -> bool {
@@ -151,10 +156,15 @@ impl TrustStore {
                 _ => sender,
             };
             let known = self.key_of(entry.id).is_some() || self.is_trusted(&entry.key);
+            let forgotten = if entry.direct {
+                self.is_key_forgotten(&entry.key)
+            } else {
+                self.is_forgotten(entry.id, Some(&entry.key))
+            };
             if entry.id == own
                 || introducer == own
                 || known
-                || self.is_forgotten(entry.id, Some(&entry.key))
+                || forgotten
                 || self.is_forgotten(introducer, None)
             {
                 continue;
@@ -471,5 +481,45 @@ mod tests {
         assert_eq!(store.merge(&old, sender, own), Merged::default());
         assert_eq!(store.key_of(desk), Some(key(2)));
         assert!(!store.is_forgotten(desk, None));
+    }
+
+    #[test]
+    fn a_new_key_seen_first_hand_brings_back_a_forgotten_server_but_not_its_old_key() {
+        let (own, sender, desk, witness) = (id(), id(), id(), id());
+        let mut store = TrustStore {
+            trusted: vec![trusted(desk, 1)],
+            forgotten: Vec::new(),
+        };
+        store.forget(desk, Some(key(1)));
+        let update = |entry: TrustedPeer| TrustUpdate {
+            trusted: vec![entry],
+            forgotten: Vec::new(),
+        };
+
+        for refused in [trusted(desk, 1), introduced(desk, 2, witness)] {
+            assert_eq!(
+                store.merge(&update(refused), sender, own),
+                Merged::default()
+            );
+        }
+        assert!(store.is_forgotten(desk, None));
+
+        let merged = store.merge(&update(trusted(desk, 2)), sender, own);
+
+        assert!(merged.changed);
+        assert_eq!(store.trusted, [introduced(desk, 2, sender)]);
+        assert!(!store.is_forgotten(desk, None));
+        assert!(!store.is_forgotten(desk, Some(&key(2))));
+        assert!(store.is_forgotten(desk, Some(&key(1))));
+        assert!(store.is_key_forgotten(&key(1)));
+        let old = TrustUpdate {
+            trusted: Vec::new(),
+            forgotten: vec![ForgottenPeer {
+                id: desk,
+                key: Some(key(1)),
+            }],
+        };
+        assert_eq!(store.merge(&old, sender, own), Merged::default());
+        assert_eq!(store.key_of(desk), Some(key(2)));
     }
 }

@@ -75,9 +75,9 @@ fn tcp_address(server: &TestServer) -> String {
 
 #[test]
 fn servers_linked_over_exec_exchange_keys_and_relink_over_tcp() {
-    let lan = FakeLan::new();
-    let a = TestServer::builder().name("a").lan(&lan).start();
-    let b = TestServer::builder().name("b").lan(&lan).start();
+    let (lan_of_a, lan_of_b) = (FakeLan::new(), FakeLan::new());
+    let a = TestServer::builder().name("a").lan(&lan_of_a).start();
+    let b = TestServer::builder().name("b").lan(&lan_of_b).start();
     assert_eq!(b.lan_port(), None);
 
     a.run_ok(&["servers", "add", "b", &b.bridge_address()]);
@@ -145,10 +145,10 @@ fn a_server_with_an_unknown_key_is_refused_as_untrusted() {
 
 #[test]
 fn keys_gossiped_through_a_shared_peer_let_two_servers_link_over_tcp() {
-    let lan = FakeLan::new();
+    let (lan_of_a, lan_of_c) = (FakeLan::new(), FakeLan::new());
     let b = TestServer::builder().name("b").start();
-    let a = TestServer::builder().name("a").lan(&lan).start();
-    let c = TestServer::builder().name("c").lan(&lan).start();
+    let a = TestServer::builder().name("a").lan(&lan_of_a).start();
+    let c = TestServer::builder().name("c").lan(&lan_of_c).start();
 
     a.run_ok(&["servers", "add", "b", &b.bridge_address()]);
     c.run_ok(&["servers", "add", "b", &b.bridge_address()]);

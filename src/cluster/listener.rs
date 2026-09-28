@@ -12,7 +12,8 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use super::noise::{self, Secured};
-use super::{Cluster, NoiseHandshake, FLUSH_GRACE};
+use super::{Cluster, NoiseHandshake, Voucher, FLUSH_GRACE};
+use crate::pairing;
 use crate::protocol::TcpKind;
 
 pub const LAN_PORT_FILE: &str = "lan-port";
@@ -97,8 +98,13 @@ async fn handshake(
         return Ok(None);
     };
     if kind == TcpKind::Pair {
-        info!(%remote, "closing a pairing connection, pairing is not available yet");
-        return Ok(None);
+        let Some(paired) = pairing::host(cluster, stream, remote).await? else {
+            return Ok(None);
+        };
+        let handshake = cluster
+            .noise_handshake(paired.stream, paired.remote, Voucher::Pairing)
+            .await?;
+        return Ok(Some((handshake, paired.flushed)));
     }
     let Secured {
         remote: key,
@@ -171,7 +177,7 @@ impl LanListener {
 }
 
 fn wants_lan_listener(cluster: &Cluster, options: &LanOptions) -> bool {
-    options.enabled && cluster.trusts_anyone()
+    options.enabled && (cluster.trusts_anyone() || cluster.pairing().is_open())
 }
 
 async fn keep_listening(
@@ -186,10 +192,12 @@ async fn keep_listening(
         .map(|dir| dir.join(LAN_PORT_FILE));
     remove_port_file(port_file.as_deref());
     let mut changes = cluster.watch();
+    let mut windows = cluster.pairing().watch();
     let mut listener: Option<Listener> = None;
     let mut attempted = false;
     loop {
         changes.borrow_and_update();
+        windows.borrow_and_update();
         if !wants_lan_listener(&cluster, &options) {
             attempted = false;
             if let Some(stopped) = listener.take() {
@@ -212,6 +220,9 @@ async fn keep_listening(
         }
         tokio::select! {
             changed = changes.changed() => if changed.is_err() {
+                break;
+            },
+            changed = windows.changed() => if changed.is_err() {
                 break;
             },
             _ = stopping.wait_for(|stop| *stop) => break,

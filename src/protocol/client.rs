@@ -398,4 +398,8 @@ pub enum ServerMessage {
     PairingClosed {
         reason: String,
     },
+    PairingAttemptFailed {
+        reason: String,
+        attempts_left: u8,
+    },
 }

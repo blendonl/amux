@@ -1,9 +1,10 @@
 pub mod directory;
 pub mod lan;
+pub mod mdns;
 pub mod tailscale;
 
 use std::env;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -17,6 +18,7 @@ use tracing::warn;
 use crate::cluster::Cluster;
 use crate::config::{DiscoveryConfig, LanConfig, ServerId};
 use crate::protocol::{DiscoveryReport, PublicKey, SourceState, SourceView, Via};
+use lan::Lan;
 
 pub const INTERVAL_ENV: &str = "AMUX_DISCOVERY_INTERVAL_MS";
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
@@ -62,11 +64,16 @@ pub struct Discovery {
     stop: watch::Sender<bool>,
     tailscale: SourceStatus,
     lan: SourceStatus,
+    lan_state: Arc<Lan>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl Discovery {
-    pub fn new(cluster: Arc<Cluster>, options: DiscoveryOptions) -> Self {
+    pub fn new(
+        cluster: Arc<Cluster>,
+        options: DiscoveryOptions,
+        lan_listener: watch::Receiver<Option<SocketAddr>>,
+    ) -> Self {
         let (stop, stopping) = watch::channel(false);
         let status = |enabled| {
             SourceStatus::new(if enabled {
@@ -78,6 +85,7 @@ impl Discovery {
         Self {
             tailscale: status(options.config.tailscale),
             lan: status(options.config.lan),
+            lan_state: Arc::new(Lan::new(lan_listener)),
             context: SourceContext {
                 cluster,
                 options: Arc::new(options),
@@ -92,6 +100,14 @@ impl Discovery {
         &self.context
     }
 
+    pub fn lan(&self) -> &Lan {
+        &self.lan_state
+    }
+
+    pub fn lan_source(&self) -> SourceState {
+        self.lan.get()
+    }
+
     pub fn start(&self) {
         let config = &self.context.options.config;
         let mut tasks = self.tasks();
@@ -100,7 +116,11 @@ impl Discovery {
             tasks.push(tokio::spawn(source));
         }
         if config.lan {
-            let source = lan::run(self.context.clone(), self.lan.clone());
+            let source = lan::run(
+                self.context.clone(),
+                self.lan.clone(),
+                Arc::clone(&self.lan_state),
+            );
             tasks.push(tokio::spawn(source));
         }
     }
