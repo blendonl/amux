@@ -164,6 +164,14 @@ pub async fn handle(
             let reply = server.cluster().drop_link(&peer);
             return send(&client.outgoing, done_or_error(reply)).await;
         }
+        ClientMessage::ReloadConfig => {
+            let reply = match server.reload_config().await {
+                Ok(None) => ServerMessage::Done,
+                Ok(Some(notice)) => ServerMessage::Notice(notice),
+                Err(err) => ServerMessage::Error(format!("{err:#}")),
+            };
+            return send(&client.outgoing, reply).await;
+        }
         ClientMessage::KillServer => {
             server.shut_down();
             return Ok(());
@@ -392,7 +400,7 @@ async fn attach(
                         session.input(event);
                     }
                     if mouse.has_pending() {
-                        let escape_time = server.settings.mouse.escape_time();
+                        let escape_time = server.settings().mouse.escape_time();
                         escape.as_mut().reset(Instant::now() + escape_time);
                     }
                 }

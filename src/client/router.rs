@@ -18,6 +18,7 @@ pub enum Action {
     Command(SessionCommand),
     Open(Panel),
     Callback(CallbackId),
+    ReloadConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,6 +241,7 @@ impl KeyRouter {
                 return None;
             }
             Binding::Callback(id) => Action::Callback(id),
+            Binding::ReloadConfig => Action::ReloadConfig,
             Binding::Detach => Action::Detach,
             Binding::RenameWindow => Action::Open(Panel::RenameWindow),
             Binding::RenameSession => Action::Open(Panel::RenameSession),

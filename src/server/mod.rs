@@ -5,6 +5,7 @@ pub mod lua_host;
 mod mouse;
 mod pane;
 mod projects;
+mod reload;
 mod render;
 mod session;
 mod status;
@@ -21,7 +22,7 @@ use std::time::{Instant, SystemTime};
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, watch, Mutex as AsyncMutex, Notify};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -81,6 +82,7 @@ pub async fn run(socket: &Path, config: Option<&Path>) -> Result<()> {
     );
 
     let trust = TrustStore::load(&state_dir.join(TRUST_FILE))?;
+    let mut hangup = signal(SignalKind::hangup())?;
     let listener = bind(socket)?;
     let mut terminate = signal(SignalKind::terminate())?;
     let socket_name = paths::socket_name(socket)?;
@@ -132,6 +134,12 @@ pub async fn run(socket: &Path, config: Option<&Path>) -> Result<()> {
                 Err(err) => warn!("accept failed: {err}"),
             },
             () = server.shutdown.notified() => break,
+            _ = hangup.recv() => {
+                let server = Arc::clone(&server);
+                tokio::spawn(async move {
+                    let _ = server.reload_config().await;
+                });
+            }
             _ = terminate.recv() => break,
         }
     }
@@ -171,7 +179,7 @@ enum Resolved {
 
 pub struct Server {
     identity: ServerIdentity,
-    settings: Arc<Settings>,
+    settings: watch::Sender<Arc<Settings>>,
     config: ConfigPaths,
     state: Mutex<LocalState>,
     events: broadcast::Sender<Event>,
@@ -180,6 +188,7 @@ pub struct Server {
     lan: LanListener,
     discovery: Discovery,
     projects: Projects,
+    reloading: AsyncMutex<()>,
     shutdown: Notify,
 }
 
@@ -230,7 +239,7 @@ impl Server {
             let lan = LanListener::new(lan);
             Self {
                 identity,
-                settings: Arc::new(settings),
+                settings: watch::channel(Arc::new(settings)).0,
                 config,
                 state: Mutex::new(state),
                 events: broadcast::channel(EVENT_CAPACITY).0,
@@ -239,6 +248,7 @@ impl Server {
                 cluster,
                 lan,
                 projects: Projects::new(registry),
+                reloading: AsyncMutex::new(()),
                 shutdown: Notify::new(),
             }
         })
@@ -258,6 +268,14 @@ impl Server {
 
     pub fn config(&self) -> &ConfigPaths {
         &self.config
+    }
+
+    fn settings(&self) -> Arc<Settings> {
+        Arc::clone(&self.settings.borrow())
+    }
+
+    fn watch_settings(&self) -> watch::Receiver<Arc<Settings>> {
+        self.settings.subscribe()
     }
 
     async fn forget_server(&self, server: &str) -> Result<Option<String>> {
@@ -317,16 +335,15 @@ impl Server {
     }
 
     fn spawn_session(self: &Arc<Self>, spec: SessionSpec<'_>) -> Result<Arc<Session>> {
+        let settings = self.settings();
         let mut state = self.state();
         let name = match spec.name {
             SessionName::Given(name) if state.sessions.contains_key(&name) => {
                 bail!("duplicate session: {name}")
             }
             SessionName::Given(name) => name,
-            SessionName::Derived(base) => {
-                free_name_like(&state.sessions, base, &self.settings.session)?
-            }
-            SessionName::Numbered => next_free_name(&state.sessions, &self.settings.session),
+            SessionName::Derived(base) => free_name_like(&state.sessions, base, &settings.session)?,
+            SessionName::Numbered => next_free_name(&state.sessions, &settings.session),
         };
         state.last_session_id += 1;
         let id = SessionId(state.last_session_id);
@@ -338,7 +355,7 @@ impl Server {
             spec.env,
             spec.binding,
             SessionHost {
-                settings: Arc::clone(&self.settings),
+                settings: self.watch_settings(),
                 hooks: self.hooks.clone(),
             },
         )?;
@@ -356,7 +373,7 @@ impl Server {
         let mut published = Instant::now();
         let mut pending = false;
         loop {
-            let interval = self.settings.session.activity_interval();
+            let interval = self.settings().session.activity_interval();
             let flush = tokio::time::sleep_until((published + interval).into());
             tokio::select! {
                 changed = windows.changed() => {
@@ -452,7 +469,7 @@ impl Server {
 
     fn host_for_new_session(&self, request: &NewSession, origin: Origin) -> Result<Option<Host>> {
         let on = match (&request.on, origin) {
-            (Some(on), _) => Some(on.as_str()),
+            (Some(on), _) => Some(on.clone()),
             (None, Origin::Local) => self.default_server(request.project.as_ref()),
             (None, Origin::Peer) => None,
         };
@@ -468,14 +485,11 @@ impl Server {
             .into_iter()
             .map(|view| (view.name, view.id))
             .collect();
-        if !peers.iter().any(|(name, _)| name == on) {
+        if !peers.iter().any(|(name, _)| *name == on) {
             bail!("unknown server: {on}");
         }
-        let peer = self.reachable_peer(on, &peers)?;
-        Ok(Some(Host {
-            peer,
-            name: on.to_owned(),
-        }))
+        let peer = self.reachable_peer(&on, &peers)?;
+        Ok(Some(Host { peer, name: on }))
     }
 
     fn reachable_peer(&self, name: &str, peers: &[(String, Option<ServerId>)]) -> Result<ServerId> {

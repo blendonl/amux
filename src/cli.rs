@@ -95,7 +95,7 @@ pub enum Command {
 
     #[command(
         subcommand,
-        about = "Check the Lua config, print its defaults or its path"
+        about = "Check the Lua config, print its defaults or its path, or reload it"
     )]
     Config(ConfigAction),
 
@@ -189,6 +189,9 @@ pub enum ConfigAction {
 
     #[command(about = "Print the path of your init.lua, whether or not it exists yet")]
     Path,
+
+    #[command(about = "Make the running server load its config again, without a restart")]
+    Reload,
 }
 
 #[derive(Debug, Args)]

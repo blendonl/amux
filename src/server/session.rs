@@ -35,9 +35,9 @@ impl Binding {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SessionHost {
-    pub settings: Arc<Settings>,
+    pub settings: watch::Receiver<Arc<Settings>>,
     pub hooks: HookSink,
 }
 
@@ -47,11 +47,10 @@ pub struct Session {
     attached_clients: AtomicUsize,
     last_activity: Mutex<SystemTime>,
     activity: Notify,
-    window_name: String,
     cwd: PathBuf,
     env: Vec<(String, String)>,
     binding: Option<Binding>,
-    settings: Arc<Settings>,
+    settings: watch::Receiver<Arc<Settings>>,
     hooks: HookSink,
     windows: Mutex<Windows>,
 }
@@ -73,7 +72,6 @@ impl Session {
             attached_clients: AtomicUsize::new(0),
             last_activity: Mutex::new(SystemTime::now()),
             activity: Notify::new(),
-            window_name: settings.window.name.clone().unwrap_or_else(shell_name),
             cwd: cwd.to_owned(),
             env: env.to_vec(),
             binding,
@@ -189,6 +187,10 @@ impl Session {
         self.state().size
     }
 
+    pub fn redraw(&self) {
+        self.state().redraw();
+    }
+
     pub fn resize(&self, size: Size) {
         let mut windows = self.state();
         windows.size = size.clamped();
@@ -199,13 +201,10 @@ impl Session {
     }
 
     pub fn frame(&self) -> Option<Frame> {
+        let settings = self.settings();
         let windows = self.state();
         windows.signals.as_ref()?;
-        Some(
-            windows
-                .active_window()?
-                .compose(windows.size, &self.settings),
-        )
+        Some(windows.active_window()?.compose(windows.size, &settings))
     }
 
     pub fn input(&self, event: InputEvent) {
@@ -376,17 +375,19 @@ impl Session {
     }
 
     fn open_window(self: &Arc<Self>) -> Result<WindowSummary> {
+        let settings = self.settings();
         let mut windows = self.state();
         if windows.signals.is_none() {
             bail!("the session has ended");
         }
-        let index = windows.free_index(self.settings.window.base_index);
+        let index = windows.free_index(settings.window.base_index);
         let id = windows.next_pane_id();
         let pane = self.spawn_pane(id, windows.size)?;
         let position = windows
             .list
             .partition_point(|window| window.index() < index);
-        let window = Window::new(index, self.window_name.clone(), id, pane);
+        let name = settings.window.name.clone().unwrap_or_else(shell_name);
+        let window = Window::new(index, name, id, pane);
         let summary = window.summary();
         windows.list.insert(position, window);
         windows.active = position;
@@ -412,9 +413,13 @@ impl Session {
             cwd: &self.cwd,
             size,
             env: &self.env,
-            settings: &self.settings.pane,
+            settings: &self.settings().pane,
             observer,
         })
+    }
+
+    fn settings(&self) -> Arc<Settings> {
+        Arc::clone(&self.settings.borrow())
     }
 
     fn touch(&self) {
@@ -666,7 +671,7 @@ mod tests {
             &[],
             None,
             SessionHost {
-                settings: Arc::new(settings),
+                settings: watch::channel(Arc::new(settings)).1,
                 hooks: HookSink::default(),
             },
         )

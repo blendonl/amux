@@ -340,6 +340,7 @@ pub enum ClientMessage {
         new_key: bool,
         verbose: bool,
     },
+    ReloadConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

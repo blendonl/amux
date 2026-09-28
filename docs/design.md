@@ -239,6 +239,8 @@ Every option lives in one `Settings` tree with a built-in default in Rust, and `
 
 The client runs the same file when it attaches, in its own Lua VM on the main thread, and takes what it draws from it: the prefix, the keymap, the status bar with its Lua functions, the tree and their theme slots. The server runs it on a thread that owns its VM and takes the rest, including the hooks. [lua.md](lua.md) is the API reference.
 
+A reload (`Ctrl-b r`, `amux config reload` or `SIGHUP`) runs the file again in a new VM, and swaps it in only when it loads. The server publishes its settings through a `watch` channel, and everything reads the latest value when it acts: a new pane, window or session, a redraw, the next dial or backoff. A changed server list is applied to the cluster as adds and removes. The name, the listeners and the discovery sources are set up once, so a change to them waits for a restart. `Ctrl-b r` asks the local server over a connection of its own, never over the attached stream, which may lead to another machine.
+
 `amux servers add` and `remove` write only `servers.lua`, a data file in the config directory that amux owns. It is merged into `amux.opt.servers` before `init.lua` runs, so `init.lua` can read and override its entries. Each rewrite is checked by loading the whole config with it, then renamed into place.
 
 `amux_path` covers machines where amux is neither on the `PATH` of a non-interactive ssh shell nor in `~/.cargo/bin`, `~/.local/bin`, `/usr/local/bin` or `/opt/homebrew/bin`.

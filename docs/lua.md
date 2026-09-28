@@ -5,6 +5,8 @@ amux runs `init.lua` in two places, and each machine uses its own copy (see [Con
 - **The client** runs it when it attaches: `amux`, `amux new` and `amux attach`. It uses the prefix, the key bindings, the status bar, the theme and the tree, which is everything the client draws. A config error stops the client with `init.lua:N` before it takes over the terminal.
 - **The server** runs it when it starts. It uses everything the host does: panes, windows, sessions, borders, the cluster and the hooks.
 
+Both run it again in a new Lua state on a reload: `reload_config()` (`Ctrl-b r`) reloads the client and the server on its machine, and `amux config reload` or `SIGHUP` the server. Nothing carries over from the old state, so a module loaded with `require` is loaded again and every binding and hook is replaced. When the new config fails, the old state keeps running and the error shows with its `init.lua:N`. The [README](../README.md#reloading) lists what a reload changes and what still needs a restart.
+
 `amux.process` is `"client"` or `"server"`, so one file can do different things in each. `amux config check` loads the file both ways. `amux ls`, `kill`, `bridge`, `kill-server` and the other one-shot commands never run it.
 
 | Everywhere             | Does                                                          |
@@ -77,6 +79,7 @@ amux.keymap.set("tree", "Space", "pick")
 | `rename_session()`          | Opens the rename session prompt                        |
 | `cluster_tree()`            | Opens the cluster tree                                 |
 | `switch_table(name)`        | Reads the next key from table `name`                   |
+| `reload_config()`           | Reloads the config here and on this machine's server   |
 
 ## Functions as bindings
 
@@ -103,7 +106,7 @@ Inside a binding these work, and they take effect in order once the function ret
 | `amux.switch(target)`        | Switches this client to a target such as `"notes@laptop"` or `"work:1"`      |
 | `amux.prompt { label, initial, on_submit }` | Opens a prompt. `on_submit(text, ctx)` runs on `Enter`, with the same API. Cancelling runs nothing |
 | `amux.state()`               | The same snapshot as `ctx`                                                   |
-| `amux.keymap.set/del/clear`  | Changes the bindings from the next key on                                    |
+| `amux.keymap.set/del/clear`  | Changes the bindings from the next key on, and frees a replaced function     |
 
 A binding has one second to finish. An error, or running past the budget, shows the error on the status row and applies none of the binding's effects or keymap changes. `notify`, `run`, `send_keys`, `switch` and `prompt` are errors outside a binding, and only the client has them.
 

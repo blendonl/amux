@@ -9,7 +9,7 @@ use super::{read_frame, write_message};
 
 pub const MAGIC: [u8; 4] = *b"AMUX";
 pub const TCP_MAGIC: [u8; 4] = *b"AMXT";
-pub const PROTOCOL_MAJOR: u16 = 8;
+pub const PROTOCOL_MAJOR: u16 = 9;
 pub const PROTOCOL_MINOR: u16 = 0;
 pub const RELEASE: &str = env!("CARGO_PKG_VERSION");
 
@@ -317,6 +317,12 @@ mod tests {
         drop(client_end);
         let role = accept(&mut server_end, &Version::current(), "desk").await;
         assert_eq!(role.unwrap(), None);
+    }
+
+    #[test]
+    fn this_build_speaks_protocol_8() {
+        assert_eq!(Version::current().major, 9);
+        assert_eq!(Version::current().minor, 0);
     }
 
     #[test]

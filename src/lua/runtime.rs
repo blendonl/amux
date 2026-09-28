@@ -51,6 +51,13 @@ impl ConfigPaths {
         let init = find_init(&dir, given, system_init);
         Self::new(dir, init)
     }
+
+    pub fn refreshed(&self, system_init: &Path) -> Self {
+        match &self.init {
+            Some(init) if init != system_init => self.clone(),
+            _ => Self::find(self.dir.clone(), None, system_init),
+        }
+    }
 }
 
 pub fn find_init(dir: &Path, given: Option<&Path>, system_init: &Path) -> Option<PathBuf> {
@@ -581,6 +588,32 @@ mod tests {
                 servers: config.path().join(SERVERS_FILE),
             }
         );
+    }
+
+    #[test]
+    fn a_refresh_finds_an_init_file_created_after_the_start() {
+        let config = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        let system_init = system.path().join(INIT_FILE);
+        let user_init = config.path().join(INIT_FILE);
+        let given = system.path().join("given.lua");
+
+        let started = ConfigPaths::find(config.path().to_owned(), None, &system_init);
+        assert_eq!(started.init, None);
+        fs::write(&system_init, "").unwrap();
+        let refreshed = started.refreshed(&system_init);
+        assert_eq!(refreshed.init, Some(system_init.clone()));
+        fs::write(&user_init, "").unwrap();
+        assert_eq!(
+            refreshed.refreshed(&system_init),
+            ConfigPaths::new(config.path().to_owned(), Some(user_init.clone()))
+        );
+
+        let chosen = ConfigPaths::find(config.path().to_owned(), Some(&given), &system_init);
+        assert_eq!(chosen.refreshed(&system_init), chosen);
+        fs::remove_file(&user_init).unwrap();
+        let kept = ConfigPaths::new(config.path().to_owned(), Some(user_init));
+        assert_eq!(kept.refreshed(&system_init), kept);
     }
 
     fn with_servers(servers: &str, init: &str) -> (tempfile::TempDir, Result<Loaded>) {

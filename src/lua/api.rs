@@ -29,7 +29,7 @@ pub const EVENTS: [&str; 11] = [
     "server_started",
 ];
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Callbacks {
     functions: BTreeMap<usize, Function>,
     next: usize,
@@ -166,7 +166,7 @@ fn keymap(lua: &Lua, constructors: Table) -> mlua::Result<Table> {
                                 Binding::Callback(callbacks.register(callback))
                             }
                         };
-                        bindings.insert(key, binding);
+                        unbound(callbacks, bindings.insert(key, binding));
                     }
                 }
                 Ok(())
@@ -178,17 +178,21 @@ fn keymap(lua: &Lua, constructors: Table) -> mlua::Result<Table> {
         function(lua, |lua, (table, key): (String, String)| {
             let key = parse_key(&key)?;
             let mut registry = registry(lua)?;
-            let keymap = &mut registry.keymap;
+            let Registry {
+                keymap, callbacks, ..
+            } = &mut *registry;
             let removed = match table.as_str() {
                 PROMPT_TABLE => keymap.prompt.remove(&key).is_some(),
                 TREE_TABLE => keymap.tree.remove(&key).is_some(),
-                ROOT_TABLE => keymap.root.remove(&key).is_some(),
-                PREFIX_TABLE => keymap.prefix.remove(&key).is_some(),
-                name => keymap
-                    .custom
-                    .get_mut(name)
-                    .and_then(|bindings| bindings.remove(&key))
-                    .is_some(),
+                ROOT_TABLE => unbound(callbacks, keymap.root.remove(&key)),
+                PREFIX_TABLE => unbound(callbacks, keymap.prefix.remove(&key)),
+                name => {
+                    let removed = keymap
+                        .custom
+                        .get_mut(name)
+                        .and_then(|bindings| bindings.remove(&key));
+                    unbound(callbacks, removed)
+                }
             };
             if !removed {
                 return Err(mlua::Error::runtime(format!(
@@ -218,20 +222,40 @@ fn keymap(lua: &Lua, constructors: Table) -> mlua::Result<Table> {
         "clear",
         function(lua, |lua, table: String| {
             let mut registry = registry(lua)?;
-            let keymap = &mut registry.keymap;
+            let Registry {
+                keymap, callbacks, ..
+            } = &mut *registry;
             match table.as_str() {
                 PROMPT_TABLE => keymap.prompt.clear(),
                 TREE_TABLE => keymap.tree.clear(),
-                ROOT_TABLE => keymap.root.clear(),
-                PREFIX_TABLE => keymap.prefix.clear(),
+                ROOT_TABLE => clear_bindings(callbacks, &mut keymap.root),
+                PREFIX_TABLE => clear_bindings(callbacks, &mut keymap.prefix),
                 name => {
-                    keymap.custom.remove(name);
+                    if let Some(mut bindings) = keymap.custom.remove(name) {
+                        clear_bindings(callbacks, &mut bindings);
+                    }
                 }
             }
             Ok(())
         })?,
     )?;
     Ok(keymap)
+}
+
+fn unbound(callbacks: &mut Callbacks, removed: Option<Binding>) -> bool {
+    if let Some(Binding::Callback(id)) = removed {
+        callbacks.release(id);
+    }
+    removed.is_some()
+}
+
+fn clear_bindings(callbacks: &mut Callbacks, bindings: &mut Bindings<Binding>) {
+    for (_, binding) in bindings.iter() {
+        if let Binding::Callback(id) = binding {
+            callbacks.release(*id);
+        }
+    }
+    bindings.clear();
 }
 
 fn parse_key(notation: &str) -> mlua::Result<Key> {
@@ -475,7 +499,7 @@ mod tests {
         )
         .keymap;
         assert_eq!(keymap.prefix.get(&key("&")), None);
-        assert_eq!(keymap.prefix.iter().count(), 25);
+        assert_eq!(keymap.prefix.iter().count(), 26);
         assert_eq!(keymap.prompt.get(&key("C-u")), None);
         assert_eq!(keymap.custom["resize"].iter().count(), 0);
         assert!(!keymap.custom.contains_key("gone"));
@@ -508,6 +532,28 @@ mod tests {
     }
 
     #[test]
+    fn replaced_and_deleted_callbacks_are_freed() {
+        let loaded = loaded(
+            "for i = 1, 10 do amux.keymap.set('prefix', 'g', function() return i end) end\n\
+             amux.keymap.set('root', 'M-x', function() end)\n\
+             amux.keymap.del('root', 'M-x')\n\
+             amux.keymap.set('resize', 'h', function() end)\n\
+             amux.keymap.set('resize', 'l', function() end)\n\
+             amux.keymap.clear('resize')\n\
+             amux.keymap.set('root', 'M-j', function() end)\n\
+             amux.keymap.clear('root')\n\
+             amux.keymap.set('prefix', 'j', function() end)\n\
+             amux.keymap.set('prefix', 'j', 'detach')",
+        );
+        assert_eq!(loaded.callbacks.len(), 1);
+        let Some(Binding::Callback(id)) = loaded.keymap.prefix.get(&key("g")).cloned() else {
+            panic!("g is not a callback");
+        };
+        let last: i64 = loaded.callbacks.get(id).unwrap().call(()).unwrap();
+        assert_eq!(last, 10);
+    }
+
+    #[test]
     fn an_invalid_action_lists_the_valid_ones() {
         let error = failure("\namux.keymap.set('prefix', 'z', 'zoom')");
         assert!(
@@ -525,7 +571,7 @@ mod tests {
                 "init.lua:1: unknown action zoom, expected one of detach, send_prefix, \
                  new_window, next_window, previous_window, select_window, split_pane, \
                  next_pane, select_pane, kill_pane, kill_window, rename_window, \
-                 rename_session, cluster_tree, switch_table"
+                 rename_session, cluster_tree, switch_table, reload_config"
             ),
             "{error}"
         );
@@ -622,7 +668,7 @@ mod tests {
     #[test]
     fn every_action_constructor_is_exposed() {
         let names = variants::<Binding>();
-        assert_eq!(names.len(), 15);
+        assert_eq!(names.len(), 16);
         assert!(names.contains(&"switch_table"));
         assert!(!names.contains(&"callback"));
         let loaded = loaded("");

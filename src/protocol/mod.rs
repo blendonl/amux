@@ -201,6 +201,7 @@ mod tests {
                 new_key: false,
                 verbose: true,
             },
+            ClientMessage::ReloadConfig,
         ];
 
         for message in &sent {
@@ -285,6 +286,11 @@ mod tests {
                 reason: "the code expired".into(),
             },
             ServerMessage::PairingStep("connected to 192.168.0.10:40123".into()),
+            ServerMessage::PairingAttemptFailed {
+                reason: "the code did not match".into(),
+                attempts_left: 2,
+            },
+            ServerMessage::Notice("amux.opt.name changes need a restart".into()),
         ];
         for message in &sent {
             write_message(&mut server, message).await.unwrap();

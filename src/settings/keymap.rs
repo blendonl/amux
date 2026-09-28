@@ -29,6 +29,7 @@ pub enum Binding {
     RenameSession,
     ClusterTree,
     SwitchTable(String),
+    ReloadConfig,
     #[serde(skip)]
     Callback(CallbackId),
 }
@@ -200,6 +201,7 @@ fn prefix_table() -> Table<Binding> {
         (Key::char('o'), Binding::NextPane),
         (Key::char('x'), Binding::KillPane),
         (Key::char('&'), Binding::KillWindow),
+        (Key::char('r'), Binding::ReloadConfig),
         (Key::from(KeyCode::Up), Binding::SelectPane(Direction::Up)),
         (
             Key::from(KeyCode::Down),
@@ -296,12 +298,13 @@ mod tests {
             ("o", Binding::NextPane),
             ("x", Binding::KillPane),
             ("&", Binding::KillWindow),
+            ("r", Binding::ReloadConfig),
             ("Up", Binding::SelectPane(Direction::Up)),
             ("Left", Binding::SelectPane(Direction::Left)),
         ] {
             assert_eq!(prefix.get(&key(notation)), Some(&binding), "{notation}");
         }
-        assert_eq!(prefix.iter().count(), 26);
+        assert_eq!(prefix.iter().count(), 27);
         assert_eq!(prefix.get(&key("C-b")), None);
         assert_eq!(Keymap::default().root, Table::default());
     }

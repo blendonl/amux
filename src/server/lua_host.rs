@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock, Weak};
 use std::thread;
@@ -10,14 +11,14 @@ use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize, Serializer};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, oneshot, watch};
 use tracing::{debug, warn};
 
 use super::connection::Origin;
 use super::session::Session;
 use super::Server;
 use crate::cluster::{Cluster, StateSource};
-use crate::lua::{self, ConfigPaths, LuaHooks, Process};
+use crate::lua::{self, ConfigPaths, LuaHooks, Process, SYSTEM_INIT};
 use crate::protocol::{Event, ServerStatus, SessionCommand, SessionId, SessionInfo, StateEvent};
 use crate::settings::Settings;
 
@@ -166,6 +167,11 @@ struct Envelope {
     depth: u32,
 }
 
+enum Job {
+    Event(Envelope),
+    Reload(oneshot::Sender<Result<Settings>>),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct Request {
     action: HookAction,
@@ -173,7 +179,7 @@ struct Request {
 }
 
 pub struct LuaHost {
-    events: SyncSender<Envelope>,
+    events: SyncSender<Job>,
     requests: UnboundedReceiver<Request>,
     state: Arc<OnceLock<Weak<dyn HookState>>>,
 }
@@ -193,7 +199,8 @@ impl LuaHost {
                     match lua::load(&paths, Process::Server) {
                         Ok(config) => {
                             if loaded.send(Ok(config.settings.clone())).is_ok() {
-                                serve(&LuaHooks::new(config), &inbox, &outbox, &shared);
+                                let hooks = LuaHooks::new(config);
+                                serve(hooks, &paths, &inbox, &outbox, &shared);
                             }
                         }
                         Err(err) => {
@@ -218,62 +225,93 @@ impl LuaHost {
 }
 
 fn serve(
-    hooks: &LuaHooks,
-    inbox: &Receiver<Envelope>,
+    mut hooks: LuaHooks,
+    paths: &ConfigPaths,
+    inbox: &Receiver<Job>,
     outbox: &UnboundedSender<Request>,
     state: &OnceLock<Weak<dyn HookState>>,
 ) {
-    for Envelope { event, depth } in inbox {
-        if depth > MAX_DEPTH {
-            warn!(
-                event = event.name(),
-                depth, "hooks kept setting each other off, not running them"
-            );
-            continue;
-        }
-        for run in hooks.run(&event, state.get()) {
-            match run.result {
-                Ok(actions) => {
-                    for action in actions {
-                        let request = Request {
-                            action,
-                            depth: depth + 1,
-                        };
-                        if let Err(unsent) = outbox.send(request) {
-                            debug!(request = ?unsent.0, "no server is taking hook requests");
-                        }
-                    }
-                }
-                Err(message) => warn!(event = event.name(), hook = %run.hook, "{message}"),
+    for job in inbox {
+        match job {
+            Job::Event(envelope) => run_hooks(&hooks, envelope, outbox, state),
+            Job::Reload(reply) => {
+                let paths = paths.refreshed(Path::new(SYSTEM_INIT));
+                let reloaded = lua::load(&paths, Process::Server).map(|config| {
+                    let settings = config.settings.clone();
+                    hooks = LuaHooks::new(config);
+                    settings
+                });
+                let _ = reply.send(reloaded);
             }
         }
     }
 }
 
+fn run_hooks(
+    hooks: &LuaHooks,
+    Envelope { event, depth }: Envelope,
+    outbox: &UnboundedSender<Request>,
+    state: &OnceLock<Weak<dyn HookState>>,
+) {
+    if depth > MAX_DEPTH {
+        warn!(
+            event = event.name(),
+            depth, "hooks kept setting each other off, not running them"
+        );
+        return;
+    }
+    for run in hooks.run(&event, state.get()) {
+        match run.result {
+            Ok(actions) => {
+                for action in actions {
+                    let request = Request {
+                        action,
+                        depth: depth + 1,
+                    };
+                    if let Err(unsent) = outbox.send(request) {
+                        debug!(request = ?unsent.0, "no server is taking hook requests");
+                    }
+                }
+            }
+            Err(message) => warn!(event = event.name(), hook = %run.hook, "{message}"),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
-pub struct HookSink(Arc<OnceLock<SyncSender<Envelope>>>);
+pub struct HookSink(Arc<OnceLock<SyncSender<Job>>>);
 
 impl HookSink {
     pub fn emit(&self, event: HookEvent) {
         self.send(event, DEPTH.get());
     }
 
+    pub async fn reload(&self) -> Result<Settings> {
+        let jobs = self.0.get().cloned().context("no lua host is running")?;
+        let (reply, reloaded) = oneshot::channel();
+        tokio::task::spawn_blocking(move || jobs.send(Job::Reload(reply)))
+            .await
+            .context("asking the lua host to reload")?
+            .map_err(|_| anyhow!("the lua host has stopped"))?;
+        reloaded
+            .await
+            .map_err(|_| anyhow!("the lua host stopped while reloading"))?
+    }
+
     fn send(&self, event: HookEvent, depth: u32) {
         let Some(events) = self.0.get() else {
             return;
         };
-        match events.try_send(Envelope { event, depth }) {
-            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
-            Err(TrySendError::Full(dropped)) => {
-                warn!(
-                    event = dropped.event.name(),
-                    "the lua hooks are behind, dropping the event"
-                );
-            }
+        let job = Job::Event(Envelope { event, depth });
+        if let Err(TrySendError::Full(Job::Event(dropped))) = events.try_send(job) {
+            warn!(
+                event = dropped.event.name(),
+                "the lua hooks are behind, dropping the event"
+            );
         }
     }
 
-    fn connect(&self, events: SyncSender<Envelope>) -> bool {
+    fn connect(&self, events: SyncSender<Job>) -> bool {
         self.0.set(events).is_ok()
     }
 }
@@ -536,7 +574,10 @@ mod tests {
 
     impl Hosted {
         fn feed(&self, event: HookEvent, depth: u32) {
-            self.host.events.send(Envelope { event, depth }).unwrap();
+            self.host
+                .events
+                .send(Job::Event(Envelope { event, depth }))
+                .unwrap();
         }
 
         fn next_request(&mut self) -> Request {
@@ -828,6 +869,39 @@ mod tests {
         assert_eq!(hosted.next_request(), request(kill_session("busy"), 1));
         let logs = hosted.logs.text();
         assert!(logs.contains("dropping the event"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn a_reload_swaps_the_hooks_and_a_broken_config_keeps_the_running_ones() {
+        let mut hosted =
+            start("amux.on('session_created', function() amux.kill_session('first') end)");
+        let sink = HookSink::default();
+        assert!(sink.connect(hosted.host.events.clone()));
+        let init = hosted.dir.path().join(INIT_FILE);
+
+        fs::write(
+            &init,
+            "amux.opt.window.base_index = 1\n\
+             amux.on('session_created', function() amux.kill_session('second') end)",
+        )
+        .unwrap();
+        let settings = sink.reload().await.unwrap();
+        assert_eq!(settings.window.base_index, 1);
+        hosted.feed(created("work"), 0);
+        assert_eq!(hosted.next_request(), request(kill_session("second"), 1));
+
+        fs::write(
+            &init,
+            "amux.on('session_created', function() amux.kill_session('third') end)\nlocal = 1",
+        )
+        .unwrap();
+        let error = sink.reload().await.unwrap_err().to_string();
+        assert!(
+            error.starts_with(&format!("{}:2: ", init.display())),
+            "{error}"
+        );
+        hosted.feed(created("work"), 0);
+        assert_eq!(hosted.next_request(), request(kill_session("second"), 1));
     }
 
     fn test_server(dir: &Path, settings: Settings) -> Arc<Server> {

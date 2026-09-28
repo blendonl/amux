@@ -96,7 +96,7 @@ async fn new_session_with(endpoint: &Endpoint, args: NewArgs, config: ClientConf
         clone: args.clone,
         ..NewSession::new(args.name, terminal::session_size(&config.settings.status)?)
     });
-    attach(server, &welcome.server_name, request, config).await
+    attach(endpoint, server, &welcome.server_name, request, config).await
 }
 
 async fn binding(
@@ -170,7 +170,7 @@ async fn attach_session_with(
         target,
         size: terminal::session_size(&config.settings.status)?,
     };
-    attach(server, &welcome.server_name, request, config).await
+    attach(endpoint, server, &welcome.server_name, request, config).await
 }
 
 pub async fn kill_session(
@@ -271,6 +271,33 @@ pub async fn forget_server(endpoint: &Endpoint, server: String) -> Result<()> {
             eprintln!("amux: {notice}");
             Ok(())
         }
+        other => bail!("unexpected reply from server: {other:?}"),
+    }
+}
+
+pub async fn reload_config(endpoint: &Endpoint) -> Result<()> {
+    let Ok(stream) = UnixStream::connect(&endpoint.socket).await else {
+        println!(
+            "no server is running on {}, so there is nothing to reload",
+            endpoint.socket.display()
+        );
+        return Ok(());
+    };
+    match request_reload(handshake(stream).await?).await? {
+        None => println!("{}", relay::RELOADED),
+        Some(notice) => println!("{}; {notice}", relay::RELOADED),
+    }
+    Ok(())
+}
+
+async fn reload_server(socket: &Path) -> Result<Option<String>> {
+    request_reload(connect(socket).await?).await
+}
+
+async fn request_reload(server: ServerConnection) -> Result<Option<String>> {
+    match request_reply(server, ClientMessage::ReloadConfig).await? {
+        ServerMessage::Done => Ok(None),
+        ServerMessage::Notice(notice) => Ok(Some(notice)),
         other => bail!("unexpected reply from server: {other:?}"),
     }
 }
@@ -465,6 +492,7 @@ fn config_paths(endpoint: &Endpoint) -> Result<ConfigPaths> {
 }
 
 async fn attach(
+    endpoint: &Endpoint,
     server: ServerConnection,
     local: &str,
     request: ClientMessage,
@@ -492,7 +520,7 @@ async fn attach(
     );
     let outcome = {
         let _terminal = RawTerminal::enter()?;
-        relay::run(incoming, outgoing, &mut relay).await?
+        relay::run(incoming, outgoing, &mut relay, endpoint).await?
     };
     println!("[{outcome} (from session {})]", relay.label());
     Ok(())

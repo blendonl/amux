@@ -108,7 +108,7 @@ impl Server {
         }
         if request.branch.is_some() {
             let (path, wanted) = (checkout.path.clone(), branch.clone());
-            let timeout = self.settings.worktrees.fetch_timeout();
+            let timeout = self.settings().worktrees.fetch_timeout();
             if let Err(err) = blocking(move || project::fetch_branch(&path, &wanted, timeout)).await
             {
                 debug!(%branch, "fetching the branch from origin failed: {err:#}");
@@ -160,12 +160,12 @@ impl Server {
         blocking(move || project::remove_worktree(&checkout, &worktree)).await
     }
 
-    pub(super) fn default_server(&self, project: Option<&ProjectRef>) -> Option<&str> {
-        self.settings
+    pub(super) fn default_server(&self, project: Option<&ProjectRef>) -> Option<String> {
+        self.settings()
             .projects
             .get(&project?.name)?
             .default_server
-            .as_deref()
+            .clone()
     }
 
     async fn checkout_of(
@@ -233,7 +233,7 @@ impl Server {
                 project.name
             );
         }
-        let dest = self.settings.projects_dir.join(&project.name);
+        let dest = self.settings().projects_dir.join(&project.name);
         let id = project.id.clone();
         info!(%url, dest = %dest.display(), "cloning project");
         let cloned = self
@@ -253,14 +253,15 @@ impl Server {
     }
 
     fn worktrees_dir(&self, project: &ProjectRef, checkout: &ProjectCheckout) -> PathBuf {
+        let settings = self.settings();
         [&project.name, &checkout.name]
             .into_iter()
-            .find_map(|name| self.settings.projects.get(name)?.worktrees_dir.clone())
+            .find_map(|name| settings.projects.get(name)?.worktrees_dir.clone())
             .unwrap_or_else(|| {
                 project::default_worktrees_dir(
                     &checkout.path,
                     &checkout.name,
-                    &self.settings.worktrees.suffix,
+                    &settings.worktrees.suffix,
                 )
             })
     }

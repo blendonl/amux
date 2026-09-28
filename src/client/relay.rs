@@ -1,5 +1,6 @@
 use std::fmt;
 use std::mem;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -16,13 +17,16 @@ use super::router::{self, Action, KeyRouter};
 use super::scripting::{ClientContext, Effect, Scripting, StatusContext};
 use super::terminal;
 use super::tree::Loading;
+use super::{ClientConfig, Endpoint};
 use crate::protocol::{
     AttachedSession, ClientMessage, ClusterStatus, ServerMessage, ServerView, SessionState, Size,
 };
 use crate::settings::{CallbackId, Keymap, Settings};
 use crate::target::Target;
 
+pub const RELOADED: &str = "config reloaded";
 const DRAIN_LIMIT: usize = 64;
+const RELOAD_TIMEOUT: Duration = Duration::from_secs(10);
 const RENAME_WINDOW: &str = "rename window";
 const RENAME_SESSION: &str = "rename session";
 
@@ -62,6 +66,8 @@ pub struct Relay {
     prompt_callback: Option<CallbackId>,
     escape_at: Option<Instant>,
     last_error: Option<String>,
+    reload_requested: bool,
+    reloading: Option<Result<(), String>>,
     output: Vec<u8>,
     messages: Vec<ClientMessage>,
     chrome_dirty: bool,
@@ -98,6 +104,8 @@ impl Relay {
             prompt_callback: None,
             escape_at: None,
             last_error: None,
+            reload_requested: false,
+            reloading: None,
             output: Vec::new(),
             messages: Vec::new(),
             chrome_dirty: true,
@@ -240,6 +248,47 @@ impl Relay {
         self.end.take()
     }
 
+    pub fn take_reload(&mut self) -> bool {
+        mem::take(&mut self.reload_requested)
+    }
+
+    pub fn client_reloaded(&mut self, config: Result<ClientConfig, String>) {
+        self.reloading = Some(config.map(|config| self.reconfigure(config)));
+    }
+
+    pub fn server_reloaded(&mut self, server: Result<Option<String>, String>) {
+        let client = self.reloading.take().unwrap_or(Ok(()));
+        self.notify(reload_notice(client, server));
+    }
+
+    fn reconfigure(&mut self, config: ClientConfig) {
+        if self.panel.is_some() {
+            self.close_panel();
+        }
+        let ClientConfig {
+            settings,
+            keymap,
+            scripting,
+        } = config;
+        let held = self.router.flush();
+        if !held.is_empty() {
+            self.messages.push(ClientMessage::Input(held));
+        }
+        let rows = self.settings.status.rows();
+        self.router = KeyRouter::new(settings.prefix, Arc::clone(&keymap), settings.escape_time());
+        self.detach_hint = detach_hint(&keymap, &settings.prefix);
+        self.settings = settings;
+        self.keymap = keymap;
+        self.scripting = Some(scripting);
+        self.status_memo = None;
+        self.status_error = None;
+        if self.settings.status.rows() != rows {
+            self.resize(self.size);
+            self.messages.push(ClientMessage::Redraw);
+        }
+        self.chrome_dirty = true;
+    }
+
     fn act(&mut self, actions: Vec<Action>) {
         for action in actions {
             match action {
@@ -248,6 +297,7 @@ impl Relay {
                 Action::Command(command) => self.messages.push(ClientMessage::Command(command)),
                 Action::Open(panel) => self.open(panel),
                 Action::Callback(id) => self.run_callback(id, None),
+                Action::ReloadConfig => self.reload_requested = self.reloading.is_none(),
             }
         }
     }
@@ -623,6 +673,24 @@ impl Relay {
     }
 }
 
+fn reload_notice(client: Result<(), String>, server: Result<Option<String>, String>) -> String {
+    match (client, server) {
+        (Ok(()), Ok(None)) => RELOADED.to_owned(),
+        (Ok(()), Ok(Some(notice))) => format!("{RELOADED}; {notice}"),
+        (Ok(()), Err(error)) => format!("{RELOADED}, but not on the server: {error}"),
+        (Err(error), Ok(_)) => format!("{error} (the server reloaded)"),
+        (Err(client), Err(server)) if client == server => client,
+        (Err(client), Err(server)) => format!("{client}; the server: {server}"),
+    }
+}
+
+async fn reload_server(socket: PathBuf) -> Result<Option<String>, String> {
+    match tokio::time::timeout(RELOAD_TIMEOUT, super::reload_server(&socket)).await {
+        Ok(reply) => reply.map_err(|error| format!("{error:#}")),
+        Err(_) => Err("the server did not answer".to_owned()),
+    }
+}
+
 fn wall_clock_ms() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -635,10 +703,12 @@ pub async fn run(
     mut incoming: mpsc::Receiver<ServerMessage>,
     outgoing: mpsc::Sender<ClientMessage>,
     relay: &mut Relay,
+    endpoint: &Endpoint,
 ) -> Result<Outcome> {
     let mut stdin = terminal::stdin_chunks();
     let mut resizes = signal(SignalKind::window_change())?;
     let mut stdin_open = true;
+    let (reloaded, mut reloads) = mpsc::channel(1);
 
     loop {
         let output = relay.take_output();
@@ -647,6 +717,16 @@ pub async fn run(
         }
         if let Some(end) = relay.take_end() {
             return end.map_err(|message| anyhow!(message));
+        }
+        if relay.take_reload() {
+            relay.client_reloaded(
+                ClientConfig::load(endpoint).map_err(|error| format!("{error:#}")),
+            );
+            let (socket, reloaded) = (endpoint.socket.clone(), reloaded.clone());
+            tokio::spawn(async move {
+                let _ = reloaded.send(reload_server(socket).await).await;
+            });
+            continue;
         }
         for message in relay.take_messages() {
             super::send(&outgoing, message).await?;
@@ -676,6 +756,7 @@ pub async fn run(
                 }
             },
             _ = resizes.recv() => relay.resize(terminal::size()?),
+            Some(reply) = reloads.recv() => relay.server_reloaded(reply),
             () = sleep_until(escape.unwrap_or_else(Instant::now)), if escape.is_some() => {
                 relay.escape_timeout();
             }
@@ -1335,6 +1416,40 @@ mod tests {
     }
 
     #[test]
+    fn the_reload_notice_names_what_did_not_reload() {
+        assert_eq!(reload_notice(Ok(()), Ok(None)), "config reloaded");
+        assert_eq!(
+            reload_notice(
+                Ok(()),
+                Ok(Some("restart required for amux.opt.name".into()))
+            ),
+            "config reloaded; restart required for amux.opt.name"
+        );
+        assert_eq!(
+            reload_notice(Ok(()), Err("the server did not answer".into())),
+            "config reloaded, but not on the server: the server did not answer"
+        );
+        assert_eq!(
+            reload_notice(Err("init.lua:1: boom".into()), Ok(None)),
+            "init.lua:1: boom (the server reloaded)"
+        );
+        assert_eq!(
+            reload_notice(
+                Err("init.lua:1: boom".into()),
+                Err("init.lua:1: boom".into())
+            ),
+            "init.lua:1: boom"
+        );
+        assert_eq!(
+            reload_notice(
+                Err("init.lua:1: boom".into()),
+                Err("init.lua:2: bang".into())
+            ),
+            "init.lua:1: boom; the server: init.lua:2: bang"
+        );
+    }
+
+    #[test]
     fn the_theme_and_chrome_settings_reach_every_panel() {
         let mut settings = Settings::default();
         settings.status.window_format = "[{index}]{name} ".into();
@@ -1396,19 +1511,32 @@ mod tests {
         use super::*;
         use crate::lua::{self, ConfigPaths, LuaScripting, Process, INIT_FILE};
 
-        fn scripted(source: &str) -> (Relay, vt100::Parser) {
+        fn config(source: &str) -> ClientConfig {
             let dir = tempfile::tempdir().unwrap();
             let init = dir.path().join(INIT_FILE);
             fs::write(&init, source).unwrap();
             let paths = ConfigPaths::new(dir.path().to_owned(), Some(init));
             let loaded = lua::load(&paths, Process::Client).unwrap();
+            ClientConfig {
+                settings: Arc::new(loaded.settings.clone()),
+                keymap: Arc::new(loaded.keymap.clone()),
+                scripting: Box::new(LuaScripting::new(loaded)),
+            }
+        }
+
+        fn scripted(source: &str) -> (Relay, vt100::Parser) {
+            let ClientConfig {
+                settings,
+                keymap,
+                scripting,
+            } = config(source);
             let relay = Relay::new(
                 "laptop".into(),
                 attached("work", "laptop"),
                 SIZE,
-                Arc::new(loaded.settings.clone()),
-                Arc::new(loaded.keymap.clone()),
-                Some(Box::new(LuaScripting::new(loaded))),
+                settings,
+                keymap,
+                Some(scripting),
             );
             (relay, terminal(SIZE.rows, SIZE.cols))
         }
@@ -1689,6 +1817,71 @@ mod tests {
                 bottom(&mut relay, &mut parser),
                 format!("{:<37}#3", "[work@laptop] 0:sh  1:vim")
             );
+        }
+
+        #[test]
+        fn a_reload_swaps_the_prefix_the_bindings_and_the_status() {
+            let (mut relay, mut parser) = scripted(
+                "amux.keymap.set('prefix', 'g', function() amux.notify('old binding') end)",
+            );
+            relay.server_message(Some(state("work", 1)));
+            relay.input(b"\x02r");
+            assert!(relay.take_reload());
+            assert!(!relay.take_reload());
+
+            relay.client_reloaded(Ok(config(
+                "amux.opt.prefix = 'C-a'\n\
+                 amux.opt.status.session_format = '<{session}>'\n\
+                 amux.keymap.set('prefix', 'g', function() amux.notify('new binding') end)",
+            )));
+            relay.input(b"\x01r");
+            assert!(!relay.take_reload());
+            relay.server_reloaded(Ok(None));
+            assert_eq!(bottom(&mut relay, &mut parser), RELOADED);
+            assert_eq!(relay.take_messages(), Vec::new());
+
+            relay.notice_expired();
+            assert_eq!(bottom(&mut relay, &mut parser), "<work> 0:sh  1:vim");
+            relay.input(b"\x02x\x01g");
+            assert_eq!(
+                relay.take_messages(),
+                vec![ClientMessage::Input(b"\x02x".to_vec())]
+            );
+            assert_eq!(bottom(&mut relay, &mut parser), "new binding");
+            relay.input(b"\x01r");
+            assert!(relay.take_reload());
+        }
+
+        #[test]
+        fn a_broken_reload_keeps_the_running_config_and_shows_the_error_once() {
+            let (mut relay, mut parser) =
+                scripted("amux.keymap.set('prefix', 'g', function() amux.notify('kept') end)");
+            relay.input(b"\x02r");
+            assert!(relay.take_reload());
+            relay.client_reloaded(Err("init.lua:2: boom".into()));
+            relay.server_reloaded(Err("init.lua:2: boom".into()));
+            assert_eq!(bottom(&mut relay, &mut parser), "init.lua:2: boom");
+
+            relay.input(b"\x02g");
+            assert_eq!(bottom(&mut relay, &mut parser), "kept");
+            assert_eq!(relay.take_messages(), Vec::new());
+        }
+
+        #[test]
+        fn a_reload_that_hides_the_status_bar_resizes_the_session() {
+            let (mut relay, _) = scripted("");
+            relay.input(b"\x02,");
+            relay.take_messages();
+            relay.client_reloaded(Ok(config("amux.opt.status.enabled = false")));
+            assert_eq!(
+                relay.take_messages(),
+                vec![
+                    ClientMessage::Redraw,
+                    ClientMessage::Resize(SIZE),
+                    ClientMessage::Redraw,
+                ]
+            );
+            assert!(relay.panel.is_none());
         }
 
         #[test]

@@ -32,6 +32,7 @@ cargo run -- pair --new-key              # pair with a new key, so a forgotten m
 cargo run -- pair k7-4821-9930 --verbose # print each step of the pairing, to see where it stops
 cargo run -- config check                # load init.lua and servers.lua and say which files were read
 cargo run -- config defaults             # every default setting, as Lua for a starting init.lua
+cargo run -- config reload               # make the running server load its config again
 cargo run -- kill-server                 # stop the server and all sessions
 ```
 
@@ -57,6 +58,7 @@ A session holds numbered windows, and each window splits into panes, each runnin
 | `Ctrl-b ,`              | Rename the active window                         |
 | `Ctrl-b $`              | Rename the session                               |
 | `Ctrl-b s`              | Pick a session or window anywhere in the cluster |
+| `Ctrl-b r`              | Reload the config, here and on this server       |
 | `Ctrl-b d`              | Detach                                           |
 | `Ctrl-b Ctrl-b`         | Send a literal `Ctrl-b`                          |
 
@@ -118,7 +120,7 @@ Panes are numbered from 0 in layout order. `attach -t work:1.0` makes window 1 a
 
 ### Config
 
-amux is configured in Lua. The server loads the config when it starts, the client loads it when it attaches (`amux`, `amux new` and `amux attach`), and so do `amux servers add`, `amux servers remove` and `amux config`. `amux ls`, `kill`, `bridge`, `kill-server` and the other one-shot commands never read it. It runs the first of these that applies:
+amux is configured in Lua. The server loads the config when it starts, the client loads it when it attaches (`amux`, `amux new` and `amux attach`), both load it again on a [reload](#reloading), and so do `amux servers add`, `amux servers remove` and `amux config`. `amux ls`, `kill`, `bridge`, `kill-server` and the other one-shot commands never read it. It runs the first of these that applies:
 
 1. The file named by `--config <path>` or `AMUX_CONFIG`, which must exist
 2. `$XDG_CONFIG_HOME/amux/init.lua`, usually `~/.config/amux/init.lua`
@@ -178,6 +180,7 @@ amux.on("session_created", function(event) amux.log("new session " .. event.sess
 | `amux config check`    | Loads the config as the server and as the client, then prints the files it read             |
 | `amux config defaults` | Prints every default as assignments to `amux.opt`, which works as a starting `init.lua`     |
 | `amux config path`     | Prints where your `init.lua` is or goes: the `--config` file, or the one in the config dir  |
+| `amux config reload`   | Makes the running server load its config again, and prints what happened                    |
 
 `name` defaults to the hostname and `projects_dir` to `~/projects`. A leading `~` in `projects_dir` and `worktrees_dir` means your home directory. Each entry under `servers` is a peer to link to. Each entry under `projects` is keyed by project name: `default_server` is where `amux new` puts that project's sessions when you don't pass `--on`, and `worktrees_dir` is where its worktrees go instead of the default `<checkout>/../<project>-worktrees`.
 
@@ -198,6 +201,26 @@ A server's `address` is one of:
 - `exec:<command>`, which runs the command directly, split like a shell would split it but without a shell. The command has to end in `amux … bridge`. The tests use it to link servers on one machine.
 - `tcp://host:port`, which links over Noise to that address. The other server's key must already be trusted, or vouched for by the tailnet. Tailscale discovery uses this form.
 - `lan://<server id>`, the form LAN discovery uses. The IP addresses and port come from mDNS each time amux dials.
+
+#### Reloading
+
+A change to the config takes effect without a restart:
+
+- `Ctrl-b r` reloads the client you type in, then asks the server on this machine to reload too. It asks over a connection of its own, so the key never reloads the config of another machine, even while you are attached to a session there. The status bar then shows `config reloaded`, or the error.
+- `amux config reload` asks the running server to reload and prints `config reloaded` or the error. Without a running server it says so and exits with success.
+- `SIGHUP` makes the server reload too, and it writes the result to its log (`<socket>.log`).
+
+The server reloads the file it started with. When it started without one, or with `/etc/amux/init.lua`, it looks again, so an `init.lua` you create later is found.
+
+A config that fails to load changes nothing. The running settings, bindings and hooks stay, and the error names the file and line, as at startup, for example `init.lua:12: unexpected symbol near '='`. A config that loads replaces them all at once, including every hook and every function binding.
+
+What a reload changes:
+
+- **The client**: the prefix, the key bindings, the status bar, the tree, the theme, and the notice and escape times, right away. An open prompt or tree closes.
+- **Panes and windows**: the ones opened after the reload get the new `pane`, `window` and session naming settings. Panes that are already running keep the shell, `TERM` and environment they started with. Pane borders are drawn again with the new `borders` and theme.
+- **Projects**: `projects` and `projects_dir` apply to the next session.
+- **The cluster**: servers added to `amux.opt.servers` or `servers.lua` are linked, and removed ones are dropped. The status interval applies right away, and the other `cluster` timings to the next dial, backoff and link.
+- **A restart** (`amux kill-server`) is still needed for `name`, `discovery` and `lan`, because the server's identity, its listeners and its discovery sources are set up once. A reload keeps their running values, applies the rest, and says so: `config reloaded; restart required for amux.opt.name`.
 
 #### servers.lua
 
@@ -221,7 +244,7 @@ Each server also has a random ID, stored in `$XDG_STATE_HOME/amux/<socket name>/
 
 Every connection starts with a greeting that carries the protocol version. When the client and the running server speak different major versions, the client names both and asks you to run `amux kill-server`. `kill-server` also works on a server that is too old to answer the greeting.
 
-This version speaks protocol 8, which added the steps `amux pair --verbose` prints, after protocol 7 added the Noise keys, trust updates and discovery, so every machine in the cluster needs the new build. Servers on different major versions refuse to link, and `amux servers` lists the older one as `incompatible, runs amux … (protocol 7.0)`. An older build doesn't listen on TCP, so Tailscale and LAN discovery can't reach it either. The cluster cache of the older build still loads.
+This version speaks protocol 9, which added config reloads. Protocol 8 added the steps `amux pair --verbose` prints, and protocol 7 added the Noise keys, trust updates and discovery, so every machine in the cluster needs the new build. Servers on different major versions refuse to link, and `amux servers` lists the older one as `incompatible, runs amux … (protocol 8.0)`. A build older than protocol 7 doesn't listen on TCP, so Tailscale and LAN discovery can't reach it either. The cluster cache of an older build still loads.
 
 amux no longer reads `config.toml`. Move its settings into `init.lua` as assignments to `amux.opt`: `name = "desktop"` becomes `amux.opt.name = "desktop"`, a `[servers.laptop]` table with `address = "ssh://laptop"` becomes `amux.opt.servers.laptop = { address = "ssh://laptop" }`, and `tailscale = false` under `[discovery]` becomes `amux.opt.discovery.tailscale = false`. Then run `amux config check`, and restart the server with `amux kill-server` so it loads the new file.
 
@@ -517,4 +540,5 @@ Beyond the design:
 
 - [x] A Lua config: `init.lua` and `servers.lua` in place of `config.toml`, and `amux config check`, `defaults` and `path`
 - [x] Prefix key and key bindings from the config in the client
+- [x] Reloading the config without a restart: `Ctrl-b r`, `amux config reload` and `SIGHUP`
 - [ ] Scrollback and copy mode

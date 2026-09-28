@@ -3,7 +3,7 @@ use std::time::Duration;
 use mlua::{AppDataRefMut, Function, IntoLua, IntoLuaMulti, Lua, MultiValue, Table, Value};
 use serde::Deserialize;
 
-use super::api::{bound, registry, Bound, Registry};
+use super::api::{bound, registry, Bound, Callbacks, Registry};
 use super::runtime::Loaded;
 use super::{call_within, describe, from_lua, function};
 use crate::client::scripting::{ClientContext, Effect, Scripting, StatusContext, StatusSpan};
@@ -61,13 +61,22 @@ impl LuaScripting {
         (result.map_err(|error| describe(&error)), call)
     }
 
-    fn sync_keymap(&mut self, succeeded: bool) -> Option<Keymap> {
+    fn saved_callbacks(&self) -> Option<Callbacks> {
+        self.lua
+            .app_data_ref::<Registry>()
+            .map(|registry| registry.callbacks.clone())
+    }
+
+    fn settle(&mut self, succeeded: bool, saved: Option<Callbacks>) -> Option<Keymap> {
         let mut registry = self.lua.app_data_mut::<Registry>()?;
-        if registry.keymap == self.keymap {
+        if !succeeded {
+            if let Some(saved) = saved {
+                registry.callbacks = saved;
+            }
+            registry.keymap = self.keymap.clone();
             return None;
         }
-        if !succeeded {
-            registry.keymap = self.keymap.clone();
+        if registry.keymap == self.keymap {
             return None;
         }
         self.keymap = registry.keymap.clone();
@@ -95,9 +104,10 @@ impl Scripting for LuaScripting {
             snapshot: Some(snapshot),
             effects: Some(Vec::new()),
         };
+        let saved = self.saved_callbacks();
         let (result, call) =
             self.run::<MultiValue>(&callback, arguments, call, BINDING_BUDGET, "a key binding");
-        let keymap = self.sync_keymap(result.is_ok());
+        let keymap = self.settle(result.is_ok(), saved);
         result?;
         Ok(keymap
             .map(Effect::Keymap)
@@ -494,6 +504,50 @@ mod tests {
         };
         assert_ne!(next, submit);
         assert_eq!(registered(&scripting), 2);
+    }
+
+    #[test]
+    fn a_failed_binding_keeps_the_callbacks_it_replaced_and_frees_the_ones_it_made() {
+        let (mut scripting, keymap) = scripting(
+            "amux.keymap.set('prefix', 'h', function() amux.notify('old h') end)\n\
+             amux.keymap.set('prefix', 'g', function()\n\
+               amux.keymap.set('prefix', 'h', function() end)\n\
+               amux.prompt { on_submit = function() end }\n\
+               error('boom')\n\
+             end)\n\
+             amux.keymap.set('prefix', 'n', function()\n\
+               amux.keymap.set('prefix', 'h', function() amux.notify('new h') end)\n\
+             end)",
+        );
+        assert_eq!(registered(&scripting), 3);
+        let error = scripting
+            .call(callback_for(&keymap, "g"), None, &context())
+            .unwrap_err();
+        assert!(error.ends_with("init.lua:5: boom"), "{error}");
+        assert_eq!(registered(&scripting), 3);
+        assert_eq!(
+            scripting.call(callback_for(&keymap, "h"), None, &context()),
+            Ok(vec![Effect::Notify("old h".into())])
+        );
+
+        let effects = scripting
+            .call(callback_for(&keymap, "n"), None, &context())
+            .unwrap();
+        let [Effect::Keymap(changed)] = effects.as_slice() else {
+            panic!("{effects:?}");
+        };
+        assert_eq!(registered(&scripting), 3);
+        assert_eq!(
+            scripting.call(callback_for(changed, "h"), None, &context()),
+            Ok(vec![Effect::Notify("new h".into())])
+        );
+        assert_eq!(
+            scripting.call(callback_for(&keymap, "h"), None, &context()),
+            Err(format!(
+                "callback {} is not registered",
+                callback_for(&keymap, "h").0
+            ))
+        );
     }
 
     fn registered(scripting: &LuaScripting) -> usize {
