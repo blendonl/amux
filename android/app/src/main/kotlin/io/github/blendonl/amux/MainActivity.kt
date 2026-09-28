@@ -37,6 +37,11 @@ class MainActivity : Activity() {
         override fun onServiceDisconnected(name: ComponentName) {
             service = null
         }
+
+        override fun onBindingDied(name: ComponentName) {
+            service = null
+            if (!isFinishing) rebind()
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -55,7 +60,7 @@ class MainActivity : Activity() {
         requestNotificationPermission()
         showProgress(getString(R.string.status_starting), null)
         AmuxService.start(this)
-        bound = bindService(Intent(this, AmuxService::class.java), connection, 0)
+        bind()
     }
 
     override fun onDestroy() {
@@ -64,6 +69,15 @@ class MainActivity : Activity() {
         session?.finishIfRunning()
         session = null
         super.onDestroy()
+    }
+
+    private fun bind() {
+        bound = bindService(Intent(this, AmuxService::class.java), connection, 0)
+    }
+
+    private fun rebind() {
+        if (bound) unbindService(connection)
+        bind()
     }
 
     private fun onServerState(state: ServerState) {
