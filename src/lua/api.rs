@@ -7,7 +7,8 @@ use serde::de::{self, DeserializeOwned, Deserializer, IntoDeserializer, Visitor}
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use super::{from_lua, function};
+use super::runtime::Process;
+use super::{client, from_lua, function};
 use crate::keys::Key;
 use crate::settings::{
     Binding, CallbackId, Keymap, PromptAction, Table as Bindings, TreeAction, PREFIX_TABLE,
@@ -44,7 +45,7 @@ impl Callbacks {
         self.0.is_empty()
     }
 
-    fn register(&mut self, callback: Function) -> CallbackId {
+    pub(super) fn register(&mut self, callback: Function) -> CallbackId {
         self.0.push(callback);
         CallbackId(self.0.len() - 1)
     }
@@ -70,15 +71,18 @@ pub struct Registry {
     pub hooks: Hooks,
 }
 
-pub fn install(lua: &Lua, opt: &Table, process: &'static str) -> mlua::Result<()> {
+pub fn install(lua: &Lua, opt: &Table, process: Process) -> mlua::Result<()> {
     lua.set_app_data(Registry::default());
     let (action, constructors) = actions(lua)?;
     let api = lua.create_table()?;
     api.set("opt", opt)?;
-    api.set("keymap", keymap(lua, constructors)?)?;
+    api.set("keymap", keymap(lua, constructors.clone())?)?;
     api.set("action", guarded(lua, "amux.action", action)?)?;
     api.set("on", function(lua, on)?)?;
-    api.set("process", process)?;
+    api.set("process", process.name())?;
+    if process == Process::Client {
+        client::install(lua, &api, constructors)?;
+    }
     api.set("hostname", function(lua, |_, ()| hostname())?)?;
     api.set("log", function(lua, log)?)?;
     lua.globals().set("amux", guarded(lua, "amux", api)?)
@@ -112,12 +116,12 @@ fn guarded(lua: &Lua, name: &'static str, api: Table) -> mlua::Result<Table> {
     Ok(guarded)
 }
 
-fn registry(lua: &Lua) -> mlua::Result<AppDataRefMut<'_, Registry>> {
+pub(super) fn registry(lua: &Lua) -> mlua::Result<AppDataRefMut<'_, Registry>> {
     lua.app_data_mut::<Registry>()
         .ok_or_else(|| mlua::Error::runtime("the amux configuration is closed"))
 }
 
-enum Bound {
+pub(super) enum Bound {
     Binding(Binding),
     Callback(Function),
 }
@@ -248,7 +252,7 @@ fn panel_action<A: DeserializeOwned>(table: &str, value: Value) -> mlua::Result<
     }
 }
 
-fn bound(lua: &Lua, constructors: &Table, value: Value) -> mlua::Result<Bound> {
+pub(super) fn bound(lua: &Lua, constructors: &Table, value: Value) -> mlua::Result<Bound> {
     match value {
         Value::Function(callback) => match constructors.raw_get::<Option<String>>(&callback)? {
             Some(name) => parse_binding(name.into_lua(lua)?).map(Bound::Binding),

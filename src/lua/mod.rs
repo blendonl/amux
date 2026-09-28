@@ -1,4 +1,5 @@
 mod api;
+mod client;
 pub mod data;
 pub mod emit;
 mod opt;
@@ -11,6 +12,7 @@ use mlua::{DeserializeOptions, FromLuaMulti, Function, IntoLuaMulti, Lua, MultiV
 use serde::de::DeserializeOwned;
 
 pub use api::{Callbacks, Hooks, EVENTS};
+pub use client::LuaScripting;
 pub use runtime::{find_init, load, ConfigPaths, Loaded, Process, INIT_FILE, SYSTEM_INIT};
 
 const TRACEBACK: &str = "\nstack traceback:";

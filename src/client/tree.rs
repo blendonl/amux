@@ -12,23 +12,6 @@ use crate::target::Target;
 const NO_PROJECT: &str = "(no project)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TreeEvent {
-    Pending,
-    Pick(Target),
-    Cancel,
-}
-
-impl From<TreeEvent> for PanelEvent {
-    fn from(event: TreeEvent) -> Self {
-        match event {
-            TreeEvent::Pending => Self::Pending,
-            TreeEvent::Pick(target) => Self::Done(ClientMessage::Switch(target)),
-            TreeEvent::Cancel => Self::Cancel,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 enum Entry {
     Server,
     Project,
@@ -111,30 +94,14 @@ impl ClusterTree {
         }
     }
 
-    pub fn handle(&mut self, input: &[u8]) -> TreeEvent {
-        for decoded in self.keys.feed(input) {
-            if let Some(event) = self.press(&decoded) {
-                return event;
-            }
-        }
-        TreeEvent::Pending
-    }
-
-    pub fn time_out(&mut self) -> TreeEvent {
-        self.keys
-            .time_out()
-            .and_then(|decoded| self.press(&decoded))
-            .unwrap_or(TreeEvent::Pending)
-    }
-
-    fn press(&mut self, decoded: &Decoded) -> Option<TreeEvent> {
+    fn press(&mut self, decoded: &Decoded) -> Option<PanelEvent> {
         self.bindings
             .resolve(decoded)
             .into_iter()
             .find_map(|(_, action)| action.and_then(|action| self.apply(action)))
     }
 
-    fn apply(&mut self, action: TreeAction) -> Option<TreeEvent> {
+    fn apply(&mut self, action: TreeAction) -> Option<PanelEvent> {
         match action {
             TreeAction::Down => self.move_by(1),
             TreeAction::Up => self.move_by(-1),
@@ -143,7 +110,7 @@ impl ClusterTree {
             TreeAction::Collapse => self.collapse(),
             TreeAction::Expand => self.expand(),
             TreeAction::Pick => return self.pick(),
-            TreeAction::Cancel => return Some(TreeEvent::Cancel),
+            TreeAction::Cancel => return Some(PanelEvent::Cancel),
         }
         None
     }
@@ -189,11 +156,11 @@ impl ClusterTree {
         }
     }
 
-    fn pick(&mut self) -> Option<TreeEvent> {
+    fn pick(&mut self) -> Option<PanelEvent> {
         let node = self.nodes.get_mut(self.cursor)?;
         match &node.entry {
             Entry::Session(target) | Entry::Window(target) if !node.stale => {
-                Some(TreeEvent::Pick(target.clone()))
+                Some(PanelEvent::Done(ClientMessage::Switch(target.clone())))
             }
             Entry::Server | Entry::Project if node.has_children => {
                 node.expanded = !node.expanded;
@@ -251,11 +218,19 @@ impl ClusterTree {
 
 impl Panel for ClusterTree {
     fn handle(&mut self, input: &[u8], _attached: &Target) -> PanelEvent {
-        ClusterTree::handle(self, input).into()
+        for decoded in self.keys.feed(input) {
+            if let Some(event) = self.press(&decoded) {
+                return event;
+            }
+        }
+        PanelEvent::Pending
     }
 
     fn time_out(&mut self, _attached: &Target) -> PanelEvent {
-        ClusterTree::time_out(self).into()
+        self.keys
+            .time_out()
+            .and_then(|decoded| self.press(&decoded))
+            .unwrap_or(PanelEvent::Pending)
     }
 
     fn is_partial(&self) -> bool {
@@ -508,7 +483,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::*;
-    use crate::client::chrome::testing::{screen_text, terminal};
+    use crate::client::chrome::testing::{screen_text, terminal, Event};
     use crate::protocol::{ProjectCheckout, SessionId, Version};
     use crate::settings::{Keymap, Settings};
 
@@ -644,13 +619,21 @@ mod tests {
         &tree.nodes[tree.cursor].label
     }
 
+    fn handle(tree: &mut ClusterTree, keys: &[u8]) -> Event {
+        Panel::handle(tree, keys, &Target::default()).into()
+    }
+
+    fn time_out(tree: &mut ClusterTree) -> Event {
+        Panel::time_out(tree, &Target::default()).into()
+    }
+
     fn press(tree: &mut ClusterTree, keys: &[u8]) {
-        assert_eq!(tree.handle(keys), TreeEvent::Pending);
+        assert_eq!(handle(tree, keys), Event::Pending);
     }
 
     fn picked(tree: &mut ClusterTree) -> String {
-        match tree.handle(b"\r") {
-            TreeEvent::Pick(target) => target.to_string(),
+        match handle(tree, b"\r") {
+            Event::Done(ClientMessage::Switch(target)) => target.to_string(),
             other => panic!("expected a pick, got {other:?}"),
         }
     }
@@ -828,23 +811,23 @@ mod tests {
         press(&mut tree, b"G");
         press(&mut tree, b"kkk");
         assert_eq!(current(&tree), "infra/main");
-        assert_eq!(tree.handle(b"\r"), TreeEvent::Pending);
+        assert_eq!(handle(&mut tree, b"\r"), Event::Pending);
 
         press(&mut tree, b"lj");
         assert_eq!(current(&tree), "0:sh");
-        assert_eq!(tree.handle(b"\r"), TreeEvent::Pending);
+        assert_eq!(handle(&mut tree, b"\r"), Event::Pending);
     }
 
     #[test]
     fn escape_q_and_ctrl_c_cancel() {
-        assert_eq!(attached_tree().handle(b"q"), TreeEvent::Cancel);
-        assert_eq!(attached_tree().handle(b"\x03"), TreeEvent::Cancel);
-        assert_eq!(attached_tree().handle(b"\x1bj"), TreeEvent::Cancel);
+        assert_eq!(handle(&mut attached_tree(), b"q"), Event::Cancel);
+        assert_eq!(handle(&mut attached_tree(), b"\x03"), Event::Cancel);
+        assert_eq!(handle(&mut attached_tree(), b"\x1bj"), Event::Cancel);
 
         let mut tree = attached_tree();
-        assert_eq!(tree.handle(b"\x1b"), TreeEvent::Pending);
+        assert_eq!(handle(&mut tree, b"\x1b"), Event::Pending);
         assert!(tree.is_partial());
-        assert_eq!(tree.time_out(), TreeEvent::Cancel);
+        assert_eq!(time_out(&mut tree), Event::Cancel);
     }
 
     #[test]
@@ -855,7 +838,7 @@ mod tests {
         press(&mut tree, b"B");
         assert_eq!(current(&tree), "api");
         assert!(!tree.is_partial());
-        assert_eq!(tree.time_out(), TreeEvent::Pending);
+        assert_eq!(time_out(&mut tree), Event::Pending);
     }
 
     #[test]
@@ -945,8 +928,8 @@ mod tests {
             Arc::new(Settings::default()),
         );
         assert_eq!(lines(&mut tree, 2, 10), vec!["", ""]);
-        assert_eq!(tree.handle(b"jkhl\r"), TreeEvent::Pending);
-        assert_eq!(tree.handle(b"q"), TreeEvent::Cancel);
+        assert_eq!(handle(&mut tree, b"jkhl\r"), Event::Pending);
+        assert_eq!(handle(&mut tree, b"q"), Event::Cancel);
         assert!(tree.render(Rect::default()).is_empty());
     }
 }

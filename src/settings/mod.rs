@@ -1,4 +1,4 @@
-mod callback;
+pub mod callback;
 mod client;
 mod host;
 mod keymap;
@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-pub use callback::CallbackId;
+pub use callback::{CallbackId, CALLBACK_SLOT};
 pub use client::{StatusSettings, TreeSettings};
 pub use host::{
     BorderSettings, MouseSettings, PaneSettings, SessionSettings, WindowSettings, WorktreeSettings,

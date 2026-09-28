@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -10,6 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::ser::{self, Serialize};
 
 use super::{from_lua, function};
+use crate::settings::CALLBACK_SLOT;
 
 const ROOT: &str = "amux.opt";
 
@@ -45,6 +47,8 @@ impl<T: Serialize + DeserializeOwned + Default> Opt<T> {
             defaults: tree(lua)?,
             views: lua.create_table()?,
             normalize: normalize::<T>,
+            shape: Shape::Struct(fields.clone()),
+            closed: Cell::new(false),
         });
         let proxy = view(lua, &state, Vec::new(), fields)?;
         Ok(Self {
@@ -58,11 +62,22 @@ impl<T: Serialize + DeserializeOwned + Default> Opt<T> {
         &self.proxy
     }
 
-    pub fn settings(&self, lua: &Lua) -> Result<T, String> {
+    pub fn settings(
+        &self,
+        lua: &Lua,
+        mut register: impl FnMut(Function) -> usize,
+    ) -> Result<T, String> {
         let data = Unwrapper::new(lua, &self.state)
             .unwrap(Value::Table(self.state.data.clone()))
+            .and_then(|data| {
+                slot_callbacks(lua, data, &self.state.shape, &mut Vec::new(), &mut register)
+            })
             .map_err(|error| error.to_string())?;
         from_lua(data).map_err(|invalid| invalid.within(ROOT))
+    }
+
+    pub fn close(&self) {
+        self.state.closed.set(true);
     }
 }
 
@@ -71,6 +86,8 @@ struct State {
     defaults: Table,
     views: Table,
     normalize: fn(&Lua, Table) -> Result<Table, String>,
+    shape: Shape,
+    closed: Cell<bool>,
 }
 
 impl State {
@@ -131,7 +148,21 @@ impl Node {
     }
 
     fn set(&self, lua: &Lua, state: &State, name: &'static str, value: Value) -> mlua::Result<()> {
+        let mut path = self.path.clone();
+        path.push(name);
+        if state.closed.get() {
+            return Err(mlua::Error::runtime(format!(
+                "{} cannot change after the configuration is loaded",
+                dotted(&path)
+            )));
+        }
+        let shape = &self.fields[name];
+        let mut slots = Vec::new();
         let value = Unwrapper::new(lua, state).unwrap(value)?;
+        let value = slot_callbacks(lua, value, shape, &mut path, &mut |callback| {
+            slots.push(callback);
+            slots.len() - 1
+        })?;
         let root = copy(lua, &state.defaults)?;
         let parent = self.path.iter().try_fold(root.clone(), |table, step| {
             let child = copy(lua, &table.raw_get(*step)?)?;
@@ -145,6 +176,7 @@ impl Node {
             .iter()
             .try_fold(normalized, |table, step| table.raw_get::<Table>(*step))?
             .raw_get(name)?;
+        let stored = restore_callbacks(stored, shape, &slots)?;
         state.node(&self.path)?.raw_set(name, stored)
     }
 
@@ -215,6 +247,52 @@ fn view(
     Ok(proxy)
 }
 
+fn slot_callbacks(
+    lua: &Lua,
+    value: Value,
+    shape: &Shape,
+    path: &mut Vec<&'static str>,
+    register: &mut dyn FnMut(Function) -> usize,
+) -> mlua::Result<Value> {
+    match (shape, value) {
+        (Shape::Callback, Value::Function(callback)) => register(callback).into_lua(lua),
+        (Shape::Callback, Value::Nil) => Ok(Value::Nil),
+        (Shape::Callback, other) => Err(mlua::Error::runtime(format!(
+            "{}: expected a function, not a {}",
+            dotted(path),
+            other.type_name()
+        ))),
+        (Shape::Struct(fields), Value::Table(table)) => {
+            for (name, field) in fields.iter().filter(|(_, field)| field.holds_callbacks()) {
+                path.push(name);
+                let slotted = slot_callbacks(lua, table.raw_get(*name)?, field, path, register)?;
+                path.pop();
+                table.raw_set(*name, slotted)?;
+            }
+            Ok(Value::Table(table))
+        }
+        (_, value) => Ok(value),
+    }
+}
+
+fn restore_callbacks(value: Value, shape: &Shape, slots: &[Function]) -> mlua::Result<Value> {
+    match (shape, value) {
+        (Shape::Callback, Value::Integer(slot)) => usize::try_from(slot)
+            .ok()
+            .and_then(|slot| slots.get(slot))
+            .map(|callback| Value::Function(callback.clone()))
+            .ok_or_else(|| mlua::Error::runtime(format!("callback slot {slot} is missing"))),
+        (Shape::Struct(fields), Value::Table(table)) => {
+            for (name, field) in fields.iter().filter(|(_, field)| field.holds_callbacks()) {
+                let restored = restore_callbacks(table.raw_get(*name)?, field, slots)?;
+                table.raw_set(*name, restored)?;
+            }
+            Ok(Value::Table(table))
+        }
+        (_, value) => Ok(value),
+    }
+}
+
 fn copy(lua: &Lua, table: &Table) -> mlua::Result<Table> {
     let copy = lua.create_table()?;
     table.for_each(|key: Value, value: Value| copy.raw_set(key, value))?;
@@ -260,7 +338,18 @@ impl<'a> Unwrapper<'a> {
 enum Shape {
     Struct(BTreeMap<&'static str, Shape>),
     Map,
+    Callback,
     Value,
+}
+
+impl Shape {
+    fn holds_callbacks(&self) -> bool {
+        match self {
+            Self::Callback => true,
+            Self::Struct(fields) => fields.values().any(Shape::holds_callbacks),
+            Self::Map | Self::Value => false,
+        }
+    }
 }
 
 struct Recorder;
@@ -359,9 +448,12 @@ impl ser::Serializer for Recorder {
 
     fn serialize_newtype_struct<T: Serialize + ?Sized>(
         self,
-        _: &'static str,
+        name: &'static str,
         value: &T,
     ) -> Result<Shape, Error> {
+        if name == CALLBACK_SLOT {
+            return Ok(Shape::Callback);
+        }
         value.serialize(self)
     }
 
@@ -535,7 +627,7 @@ mod tests {
 
     use super::*;
     use crate::lua::describe;
-    use crate::settings::Color;
+    use crate::settings::{CallbackId, Color};
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     #[serde(default, deny_unknown_fields)]
@@ -594,7 +686,7 @@ mod tests {
             .set_name("@/config/init.lua")
             .exec()
             .map_err(|error| describe(&error))?;
-        opt.settings(&lua)
+        opt.settings(&lua, |_| 0)
     }
 
     #[test]
@@ -799,6 +891,120 @@ mod tests {
         let error = run("\nopt.servers = { laptop = { address = 5 } }").unwrap_err();
         assert!(
             error.starts_with("/config/init.lua:2: amux.opt.servers.laptop.address: invalid type"),
+            "{error}"
+        );
+    }
+
+    #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    struct Hooked {
+        label: String,
+        inner: HookedInner,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    struct HookedInner {
+        #[serde(with = "crate::settings::callback::slot")]
+        hide: Option<CallbackId>,
+        #[serde(with = "crate::settings::callback::slot")]
+        show: Option<CallbackId>,
+    }
+
+    fn hooked(source: &str) -> (Lua, Opt<Hooked>, Result<(), String>) {
+        let lua = Lua::new();
+        let opt = Opt::<Hooked>::install(&lua).unwrap();
+        lua.globals().set("opt", opt.proxy()).unwrap();
+        let result = lua
+            .load(source)
+            .set_name("@/config/init.lua")
+            .exec()
+            .map_err(|error| describe(&error));
+        (lua, opt, result)
+    }
+
+    #[test]
+    fn a_callback_slot_records_its_own_shape() {
+        let Shape::Struct(fields) = Hooked::default().serialize(Recorder).unwrap() else {
+            panic!("a struct records as a struct");
+        };
+        assert_eq!(
+            fields["inner"],
+            Shape::Struct(BTreeMap::from([
+                ("hide", Shape::Callback),
+                ("show", Shape::Callback),
+            ]))
+        );
+        assert!(fields["inner"].holds_callbacks());
+        assert!(!fields["label"].holds_callbacks());
+    }
+
+    #[test]
+    fn functions_fill_callback_slots_and_read_back() {
+        let (lua, opt, result) = hooked(
+            "local function show() return 'shown' end\n\
+             opt.inner.show = show\n\
+             assert(opt.inner.show == show)\n\
+             opt.inner = { hide = function() return 'hidden' end, show = opt.inner.show }\n\
+             assert(opt.inner.show == show and type(opt.inner.hide) == 'function')\n\
+             opt.label = 'x'",
+        );
+        result.unwrap();
+        let mut registered = Vec::new();
+        let settings = opt
+            .settings(&lua, |callback| {
+                registered.push(callback);
+                registered.len() + 6
+            })
+            .unwrap();
+        assert_eq!(
+            settings,
+            Hooked {
+                label: "x".into(),
+                inner: HookedInner {
+                    hide: Some(CallbackId(7)),
+                    show: Some(CallbackId(8)),
+                },
+            }
+        );
+        let shown: String = registered[1].call(()).unwrap();
+        assert_eq!(shown, "shown");
+
+        let (lua, opt, result) = hooked("opt.inner.show = function() end\nopt.inner.show = nil");
+        result.unwrap();
+        assert_eq!(opt.settings(&lua, |_| 0).unwrap(), Hooked::default());
+    }
+
+    #[test]
+    fn a_callback_slot_takes_only_functions() {
+        for (source, expected) in [
+            (
+                "opt.inner.show = 'text'",
+                "/config/init.lua:1: amux.opt.inner.show: expected a function, not a string",
+            ),
+            (
+                "\nopt.inner = { hide = 3 }",
+                "/config/init.lua:2: amux.opt.inner.hide: expected a function, not a integer",
+            ),
+        ] {
+            assert_eq!(hooked(source).2.unwrap_err(), expected, "{source}");
+        }
+        let error = hooked("opt.label = function() end").2.unwrap_err();
+        assert!(
+            error.starts_with("/config/init.lua:1: amux.opt.label: "),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_closed_opt_can_be_read_but_not_changed() {
+        let (lua, opt, result) = hooked("opt.label = 'x'");
+        result.unwrap();
+        opt.close();
+        lua.load("assert(opt.label == 'x')").exec().unwrap();
+        let error = describe(&lua.load("opt.inner.show = print").exec().unwrap_err());
+        assert!(
+            error.contains("amux.opt.inner.show cannot change after the configuration is loaded"),
             "{error}"
         );
     }

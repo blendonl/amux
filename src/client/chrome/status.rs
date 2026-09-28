@@ -2,13 +2,14 @@ use std::time::Duration;
 
 use super::draw::{self, Span, Style};
 use crate::protocol::WindowSummary;
-use crate::settings::{template, StatusSettings, Theme};
+use crate::settings::{template, StatusSettings, StyleSpec, Theme};
 
 const MIN_SESSION_COLUMNS: usize = 4;
 const GAP: usize = 1;
 
 struct Look<'a> {
     formats: &'a StatusSettings,
+    base: StyleSpec,
     bar: Style,
     session: Style,
     active_window: Style,
@@ -21,6 +22,7 @@ impl<'a> Look<'a> {
         let bar = theme.status;
         Self {
             formats,
+            base: bar,
             bar: bar.into(),
             session: bar.merge(theme.status_session).into(),
             active_window: bar.merge(theme.status_active_window).into(),
@@ -37,6 +39,25 @@ impl<'a> Look<'a> {
     fn hidden_marker(&self) -> Span {
         Span::new(self.formats.hidden_marker.as_str(), self.bar)
     }
+
+    fn scripted(&self, spans: &[StatusSpan]) -> Vec<Span> {
+        spans
+            .iter()
+            .map(|span| Span::new(span.text.as_str(), self.base.merge(span.style).into()))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StatusSpan {
+    pub text: String,
+    pub style: StyleSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StatusSides {
+    pub left: Option<Vec<StatusSpan>>,
+    pub right: Option<Vec<StatusSpan>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,7 +103,18 @@ pub struct StatusLine {
 }
 
 impl StatusLine {
+    #[cfg(test)]
     pub fn render(&self, width: u16, settings: &StatusSettings, theme: &Theme) -> Vec<u8> {
+        self.render_scripted(width, settings, theme, &StatusSides::default())
+    }
+
+    pub fn render_scripted(
+        &self,
+        width: u16,
+        settings: &StatusSettings,
+        theme: &Theme,
+        sides: &StatusSides,
+    ) -> Vec<u8> {
         let look = Look::new(settings, theme);
         let columns = usize::from(width);
         let (spans, fill) = match &self.message {
@@ -90,7 +122,7 @@ impl StatusLine {
                 vec![Span::new(message.as_str(), look.message)],
                 look.message,
             ),
-            None => (self.spans(columns, &look), look.bar),
+            None => (self.spans(columns, &look, sides), look.bar),
         };
         let mut out = Vec::new();
         out.extend_from_slice(draw::SAVE_CURSOR);
@@ -100,15 +132,22 @@ impl StatusLine {
         out
     }
 
-    fn spans(&self, columns: usize, look: &Look) -> Vec<Span> {
-        let tag = self.tag(columns, look);
-        let tag_width = draw::width(&tag.text);
+    fn spans(&self, columns: usize, look: &Look, sides: &StatusSides) -> Vec<Span> {
+        let tag = match &sides.left {
+            Some(left) => look.scripted(left),
+            None => vec![self.tag(columns, look)],
+        };
+        let tag_width = draw::spans_width(&tag);
         let tabs: Vec<Span> = self.windows.iter().map(|tab| tab.span(look)).collect();
-        let right = self.right_side(&tabs, columns.saturating_sub(tag_width), look);
+        let variants = match &sides.right {
+            Some(right) => vec![look.scripted(right), Vec::new()],
+            None => self.right_variants(look).into(),
+        };
+        let right = self.right_side(&tabs, columns.saturating_sub(tag_width), variants, look);
         let right_width = draw::spans_width(&right);
         let reserved = tag_width + right_width + if right.is_empty() { 0 } else { GAP };
 
-        let mut spans = vec![tag];
+        let mut spans = tag;
         spans.extend(self.fit_windows(tabs, columns.saturating_sub(reserved), look));
         let used = draw::spans_width(&spans) + right_width;
         spans.push(Span::new(
@@ -152,14 +191,20 @@ impl StatusLine {
         Span::new(text, look.session)
     }
 
-    fn right_side(&self, tabs: &[Span], room: usize, look: &Look) -> Vec<Span> {
+    fn right_side(
+        &self,
+        tabs: &[Span],
+        room: usize,
+        variants: Vec<Vec<Span>>,
+        look: &Look,
+    ) -> Vec<Span> {
         let all_windows = draw::spans_width(tabs);
         let windows = if all_windows <= room {
             all_windows
         } else {
             self.active_window_width(tabs, look)
         };
-        self.right_variants(look)
+        variants
             .into_iter()
             .find(|spans| spans.is_empty() || windows + GAP + draw::spans_width(spans) <= room)
             .unwrap_or_default()
@@ -642,6 +687,51 @@ mod tests {
         };
         assert_eq!(formatted(&status, 30), "<h:s><>5|w 6|w 7|w 8|w 9|w");
         assert_eq!(formatted(&status, 16), "<h:s><>7|w <>");
+    }
+
+    #[test]
+    fn scripted_sides_replace_the_tag_and_the_cluster_details() {
+        let sides = StatusSides {
+            left: Some(vec![StatusSpan {
+                text: "<w>".into(),
+                style: StyleSpec {
+                    fg: Some(Color::Indexed(4)),
+                    ..StyleSpec::EMPTY
+                },
+            }]),
+            right: Some(vec![StatusSpan {
+                text: " 12:00 ".into(),
+                style: StyleSpec::BOLD,
+            }]),
+        };
+        let draw_scripted = |width| {
+            let mut parser = terminal(ROWS, width);
+            parser.process(&remote().render_scripted(
+                width,
+                &StatusSettings::default(),
+                &Theme::default(),
+                &sides,
+            ));
+            parser
+        };
+
+        let parser = draw_scripted(40);
+        assert_eq!(
+            row_text(&parser, STATUS_ROW),
+            format!("{:<34}12:00", "<w> 0:sh  1:vim  2:logs")
+        );
+        let cell = |col| parser.screen().cell(STATUS_ROW, col).unwrap().clone();
+        assert_eq!(cell(0).fgcolor(), vt100::Color::Idx(4));
+        assert_eq!(cell(0).bgcolor(), vt100::Color::Idx(2));
+        assert!(!cell(0).bold());
+        assert!(cell(34).bold());
+        assert_eq!(cell(34).bgcolor(), vt100::Color::Idx(2));
+
+        let parser = draw_scripted(30);
+        assert_eq!(row_text(&parser, STATUS_ROW), "<w> 0:sh  1:vim  2:logs");
+
+        let parser = draw_scripted(12);
+        assert_eq!(row_text(&parser, STATUS_ROW), "<w>… 1:vim …");
     }
 
     #[test]

@@ -3,6 +3,7 @@ mod listing;
 mod projects;
 mod relay;
 mod router;
+pub mod scripting;
 mod terminal;
 mod tree;
 
@@ -436,6 +437,7 @@ async fn attach(
         terminal::size()?,
         settings,
         Arc::new(Keymap::default()),
+        None,
     );
     let outcome = {
         let _terminal = RawTerminal::enter()?;

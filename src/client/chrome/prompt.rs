@@ -2,37 +2,32 @@ use super::draw::{self, Rect, Span, Style};
 use super::panel::{Panel, PanelEvent, Placement};
 use crate::keys::{Decoded, Key, KeyDecoder};
 use crate::protocol::{ClientMessage, SessionCommand};
-use crate::settings::{PromptAction, Table, Theme};
+use crate::settings::{CallbackId, PromptAction, Table, Theme};
 use crate::target::Target;
 
 const LABEL_SEPARATOR: &str = ": ";
 const MIN_INPUT_COLUMNS: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PromptEvent {
-    Pending,
-    Submit(String),
-    Cancel,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptPurpose {
     RenameWindow,
     RenameSession,
+    Callback(CallbackId),
 }
 
 impl PromptPurpose {
     fn submit(&self, text: String, attached: &Target) -> PanelEvent {
-        if text.is_empty() {
-            return PanelEvent::Cancel;
-        }
-        PanelEvent::Done(match self {
-            Self::RenameWindow => ClientMessage::Command(SessionCommand::RenameWindow(text)),
-            Self::RenameSession => ClientMessage::RenameSession {
+        match self {
+            Self::Callback(id) => PanelEvent::Callback(*id, text),
+            _ if text.is_empty() => PanelEvent::Cancel,
+            Self::RenameWindow => {
+                PanelEvent::Done(ClientMessage::Command(SessionCommand::RenameWindow(text)))
+            }
+            Self::RenameSession => PanelEvent::Done(ClientMessage::RenameSession {
                 target: attached.clone(),
                 name: text,
-            },
-        })
+            }),
+        }
     }
 }
 
@@ -76,22 +71,6 @@ impl Prompt {
         self.text.iter().collect()
     }
 
-    pub fn handle(&mut self, input: &[u8]) -> PromptEvent {
-        for decoded in self.keys.feed(input) {
-            if let Some(event) = self.press(&decoded) {
-                return event;
-            }
-        }
-        PromptEvent::Pending
-    }
-
-    pub fn time_out(&mut self) -> PromptEvent {
-        self.keys
-            .time_out()
-            .and_then(|decoded| self.press(&decoded))
-            .unwrap_or(PromptEvent::Pending)
-    }
-
     fn visible_text(&self, columns: usize) -> (String, usize) {
         let widths: Vec<usize> = self
             .text
@@ -117,25 +96,22 @@ impl Prompt {
         (visible, cursor_column)
     }
 
-    fn panel_event(&self, event: PromptEvent, attached: &Target) -> PanelEvent {
-        match event {
-            PromptEvent::Pending => PanelEvent::Pending,
-            PromptEvent::Submit(text) => self.purpose.submit(text, attached),
-            PromptEvent::Cancel => PanelEvent::Cancel,
-        }
-    }
-
-    fn press(&mut self, decoded: &Decoded) -> Option<PromptEvent> {
+    fn press(&mut self, decoded: &Decoded, attached: &Target) -> Option<PanelEvent> {
         self.bindings
             .resolve(decoded)
             .into_iter()
-            .find_map(|(key, action)| self.apply(key, action))
+            .find_map(|(key, action)| self.apply(key, action, attached))
     }
 
-    fn apply(&mut self, key: Key, action: Option<PromptAction>) -> Option<PromptEvent> {
+    fn apply(
+        &mut self,
+        key: Key,
+        action: Option<PromptAction>,
+        attached: &Target,
+    ) -> Option<PanelEvent> {
         match action {
-            Some(PromptAction::Submit) => return Some(PromptEvent::Submit(self.text())),
-            Some(PromptAction::Cancel) => return Some(PromptEvent::Cancel),
+            Some(PromptAction::Submit) => return Some(self.purpose.submit(self.text(), attached)),
+            Some(PromptAction::Cancel) => return Some(PanelEvent::Cancel),
             Some(PromptAction::DeleteBackward) if self.cursor > 0 => {
                 self.cursor -= 1;
                 self.text.remove(self.cursor);
@@ -167,13 +143,19 @@ impl Prompt {
 
 impl Panel for Prompt {
     fn handle(&mut self, input: &[u8], attached: &Target) -> PanelEvent {
-        let event = Prompt::handle(self, input);
-        self.panel_event(event, attached)
+        for decoded in self.keys.feed(input) {
+            if let Some(event) = self.press(&decoded, attached) {
+                return event;
+            }
+        }
+        PanelEvent::Pending
     }
 
     fn time_out(&mut self, attached: &Target) -> PanelEvent {
-        let event = Prompt::time_out(self);
-        self.panel_event(event, attached)
+        self.keys
+            .time_out()
+            .and_then(|decoded| self.press(&decoded, attached))
+            .unwrap_or(PanelEvent::Pending)
     }
 
     fn is_partial(&self) -> bool {
@@ -221,12 +203,12 @@ impl Panel for Prompt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::chrome::testing::{row_text, terminal};
+    use crate::client::chrome::testing::{row_text, terminal, Event};
     use crate::settings::Keymap;
 
-    fn new_prompt(label: &str, initial: &str) -> Prompt {
+    fn prompt_for(purpose: PromptPurpose, label: &str, initial: &str) -> Prompt {
         Prompt::new(
-            PromptPurpose::RenameWindow,
+            purpose,
             label,
             initial,
             Keymap::default().prompt,
@@ -234,10 +216,28 @@ mod tests {
         )
     }
 
+    fn new_prompt(label: &str, initial: &str) -> Prompt {
+        prompt_for(PromptPurpose::RenameWindow, label, initial)
+    }
+
+    fn handle(prompt: &mut Prompt, input: &[u8]) -> Event {
+        Panel::handle(prompt, input, &Target::default()).into()
+    }
+
+    fn time_out(prompt: &mut Prompt) -> Event {
+        Panel::time_out(prompt, &Target::default()).into()
+    }
+
+    fn renamed(name: &str) -> Event {
+        Event::Done(ClientMessage::Command(SessionCommand::RenameWindow(
+            name.into(),
+        )))
+    }
+
     fn edited(initial: &str, chunks: &[&[u8]]) -> Prompt {
         let mut prompt = new_prompt("name", initial);
         for chunk in chunks {
-            assert_eq!(prompt.handle(chunk), PromptEvent::Pending);
+            assert_eq!(handle(&mut prompt, chunk), Event::Pending);
         }
         prompt
     }
@@ -288,21 +288,36 @@ mod tests {
     #[test]
     fn enter_submits_and_escape_cancels() {
         assert_eq!(
-            new_prompt("name", "sh").handle(b"ell\r"),
-            PromptEvent::Submit("shell".into())
+            handle(&mut new_prompt("name", "sh"), b"ell\r"),
+            renamed("shell")
+        );
+        assert_eq!(handle(&mut new_prompt("name", ""), b"a\nb"), renamed("a"));
+        assert_eq!(
+            handle(&mut new_prompt("name", "sh"), b"\x1bx"),
+            Event::Cancel
         );
         assert_eq!(
-            new_prompt("name", "").handle(b"a\nb"),
-            PromptEvent::Submit("a".into())
+            handle(&mut new_prompt("name", "sh"), b"\x03"),
+            Event::Cancel
+        );
+    }
+
+    #[test]
+    fn a_callback_prompt_submits_any_text_to_its_callback() {
+        let purpose = PromptPurpose::Callback(CallbackId(4));
+        assert_eq!(
+            handle(&mut prompt_for(purpose.clone(), "name", "sh"), b"ell\r"),
+            Event::Callback(CallbackId(4), "shell".into())
         );
         assert_eq!(
-            new_prompt("name", "sh").handle(b"\x1bx"),
-            PromptEvent::Cancel
+            handle(&mut prompt_for(purpose.clone(), "name", ""), b"\r"),
+            Event::Callback(CallbackId(4), String::new())
         );
         assert_eq!(
-            new_prompt("name", "sh").handle(b"\x03"),
-            PromptEvent::Cancel
+            handle(&mut prompt_for(purpose, "name", "sh"), b"\x03"),
+            Event::Cancel
         );
+        assert_eq!(handle(&mut new_prompt("name", ""), b"\r"), Event::Cancel);
     }
 
     #[test]
@@ -323,13 +338,13 @@ mod tests {
     #[test]
     fn a_lone_escape_cancels_once_the_timeout_expires() {
         let mut prompt = new_prompt("name", "sh");
-        assert_eq!(prompt.handle(b"\x1b"), PromptEvent::Pending);
+        assert_eq!(handle(&mut prompt, b"\x1b"), Event::Pending);
         assert!(prompt.is_partial());
-        assert_eq!(prompt.time_out(), PromptEvent::Cancel);
+        assert_eq!(time_out(&mut prompt), Event::Cancel);
 
         let mut prompt = new_prompt("name", "sh");
-        assert_eq!(prompt.time_out(), PromptEvent::Pending);
-        assert_eq!(prompt.handle(b"\x1b[D"), PromptEvent::Pending);
+        assert_eq!(time_out(&mut prompt), Event::Pending);
+        assert_eq!(handle(&mut prompt, b"\x1b[D"), Event::Pending);
         assert!(!prompt.is_partial());
     }
 
@@ -370,7 +385,7 @@ mod tests {
         assert_eq!(row_text(&parser, 2), "name: nopqrstuvwxyz");
         assert_eq!(parser.screen().cursor_position(), (2, 19));
 
-        prompt.handle(b"\x01");
+        handle(&mut prompt, b"\x01");
         let parser = draw(&mut prompt, 20);
         assert_eq!(row_text(&parser, 2), "name: abcdefghijklmn");
         assert_eq!(parser.screen().cursor_position(), (2, 6));
@@ -387,7 +402,7 @@ mod tests {
         assert_eq!(row_text(&parser, 2), "n: 語");
         assert_eq!(parser.screen().cursor_position(), (2, 5));
 
-        prompt.handle(b"\x1b[D");
+        handle(&mut prompt, b"\x1b[D");
         let parser = draw(&mut prompt, 7);
         assert_eq!(row_text(&parser, 2), "n: 本語");
         assert_eq!(parser.screen().cursor_position(), (2, 5));

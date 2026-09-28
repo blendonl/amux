@@ -1,6 +1,7 @@
 use std::fmt;
 use std::mem;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Result};
 use tokio::signal::unix::{signal, SignalKind};
@@ -9,15 +10,16 @@ use tokio::time::{sleep_until, Instant};
 
 use super::chrome::{
     detach_hint, draw_row, render_reconnecting, Panel, PanelEvent, Placement, Prompt,
-    PromptPurpose, Rect, StatusLine, Style, WindowTab,
+    PromptPurpose, Rect, StatusLine, StatusSides, Style, WindowTab,
 };
 use super::router::{self, Action, KeyRouter};
+use super::scripting::{ClientContext, Effect, Scripting, StatusContext};
 use super::terminal;
 use super::tree::Loading;
 use crate::protocol::{
     AttachedSession, ClientMessage, ClusterStatus, ServerMessage, ServerView, SessionState, Size,
 };
-use crate::settings::{Keymap, Settings};
+use crate::settings::{CallbackId, Keymap, Settings};
 use crate::target::Target;
 
 const DRAIN_LIMIT: usize = 64;
@@ -48,6 +50,9 @@ pub struct Relay {
     settings: Arc<Settings>,
     keymap: Arc<Keymap>,
     router: KeyRouter,
+    scripting: Option<Box<dyn Scripting>>,
+    status_memo: Option<(StatusContext, StatusSides)>,
+    status_error: Option<String>,
     detach_hint: Option<String>,
     session: Option<SessionState>,
     cluster: Option<ClusterStatus>,
@@ -69,6 +74,7 @@ impl Relay {
         size: Size,
         settings: Arc<Settings>,
         keymap: Arc<Keymap>,
+        scripting: Option<Box<dyn Scripting>>,
     ) -> Self {
         let router = KeyRouter::new(settings.prefix, Arc::clone(&keymap), settings.escape_time());
         let detach_hint = detach_hint(&keymap, &settings.prefix);
@@ -79,6 +85,9 @@ impl Relay {
             settings,
             keymap,
             router,
+            scripting,
+            status_memo: None,
+            status_error: None,
             detach_hint,
             session: None,
             cluster: None,
@@ -123,11 +132,7 @@ impl Relay {
             Some(ServerMessage::Detached) => self.end = Some(Ok(Outcome::Detached)),
             Some(ServerMessage::Exited) => self.end = Some(Ok(Outcome::Exited)),
             Some(ServerMessage::Error(message)) => {
-                self.notice = Some((
-                    message.clone(),
-                    Instant::now() + self.settings.notice_time(),
-                ));
-                self.chrome_dirty = true;
+                self.notify(message.clone());
                 self.last_error = Some(message);
             }
             Some(other) => {
@@ -198,6 +203,19 @@ impl Relay {
         self.chrome_dirty = true;
     }
 
+    pub fn status_deadline(&self) -> Option<Instant> {
+        let interval = self.settings.status.interval_ms;
+        if interval == 0 || !self.runs_status_scripts() {
+            return None;
+        }
+        let wait = interval - wall_clock_ms() % interval;
+        Some(Instant::now() + Duration::from_millis(wait))
+    }
+
+    pub fn status_due(&mut self) {
+        self.chrome_dirty = true;
+    }
+
     pub fn take_output(&mut self) -> Vec<u8> {
         if mem::take(&mut self.chrome_dirty) {
             self.draw_chrome();
@@ -224,8 +242,54 @@ impl Relay {
                 Action::Detach => self.messages.push(ClientMessage::Detach),
                 Action::Command(command) => self.messages.push(ClientMessage::Command(command)),
                 Action::Open(panel) => self.open(panel),
+                Action::Callback(id) => self.run_callback(id, None),
             }
         }
+    }
+
+    fn run_callback(&mut self, id: CallbackId, input: Option<&str>) {
+        let context = self.client_context();
+        let Some(scripting) = self.scripting.as_deref_mut() else {
+            return;
+        };
+        match scripting.call(id, input, &context) {
+            Ok(effects) => self.apply(effects),
+            Err(error) => self.notify(error),
+        }
+    }
+
+    fn apply(&mut self, effects: Vec<Effect>) {
+        for effect in effects {
+            match effect {
+                Effect::Notify(message) => self.notify(message),
+                Effect::Run(binding) => {
+                    let actions = self.router.run_binding(binding);
+                    self.act(actions);
+                }
+                Effect::SendKeys(bytes) => self.messages.push(ClientMessage::Input(bytes)),
+                Effect::Prompt {
+                    label,
+                    initial,
+                    submit,
+                } => self.open_prompt(PromptPurpose::Callback(submit), label, &initial),
+                Effect::Switch(target) => self.messages.push(ClientMessage::Switch(target)),
+                Effect::Keymap(keymap) => self.set_keymap(keymap),
+            }
+        }
+    }
+
+    fn set_keymap(&mut self, keymap: Keymap) {
+        self.keymap = Arc::new(keymap);
+        self.detach_hint = detach_hint(&self.keymap, &self.settings.prefix);
+        let held = self.router.set_keymap(Arc::clone(&self.keymap));
+        if !held.is_empty() {
+            self.messages.push(ClientMessage::Input(held));
+        }
+    }
+
+    fn notify(&mut self, message: String) {
+        self.notice = Some((message, Instant::now() + self.settings.notice_time()));
+        self.chrome_dirty = true;
     }
 
     fn host_output(&mut self, bytes: &[u8]) {
@@ -248,29 +312,37 @@ impl Relay {
     }
 
     fn open(&mut self, request: router::Panel) {
-        let panel: Box<dyn Panel> = match request {
-            router::Panel::RenameWindow => Box::new(Prompt::new(
-                PromptPurpose::RenameWindow,
-                RENAME_WINDOW,
-                &self.active_window_name(),
-                self.keymap.prompt.clone(),
-                &self.settings.theme,
-            )),
-            router::Panel::RenameSession => Box::new(Prompt::new(
-                PromptPurpose::RenameSession,
-                RENAME_SESSION,
-                self.session_name(),
-                self.keymap.prompt.clone(),
-                &self.settings.theme,
-            )),
+        match request {
+            router::Panel::RenameWindow => {
+                let name = self.active_window_name();
+                self.open_prompt(PromptPurpose::RenameWindow, RENAME_WINDOW, &name);
+            }
+            router::Panel::RenameSession => {
+                let name = self.session_name().to_owned();
+                self.open_prompt(PromptPurpose::RenameSession, RENAME_SESSION, &name);
+            }
             router::Panel::ClusterTree => {
                 self.messages.push(ClientMessage::ListCluster);
-                Box::new(Loading::new(
+                self.show(Box::new(Loading::new(
                     self.keymap.tree.clone(),
                     Arc::clone(&self.settings),
-                ))
+                )));
             }
-        };
+        }
+    }
+
+    fn open_prompt(&mut self, purpose: PromptPurpose, label: impl Into<String>, initial: &str) {
+        let prompt = Prompt::new(
+            purpose,
+            label,
+            initial,
+            self.keymap.prompt.clone(),
+            &self.settings.theme,
+        );
+        self.show(Box::new(prompt));
+    }
+
+    fn show(&mut self, panel: Box<dyn Panel>) {
         self.panel = Some(panel);
         self.chrome_dirty = true;
     }
@@ -301,9 +373,12 @@ impl Relay {
                 self.messages.push(message);
                 self.close_panel();
             }
+            PanelEvent::Callback(id, text) => {
+                self.close_panel();
+                self.run_callback(id, Some(&text));
+            }
             PanelEvent::Replace(panel, input) => {
-                self.panel = Some(panel);
-                self.chrome_dirty = true;
+                self.show(panel);
                 self.panel_input(&input);
             }
         }
@@ -327,7 +402,6 @@ impl Relay {
     fn draw_chrome(&mut self) {
         let above = self.above_status();
         let status_row = self.status_row();
-        let status = self.status_line();
         if let Some(panel) = self.placed(Placement::SessionArea) {
             let drawn = panel.render(above);
             self.output.extend(drawn);
@@ -348,12 +422,65 @@ impl Relay {
                 let drawn = panel.render(status_row);
                 self.output.extend(drawn);
             }
-            None => self.output.extend(status.render(
-                self.size.cols,
-                &self.settings.status,
-                &self.settings.theme,
-            )),
+            None => self.draw_status(),
         }
+    }
+
+    fn draw_status(&mut self) {
+        let sides = self.scripted_sides();
+        let status = self.status_line();
+        self.output.extend(status.render_scripted(
+            self.size.cols,
+            &self.settings.status,
+            &self.settings.theme,
+            &sides,
+        ));
+    }
+
+    fn runs_status_scripts(&self) -> bool {
+        self.scripting.is_some() && self.settings.status.is_scripted()
+    }
+
+    fn scripted_sides(&mut self) -> StatusSides {
+        if self.notice.is_some() || !self.runs_status_scripts() {
+            return StatusSides::default();
+        }
+        let interval = self.settings.status.interval_ms;
+        let context = StatusContext {
+            client: self.client_context(),
+            width: self.size.cols,
+            tick: (interval > 0).then(|| wall_clock_ms() / interval),
+        };
+        if let Some((memo, sides)) = &self.status_memo {
+            if *memo == context {
+                return sides.clone();
+            }
+        }
+        let Some(scripting) = self.scripting.as_deref_mut() else {
+            return StatusSides::default();
+        };
+        let status = &self.settings.status;
+        let mut errors = Vec::new();
+        let mut side = |name: &str, id: Option<CallbackId>| {
+            let id = id?;
+            scripting.status(id, &context).unwrap_or_else(|error| {
+                errors.push(format!("status.{name}: {error}"));
+                None
+            })
+        };
+        let sides = StatusSides {
+            left: side("left", status.left),
+            right: side("right", status.right),
+        };
+        self.status_memo = Some((context, sides.clone()));
+        let error = errors.into_iter().next();
+        if error != self.status_error {
+            if let Some(message) = error.clone() {
+                self.notify(message);
+            }
+            self.status_error = error;
+        }
+        sides
     }
 
     fn placed(&mut self, placement: Placement) -> Option<&mut Box<dyn Panel>> {
@@ -418,6 +545,28 @@ impl Relay {
         }
     }
 
+    fn client_context(&self) -> ClientContext {
+        let cluster = self.cluster.as_ref();
+        let host = &self.attached.server;
+        ClientContext {
+            session: self.session_name().to_owned(),
+            server: host.clone(),
+            local: cluster.map_or(&self.local, |status| &status.local).clone(),
+            windows: self
+                .session
+                .as_ref()
+                .map(|state| state.windows.clone())
+                .unwrap_or_default(),
+            active: self.session.as_ref().map(|state| state.active),
+            latency: cluster
+                .filter(|status| status.host == *host)
+                .and_then(|status| status.latency),
+            offline: cluster
+                .map(|status| status.offline.clone())
+                .unwrap_or_default(),
+        }
+    }
+
     fn session_name(&self) -> &str {
         self.session
             .as_ref()
@@ -447,6 +596,14 @@ impl Relay {
     }
 }
 
+fn wall_clock_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 pub async fn run(
     mut incoming: mpsc::Receiver<ServerMessage>,
     outgoing: mpsc::Sender<ClientMessage>,
@@ -470,6 +627,7 @@ pub async fn run(
 
         let escape = relay.escape_deadline();
         let notice = relay.notice_deadline();
+        let status = relay.status_deadline();
         tokio::select! {
             message = incoming.recv() => {
                 relay.server_message(message);
@@ -496,6 +654,9 @@ pub async fn run(
             }
             () = sleep_until(notice.unwrap_or_else(Instant::now)), if notice.is_some() => {
                 relay.notice_expired();
+            }
+            () = sleep_until(status.unwrap_or_else(Instant::now)), if status.is_some() => {
+                relay.status_due();
             }
         }
     }
@@ -532,6 +693,7 @@ mod tests {
             SIZE,
             Arc::new(Settings::default()),
             Arc::new(Keymap::default()),
+            None,
         );
         (relay, terminal(SIZE.rows, SIZE.cols))
     }
@@ -620,6 +782,7 @@ mod tests {
             size,
             Arc::new(Settings::default()),
             Arc::new(Keymap::default()),
+            None,
         );
         let mut parser = terminal(size.rows, size.cols);
         relay.server_message(Some(state("work", 0)));
@@ -901,6 +1064,7 @@ mod tests {
             SIZE,
             Arc::new(settings),
             Arc::new(keymap),
+            None,
         )
     }
 
@@ -1062,5 +1226,348 @@ mod tests {
         let title = parser.screen().cell(3, 8).unwrap();
         assert_eq!(title.contents(), "r");
         assert!(title.italic() && !title.bold());
+    }
+
+    mod scripted {
+        use std::fs;
+        use std::time::Instant as Clock;
+
+        use super::*;
+        use crate::lua::{self, ConfigPaths, LuaScripting, Process, INIT_FILE};
+
+        fn scripted(source: &str) -> (Relay, vt100::Parser) {
+            let dir = tempfile::tempdir().unwrap();
+            let init = dir.path().join(INIT_FILE);
+            fs::write(&init, source).unwrap();
+            let paths = ConfigPaths {
+                dir: dir.path().to_owned(),
+                init: Some(init),
+            };
+            let loaded = lua::load(&paths, Process::Client).unwrap();
+            let relay = Relay::new(
+                "laptop".into(),
+                attached("work", "laptop"),
+                SIZE,
+                Arc::new(loaded.settings.clone()),
+                Arc::new(loaded.keymap.clone()),
+                Some(Box::new(LuaScripting::new(loaded))),
+            );
+            (relay, terminal(SIZE.rows, SIZE.cols))
+        }
+
+        fn notice(relay: &Relay) -> String {
+            relay
+                .notice
+                .as_ref()
+                .map(|(message, _)| message.clone())
+                .unwrap_or_default()
+        }
+
+        fn output_batch(relay: &mut Relay, parser: &mut vt100::Parser) {
+            relay.server_message(Some(ServerMessage::Output(b"x".to_vec())));
+            draw(relay, parser);
+        }
+
+        #[test]
+        fn a_binding_callback_runs_actions_and_sends_keys_with_the_client_context() {
+            let (mut relay, _) = scripted(
+                "amux.keymap.set('prefix', 'g', function(ctx)\n\
+                   assert(ctx.session == 'work' and ctx.server == 'laptop')\n\
+                   assert(ctx.local_server == 'laptop' and ctx.panes == 1)\n\
+                   assert(ctx.window_index == 1 and ctx.window_name == 'vim')\n\
+                   assert(#ctx.windows == 2 and ctx.windows[2].active)\n\
+                   assert(amux.state() == ctx)\n\
+                   assert(not pcall(function() ctx.session = 'x' end))\n\
+                   assert(not pcall(function() ctx.windows[1].name = 'x' end))\n\
+                   amux.run(amux.action.new_window())\n\
+                   amux.send_keys('git status\\r')\n\
+                 end)",
+            );
+            relay.server_message(Some(state("work", 1)));
+            relay.input(b"a\x02gb");
+            assert_eq!(notice(&relay), "");
+            assert_eq!(
+                relay.take_messages(),
+                vec![
+                    ClientMessage::Input(b"a".to_vec()),
+                    ClientMessage::Command(SessionCommand::NewWindow),
+                    ClientMessage::Input(b"git status\r".to_vec()),
+                    ClientMessage::Input(b"b".to_vec()),
+                ]
+            );
+        }
+
+        #[test]
+        fn a_notice_from_lua_shows_on_the_status_line() {
+            let (mut relay, mut parser) = scripted(
+                "amux.keymap.set('prefix', 'm', function(ctx)\n\
+                   amux.notify('hello ' .. ctx.session)\n\
+                 end)",
+            );
+            relay.input(b"\x02m");
+            assert_eq!(bottom(&mut relay, &mut parser), "hello work");
+            assert!(relay.notice_deadline().is_some());
+            assert_eq!(relay.take_messages(), Vec::new());
+
+            relay.notice_expired();
+            assert_eq!(bottom(&mut relay, &mut parser), "[work@laptop]");
+        }
+
+        #[test]
+        fn a_lua_prompt_submits_its_text_to_on_submit() {
+            let (mut relay, mut parser) = scripted(
+                "amux.keymap.set('prefix', 'f', function(ctx)\n\
+                   amux.prompt {\n\
+                     label = 'find',\n\
+                     initial = ctx.window_name,\n\
+                     on_submit = function(text, ctx)\n\
+                       amux.send_keys('find ' .. text .. ' in ' .. ctx.session .. '\\r')\n\
+                       amux.switch(text .. '@laptop')\n\
+                     end,\n\
+                   }\n\
+                 end)",
+            );
+            relay.server_message(Some(state("work", 1)));
+            relay.input(b"\x02f");
+            assert_eq!(bottom(&mut relay, &mut parser), "find: vim");
+
+            relay.input(b"ed\rignored");
+            assert_eq!(
+                relay.take_messages(),
+                vec![
+                    ClientMessage::Redraw,
+                    ClientMessage::Input(b"find vimed in work\r".to_vec()),
+                    ClientMessage::Switch("vimed@laptop".parse().unwrap()),
+                ]
+            );
+            relay.input(b"x");
+            assert_eq!(
+                relay.take_messages(),
+                vec![ClientMessage::Input(b"x".to_vec())]
+            );
+        }
+
+        #[test]
+        fn a_runtime_keymap_change_applies_to_the_next_key() {
+            let (mut relay, mut parser) = scripted(
+                "amux.keymap.set('prefix', 'k', function()\n\
+                   amux.keymap.set('root', 'M-x', amux.action.next_window())\n\
+                   amux.keymap.set('prefix', 'j', function() amux.notify('jumped') end)\n\
+                   amux.keymap.del('prefix', 'n')\n\
+                 end)",
+            );
+            relay.input(b"\x1bx");
+            assert_eq!(
+                relay.take_messages(),
+                vec![ClientMessage::Input(b"\x1bx".to_vec())]
+            );
+
+            relay.input(b"\x02k\x1bx");
+            assert_eq!(
+                relay.take_messages(),
+                vec![ClientMessage::Command(SessionCommand::NextWindow)]
+            );
+            relay.input(b"\x02n\x02j");
+            assert_eq!(relay.take_messages(), Vec::new());
+            assert_eq!(bottom(&mut relay, &mut parser), "jumped");
+        }
+
+        #[test]
+        fn a_lua_error_shows_a_notice_and_changes_nothing() {
+            let (mut relay, _) = scripted(
+                "amux.keymap.set('prefix', 'e', function()\n\
+                   amux.keymap.set('root', 'M-z', 'detach')\n\
+                   amux.run(amux.action.new_window())\n\
+                   error('boom')\n\
+                 end)",
+            );
+            relay.input(b"\x02e");
+            assert!(
+                notice(&relay).ends_with("init.lua:4: boom"),
+                "{}",
+                notice(&relay)
+            );
+            assert!(!relay.has_ended());
+            assert_eq!(relay.take_messages(), Vec::new());
+
+            relay.input(b"\x1bz");
+            assert_eq!(
+                relay.take_messages(),
+                vec![ClientMessage::Input(b"\x1bz".to_vec())]
+            );
+        }
+
+        #[test]
+        fn a_runaway_binding_is_cut_off_by_its_budget() {
+            let (mut relay, _) = scripted(
+                "amux.keymap.set('prefix', 'l', function()\n\
+                   amux.send_keys('never')\n\
+                   while true do end\n\
+                 end)",
+            );
+            let started = Clock::now();
+            relay.input(b"\x02lx");
+            let elapsed = started.elapsed();
+            assert!(elapsed >= Duration::from_millis(900), "{elapsed:?}");
+            assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+            assert!(
+                notice(&relay).ends_with("init.lua:3: a key binding ran past its 1000 ms budget"),
+                "{}",
+                notice(&relay)
+            );
+            assert_eq!(
+                relay.take_messages(),
+                vec![ClientMessage::Input(b"x".to_vec())]
+            );
+        }
+
+        #[test]
+        fn status_functions_replace_the_session_tag_and_the_right_side() {
+            let (mut relay, mut parser) = scripted(
+                "amux.opt.status.left = function(ctx)\n\
+                   return { { text = '<' .. ctx.session .. '>', style = { fg = 'blue', bold = true } } }\n\
+                 end\n\
+                 amux.opt.status.right = function(ctx) return ' ' .. ctx.width .. ' cols ' end",
+            );
+            relay.server_message(Some(state("work", 1)));
+            assert_eq!(
+                bottom(&mut relay, &mut parser),
+                format!("{:<32}40 cols", "<work> 0:sh  1:vim")
+            );
+            let tag = parser.screen().cell(BOTTOM, 0).unwrap();
+            assert_eq!(tag.fgcolor(), vt100::Color::Idx(4));
+            assert_eq!(tag.bgcolor(), vt100::Color::Idx(2));
+            assert!(tag.bold());
+            assert_eq!(relay.status_deadline(), None);
+        }
+
+        #[test]
+        fn a_status_function_can_fall_back_to_the_built_in_segment() {
+            let (mut relay, mut parser) = scripted(
+                "amux.opt.status.left = function(ctx) return nil end\n\
+                 amux.opt.status.right = function(ctx) return { { text = ' a very long right side' } } end",
+            );
+            relay.server_message(Some(state("work", 1)));
+            assert_eq!(bottom(&mut relay, &mut parser), "[work@laptop] 0:sh  1:vim");
+        }
+
+        #[test]
+        fn a_failing_status_function_shows_its_error_once_and_falls_back() {
+            let (mut relay, mut parser) = scripted(
+                "amux.opt.status.right = function(ctx) while true do end end\n\
+                 amux.opt.status.left = function(ctx) return 5 end",
+            );
+            relay.server_message(Some(state("work", 1)));
+            draw(&mut relay, &mut parser);
+            assert_eq!(
+                notice(&relay),
+                "status.left: a status function returns a string or a list of spans, not a integer"
+            );
+            relay.notice_expired();
+            assert_eq!(bottom(&mut relay, &mut parser), "[work@laptop] 0:sh  1:vim");
+
+            relay.server_message(Some(state("work", 0)));
+            draw(&mut relay, &mut parser);
+            assert_eq!(relay.notice_deadline(), None);
+        }
+
+        #[test]
+        fn a_runaway_status_function_is_cut_off_by_its_budget() {
+            let (mut relay, mut parser) =
+                scripted("amux.opt.status.right = function(ctx) while true do end end");
+            let started = Clock::now();
+            draw(&mut relay, &mut parser);
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert!(
+                notice(&relay).ends_with("a status function ran past its 50 ms budget"),
+                "{}",
+                notice(&relay)
+            );
+            relay.notice_expired();
+            assert_eq!(bottom(&mut relay, &mut parser), "[work@laptop]");
+        }
+
+        #[test]
+        fn status_functions_run_only_when_their_context_changes() {
+            let (mut relay, mut parser) = scripted(
+                "local calls = 0\n\
+                 amux.opt.status.right = function(ctx)\n\
+                   calls = calls + 1\n\
+                   return ' #' .. calls .. ' '\n\
+                 end",
+            );
+            assert_eq!(
+                bottom(&mut relay, &mut parser),
+                format!("{:<37}#1", "[work@laptop]")
+            );
+            for _ in 0..50 {
+                output_batch(&mut relay, &mut parser);
+            }
+            assert_eq!(
+                row_text(&parser, BOTTOM),
+                format!("{:<37}#1", "[work@laptop]")
+            );
+
+            relay.server_message(Some(state("work", 1)));
+            assert_eq!(
+                bottom(&mut relay, &mut parser),
+                format!("{:<37}#2", "[work@laptop] 0:sh  1:vim")
+            );
+            relay.server_message(Some(ServerMessage::ClusterStatus(ClusterStatus {
+                local: "laptop".into(),
+                host: "laptop".into(),
+                latency: None,
+                offline: vec!["attic".into()],
+            })));
+            assert_eq!(
+                bottom(&mut relay, &mut parser),
+                format!("{:<37}#3", "[work@laptop] 0:sh  1:vim")
+            );
+
+            relay.input(b"\x02,");
+            output_batch(&mut relay, &mut parser);
+            relay.input(b"\x03");
+            assert_eq!(
+                bottom(&mut relay, &mut parser),
+                format!("{:<37}#3", "[work@laptop] 0:sh  1:vim")
+            );
+        }
+
+        #[test]
+        fn an_interval_redraws_the_status_on_each_tick() {
+            let (mut relay, mut parser) = scripted(
+                "local calls = 0\n\
+                 amux.opt.status.interval_ms = 30\n\
+                 amux.opt.status.right = function(ctx)\n\
+                   calls = calls + 1\n\
+                   return ' #' .. calls .. ' '\n\
+                 end",
+            );
+            assert_eq!(
+                bottom(&mut relay, &mut parser),
+                format!("{:<37}#1", "[work@laptop]")
+            );
+            assert!(relay.take_output().is_empty());
+
+            let deadline = relay.status_deadline().unwrap();
+            let wait = deadline - Instant::now();
+            assert!(wait <= Duration::from_millis(30), "{wait:?}");
+            std::thread::sleep(wait + Duration::from_millis(5));
+            relay.status_due();
+            assert_eq!(
+                bottom(&mut relay, &mut parser),
+                format!("{:<37}#2", "[work@laptop]")
+            );
+
+            let (relay, _) = scripted("amux.opt.status.interval_ms = 30");
+            assert_eq!(relay.status_deadline(), None);
+            let mut settings = Settings::default();
+            settings.status.interval_ms = 30;
+            settings.status.right = Some(CallbackId(0));
+            assert_eq!(
+                relay_with(settings, Keymap::default()).status_deadline(),
+                None
+            );
+        }
     }
 }

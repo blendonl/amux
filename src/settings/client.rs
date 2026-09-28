@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::callback::{self, CallbackId};
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StatusSettings {
@@ -10,11 +12,20 @@ pub struct StatusSettings {
     pub offline_format: String,
     pub offline_count_format: String,
     pub hidden_marker: String,
+    #[serde(with = "callback::slot")]
+    pub left: Option<CallbackId>,
+    #[serde(with = "callback::slot")]
+    pub right: Option<CallbackId>,
+    pub interval_ms: u64,
 }
 
 impl StatusSettings {
     pub fn rows(&self) -> u16 {
         u16::from(self.enabled)
+    }
+
+    pub fn is_scripted(&self) -> bool {
+        self.enabled && (self.left.is_some() || self.right.is_some())
     }
 }
 
@@ -28,6 +39,9 @@ impl Default for StatusSettings {
             offline_format: " {server} offline ".into(),
             offline_count_format: " {count} offline ".into(),
             hidden_marker: "…".into(),
+            left: None,
+            right: None,
+            interval_ms: 0,
         }
     }
 }

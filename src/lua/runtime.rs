@@ -62,7 +62,7 @@ pub fn load(paths: &ConfigPaths, process: Process) -> Result<Loaded> {
     let lua = Lua::new();
     add_module_path(&lua, &paths.dir)?;
     let opt = Opt::<Settings>::install(&lua)?;
-    api::install(&lua, opt.proxy(), process.name())?;
+    api::install(&lua, opt.proxy(), process)?;
     if let Some(init) = &paths.init {
         let source = fs::read(init).with_context(|| format!("reading {}", init.display()))?;
         lua.load(source)
@@ -70,17 +70,20 @@ pub fn load(paths: &ConfigPaths, process: Process) -> Result<Loaded> {
             .exec()
             .map_err(|error| anyhow!(describe(&error)))?;
     }
-    let settings = opt.settings(&lua).map_err(|message| match &paths.init {
-        Some(init) => anyhow!("{}: {message}", init.display()),
-        None => anyhow!(message),
-    })?;
     let Registry {
         keymap,
-        callbacks,
+        mut callbacks,
         hooks,
     } = lua
         .remove_app_data::<Registry>()
         .context("the amux registry is missing")?;
+    let settings = opt
+        .settings(&lua, |callback| callbacks.register(callback).0)
+        .map_err(|message| match &paths.init {
+            Some(init) => anyhow!("{}: {message}", init.display()),
+            None => anyhow!(message),
+        })?;
+    opt.close();
     Ok(Loaded {
         settings,
         keymap,
@@ -369,6 +372,51 @@ mod tests {
             "{error}"
         );
         loaded("amux.helpers = { answer = 42 }\nassert(amux.helpers.answer == 42)");
+    }
+
+    #[test]
+    fn status_functions_are_stored_as_callbacks() {
+        let loaded = loaded(
+            "amux.opt.status.interval_ms = 1000\n\
+             amux.opt.status.right = function(ctx) return 'right' end\n\
+             amux.keymap.set('prefix', 'g', function() end)\n\
+             amux.opt.status.left = function(ctx) return ctx.session end\n\
+             assert(type(amux.opt.status.left) == 'function')",
+        );
+        let status = &loaded.settings.status;
+        assert_eq!(status.interval_ms, 1000);
+        assert_eq!(loaded.callbacks.len(), 3);
+        let (left, right) = (status.left.unwrap(), status.right.unwrap());
+        assert_ne!(left, right);
+        let context = loaded.lua.create_table().unwrap();
+        context.set("session", "work").unwrap();
+        let session: String = loaded.callbacks.get(left).unwrap().call(context).unwrap();
+        assert_eq!(session, "work");
+        let text: String = loaded.callbacks.get(right).unwrap().call(()).unwrap();
+        assert_eq!(text, "right");
+
+        let error = failure("amux.opt.status.left = 'session'");
+        assert!(
+            error.contains("init.lua:1: amux.opt.status.left: expected a function, not a string"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn amux_opt_is_closed_once_the_configuration_is_loaded() {
+        let loaded = loaded("amux.opt.prefix = 'C-a'");
+        let error = describe(
+            &loaded
+                .lua
+                .load("assert(amux.opt.prefix == 'C-a')\namux.opt.prefix = 'C-b'")
+                .exec()
+                .unwrap_err(),
+        );
+        assert!(
+            error.contains("amux.opt.prefix cannot change after the configuration is loaded"),
+            "{error}"
+        );
+        assert_eq!(loaded.settings.prefix, Key::ctrl('a'));
     }
 
     #[test]

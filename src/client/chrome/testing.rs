@@ -1,3 +1,7 @@
+use super::PanelEvent;
+use crate::protocol::ClientMessage;
+use crate::settings::CallbackId;
+
 pub fn terminal(rows: u16, cols: u16) -> vt100::Parser {
     vt100::Parser::new(rows, cols, 0)
 }
@@ -12,4 +16,27 @@ pub fn screen_text(parser: &vt100::Parser) -> Vec<String> {
         .rows(0, screen.size().1)
         .map(|row| row.trim_end().to_owned())
         .collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Event {
+    Unchanged,
+    Pending,
+    Cancel,
+    Done(ClientMessage),
+    Callback(CallbackId, String),
+    Replace(Vec<u8>),
+}
+
+impl From<PanelEvent> for Event {
+    fn from(event: PanelEvent) -> Self {
+        match event {
+            PanelEvent::Unchanged => Self::Unchanged,
+            PanelEvent::Pending => Self::Pending,
+            PanelEvent::Cancel => Self::Cancel,
+            PanelEvent::Done(message) => Self::Done(message),
+            PanelEvent::Callback(id, text) => Self::Callback(id, text),
+            PanelEvent::Replace(_, input) => Self::Replace(input),
+        }
+    }
 }

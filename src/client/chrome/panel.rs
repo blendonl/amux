@@ -1,5 +1,6 @@
 use super::draw::Rect;
 use crate::protocol::{ClientMessage, ServerView};
+use crate::settings::CallbackId;
 use crate::target::Target;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +14,7 @@ pub enum PanelEvent {
     Pending,
     Cancel,
     Done(ClientMessage),
+    Callback(CallbackId, String),
     Replace(Box<dyn Panel>, Vec<u8>),
 }
 

@@ -7,7 +7,7 @@ use tokio::time::Instant;
 
 use crate::keys::{Decoded, Key, KeyDecoder, Scanner, ESC};
 use crate::protocol::SessionCommand;
-use crate::settings::{Binding, Keymap, PREFIX_TABLE, ROOT_TABLE};
+use crate::settings::{Binding, CallbackId, Keymap, PREFIX_TABLE, ROOT_TABLE};
 
 const TRIE_ROOT: usize = 0;
 
@@ -17,6 +17,7 @@ pub enum Action {
     Detach,
     Command(SessionCommand),
     Open(Panel),
+    Callback(CallbackId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,19 +41,11 @@ pub struct KeyRouter {
 
 impl KeyRouter {
     pub fn new(prefix: Key, keymap: Arc<Keymap>, escape_time: Duration) -> Self {
-        let enter_prefix = (prefix, Binding::SwitchTable(PREFIX_TABLE.to_owned()));
-        let trie = Trie::new(
-            keymap
-                .root
-                .iter()
-                .map(|(key, binding)| (*key, binding.clone()))
-                .chain([enter_prefix]),
-        );
         Self {
             prefix,
+            trie: Trie::root(prefix, &keymap),
             keymap,
             escape_time,
-            trie,
             scanner: Scanner::default(),
             held: Held::default(),
             table: None,
@@ -76,6 +69,25 @@ impl KeyRouter {
     pub fn flush(&mut self) -> Vec<u8> {
         self.escape_at = None;
         mem::take(&mut self.held).bytes
+    }
+
+    pub fn run_binding(&mut self, binding: Binding) -> Vec<Action> {
+        let mut routed = Routed::default();
+        if let Some(action) = self.perform(binding, &mut routed) {
+            routed.act(action);
+        }
+        routed.finish()
+    }
+
+    pub fn set_keymap(&mut self, keymap: Arc<Keymap>) -> Vec<u8> {
+        let held = self.flush();
+        self.trie = Trie::root(self.prefix, &keymap);
+        self.table = self
+            .table
+            .take()
+            .filter(|table| keymap.table(table).is_some());
+        self.keymap = keymap;
+        held
     }
 
     fn run(&mut self, mut queue: VecDeque<u8>, expire: bool) -> (Vec<Action>, Vec<u8>) {
@@ -226,7 +238,7 @@ impl KeyRouter {
                 self.table = known.then_some(table);
                 return None;
             }
-            Binding::Callback(_) => return None,
+            Binding::Callback(id) => Action::Callback(id),
             Binding::Detach => Action::Detach,
             Binding::RenameWindow => Action::Open(Panel::RenameWindow),
             Binding::RenameSession => Action::Open(Panel::RenameSession),
@@ -295,6 +307,17 @@ struct TrieNode {
 }
 
 impl Trie {
+    fn root(prefix: Key, keymap: &Keymap) -> Self {
+        let enter_prefix = (prefix, Binding::SwitchTable(PREFIX_TABLE.to_owned()));
+        Self::new(
+            keymap
+                .root
+                .iter()
+                .map(|(key, binding)| (*key, binding.clone()))
+                .chain([enter_prefix]),
+        )
+    }
+
     fn new(bindings: impl IntoIterator<Item = (Key, Binding)>) -> Self {
         let mut trie = Self {
             nodes: vec![TrieNode::default()],
@@ -773,6 +796,61 @@ mod tests {
         assert_eq!(
             route(&mut router, b"\x01a\x01\x01"),
             vec![forward(b"\x01\x01")]
+        );
+    }
+
+    #[test]
+    fn a_callback_binding_returns_before_the_rest_of_the_input() {
+        let mut keymap = Keymap::default();
+        keymap
+            .prefix
+            .insert(key("g"), Binding::Callback(CallbackId(2)));
+        let mut router = KeyRouter::new(key("C-b"), Arc::new(keymap), ESCAPE_TIME);
+        let (actions, rest) = router.route(b"a\x02gb\x02d");
+        assert_eq!(
+            actions,
+            vec![forward(b"a"), Action::Callback(CallbackId(2))]
+        );
+        assert_eq!(rest, b"b\x02d");
+    }
+
+    #[test]
+    fn running_a_binding_acts_like_pressing_it() {
+        let mut router = router();
+        assert_eq!(
+            router.run_binding(Binding::NewWindow),
+            vec![command(SessionCommand::NewWindow)]
+        );
+        assert_eq!(
+            router.run_binding(Binding::RenameWindow),
+            vec![Action::Open(Panel::RenameWindow)]
+        );
+        assert_eq!(
+            router.run_binding(Binding::SendPrefix),
+            vec![forward(b"\x02")]
+        );
+        assert_eq!(
+            router.run_binding(Binding::SwitchTable(PREFIX_TABLE.into())),
+            Vec::new()
+        );
+        assert_eq!(route(&mut router, b"d"), vec![Action::Detach]);
+    }
+
+    #[test]
+    fn a_new_keymap_applies_to_the_next_key_and_hands_back_held_bytes() {
+        let mut router = router_with("C-b", &[("M-h", select_left())]);
+        assert_eq!(route(&mut router, b"\x1b"), Vec::new());
+
+        let mut keymap = Keymap::default();
+        keymap.root.insert(key("M-l"), Binding::NextPane);
+        keymap.prefix.remove(&key("d"));
+        assert_eq!(router.set_keymap(Arc::new(keymap)), b"\x1b");
+        assert_eq!(router.escape_deadline(), None);
+
+        assert_eq!(route(&mut router, b"\x1bh"), vec![forward(b"\x1bh")]);
+        assert_eq!(
+            route(&mut router, b"\x1bl\x02d"),
+            vec![command(SessionCommand::NextPane)]
         );
     }
 }
