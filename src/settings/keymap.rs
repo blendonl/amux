@@ -1,12 +1,18 @@
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
+use super::callback::CallbackId;
 use crate::keys::{Decoded, Key, KeyCode};
 use crate::protocol::{Direction, Split};
 
 pub const ROOT_TABLE: &str = "root";
 pub const PREFIX_TABLE: &str = "prefix";
+pub const PROMPT_TABLE: &str = "prompt";
+pub const TREE_TABLE: &str = "tree";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Binding {
     Detach,
     SendPrefix,
@@ -14,18 +20,37 @@ pub enum Binding {
     NextWindow,
     PreviousWindow,
     SelectWindow(usize),
-    SplitPane(Split),
+    SplitPane(#[serde(with = "SplitName")] Split),
     NextPane,
-    SelectPane(Direction),
+    SelectPane(#[serde(with = "DirectionName")] Direction),
     KillPane,
     KillWindow,
     RenameWindow,
     RenameSession,
     ClusterTree,
     SwitchTable(String),
+    #[serde(skip)]
+    Callback(CallbackId),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Split", rename_all = "kebab-case")]
+enum SplitName {
+    LeftRight,
+    TopBottom,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Direction", rename_all = "kebab-case")]
+enum DirectionName {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PromptAction {
     Submit,
     Cancel,
@@ -38,7 +63,8 @@ pub enum PromptAction {
     CursorEnd,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TreeAction {
     Down,
     Up,
@@ -66,6 +92,14 @@ impl<A> Table<A> {
 
     pub fn insert(&mut self, key: Key, action: A) -> Option<A> {
         self.0.insert(key, action)
+    }
+
+    pub fn remove(&mut self, key: &Key) -> Option<A> {
+        self.0.remove(key)
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&Key, &A)> {

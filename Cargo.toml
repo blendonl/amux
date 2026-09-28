@@ -12,10 +12,12 @@ anyhow = "1.0.104"
 clap = { version = "4.5.61", features = ["derive", "env"] }
 crossterm = "0.29.0"
 getrandom = "0.3.4"
+mlua = { version = "0.11.5", features = ["lua54", "vendored", "serialize", "anyhow"] }
 nix = { version = "0.31.3", features = ["hostname", "process", "signal", "user"] }
 portable-pty = "0.9.0"
 postcard = { version = "1.1.3", features = ["use-std"] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_path_to_error = "0.1.20"
 shell-words = "1.1.1"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time", "process", "io-std"] }
 toml = "1.0.7"

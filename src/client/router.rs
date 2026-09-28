@@ -226,6 +226,7 @@ impl KeyRouter {
                 self.table = known.then_some(table);
                 return None;
             }
+            Binding::Callback(_) => return None,
             Binding::Detach => Action::Detach,
             Binding::RenameWindow => Action::Open(Panel::RenameWindow),
             Binding::RenameSession => Action::Open(Panel::RenameSession),

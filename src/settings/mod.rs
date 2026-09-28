@@ -1,3 +1,4 @@
+mod callback;
 mod client;
 mod keymap;
 mod style;
@@ -7,8 +8,12 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+pub use callback::CallbackId;
 pub use client::{StatusSettings, TreeSettings};
-pub use keymap::{Binding, Keymap, PromptAction, Table, TreeAction, PREFIX_TABLE, ROOT_TABLE};
+pub use keymap::{
+    Binding, Keymap, PromptAction, Table, TreeAction, PREFIX_TABLE, PROMPT_TABLE, ROOT_TABLE,
+    TREE_TABLE,
+};
 pub use style::{Color, StyleSpec};
 pub use theme::Theme;
 

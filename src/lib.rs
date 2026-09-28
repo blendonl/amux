@@ -3,6 +3,7 @@ pub mod client;
 pub mod cluster;
 pub mod config;
 pub mod keys;
+pub mod lua;
 pub mod paths;
 pub mod project;
 pub mod protocol;
