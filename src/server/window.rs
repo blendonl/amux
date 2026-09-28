@@ -147,11 +147,15 @@ impl Window {
     }
 
     pub fn write_input(&self, bytes: Vec<u8>) {
-        let Some(pane) = self.panes.get(&self.active) else {
+        self.write_input_to(self.active, bytes);
+    }
+
+    pub fn write_input_to(&self, id: PaneId, bytes: Vec<u8>) {
+        let Some(pane) = self.panes.get(&id) else {
             return;
         };
         if let Err(err) = pane.write_input(bytes) {
-            debug!(pane = %self.active, "dropping input: {err:#}");
+            debug!(pane = %id, "dropping input: {err:#}");
         }
     }
 

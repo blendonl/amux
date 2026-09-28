@@ -5,9 +5,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::SystemTime;
 
 use anyhow::{anyhow, bail, Result};
+use portable_pty::ExitStatus;
 use tokio::sync::{watch, Notify};
 
+use super::connection::Origin;
 use super::layout::PaneId;
+use super::lua_host::{HookEvent, HookSink};
 use super::mouse::InputEvent;
 use super::pane::{Pane, PaneObserver, PaneSpec};
 use super::render::Frame;
@@ -32,6 +35,12 @@ impl Binding {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct SessionHost {
+    pub settings: Arc<Settings>,
+    pub hooks: HookSink,
+}
+
 pub struct Session {
     id: SessionId,
     name: Mutex<String>,
@@ -43,6 +52,7 @@ pub struct Session {
     env: Vec<(String, String)>,
     binding: Option<Binding>,
     settings: Arc<Settings>,
+    hooks: HookSink,
     windows: Mutex<Windows>,
 }
 
@@ -54,8 +64,9 @@ impl Session {
         size: Size,
         env: &[(String, String)],
         binding: Option<Binding>,
-        settings: Arc<Settings>,
+        host: SessionHost,
     ) -> Result<Arc<Self>> {
+        let SessionHost { settings, hooks } = host;
         let session = Arc::new(Self {
             id,
             name: Mutex::new(name),
@@ -67,6 +78,7 @@ impl Session {
             env: env.to_vec(),
             binding,
             settings,
+            hooks,
             windows: Mutex::new(Windows::new(size.clamped())),
         });
         session.open_window()?;
@@ -152,12 +164,25 @@ impl Session {
         self.touch();
     }
 
-    pub fn client_attached(&self) {
-        self.attached_clients.fetch_add(1, Ordering::Relaxed);
+    pub fn client_attached(&self, origin: Origin) {
+        let clients = self.attached_clients.fetch_add(1, Ordering::Relaxed) + 1;
+        self.hooks.emit(HookEvent::ClientAttached {
+            session: self.name(),
+            origin,
+            clients,
+        });
     }
 
-    pub fn client_detached(&self) {
-        self.attached_clients.fetch_sub(1, Ordering::Relaxed);
+    pub fn client_detached(&self, origin: Origin) {
+        let clients = self
+            .attached_clients
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
+        self.hooks.emit(HookEvent::ClientDetached {
+            session: self.name(),
+            origin,
+            clients,
+        });
     }
 
     pub fn size(&self) -> Size {
@@ -205,7 +230,7 @@ impl Session {
 
     pub fn run(self: &Arc<Self>, command: SessionCommand) -> Result<()> {
         match command {
-            SessionCommand::NewWindow => self.open_window(),
+            SessionCommand::NewWindow => self.new_window(),
             SessionCommand::NextWindow => {
                 self.state().cycle(Cycle::Next);
                 Ok(())
@@ -238,11 +263,11 @@ impl Session {
                 let active = self.state().active;
                 self.remove_window(active)
             }
-            SessionCommand::RenameWindow(name) => self.rename_window(name),
+            SessionCommand::RenameWindow(name) => self.rename_window(None, name),
         }
     }
 
-    fn rename_window(&self, name: String) -> Result<()> {
+    pub fn rename_window(&self, window: Option<usize>, name: String) -> Result<()> {
         if name.trim().is_empty() {
             bail!("a window name can't be empty");
         }
@@ -250,17 +275,38 @@ impl Session {
             bail!("a window name can't contain control characters");
         }
         let mut windows = self.state();
-        windows.active_window_mut().ok_or_else(ended)?.rename(name);
+        let position = windows.position(window)?;
+        windows
+            .list
+            .get_mut(position)
+            .ok_or_else(ended)?
+            .rename(name);
         windows.structure_changed();
+        Ok(())
+    }
+
+    pub fn send_keys(
+        &self,
+        window: Option<usize>,
+        pane: Option<usize>,
+        keys: Vec<u8>,
+    ) -> Result<()> {
+        let windows = self.state();
+        let target = windows
+            .list
+            .get(windows.position(window)?)
+            .ok_or_else(ended)?;
+        let pane = match pane {
+            Some(index) => target.pane_at(index)?,
+            None => target.active_pane(),
+        };
+        target.write_input_to(pane, keys);
         Ok(())
     }
 
     pub fn select(&self, window: Option<usize>, pane: Option<usize>) -> Result<()> {
         let mut windows = self.state();
-        let position = match window {
-            Some(index) => windows.position_of(index)?,
-            None => windows.active,
-        };
+        let position = windows.position(window)?;
         let selected = windows.list.get_mut(position).ok_or_else(ended)?;
         if let Some(pane) = pane {
             let id = selected.pane_at(pane)?;
@@ -279,13 +325,9 @@ impl Session {
     pub fn kill_pane(&self, window: Option<usize>, pane: usize) -> Result<()> {
         let id = {
             let windows = self.state();
-            let position = match window {
-                Some(index) => windows.position_of(index)?,
-                None => windows.active,
-            };
             windows
                 .list
-                .get(position)
+                .get(windows.position(window)?)
                 .ok_or_else(ended)?
                 .pane_at(pane)?
         };
@@ -301,15 +343,39 @@ impl Session {
     }
 
     fn remove_pane(&self, pane: PaneId) {
-        let _removed = self.state().remove_pane(pane);
+        let Some(removed) = self.state().remove_pane(pane) else {
+            return;
+        };
+        self.window_closed(removed.closed.as_ref());
     }
 
     fn remove_window(&self, position: usize) -> Result<()> {
-        let _removed = self.state().remove_window(position).ok_or_else(ended)?;
+        let removed = self.state().remove_window(position).ok_or_else(ended)?;
+        self.window_closed(Some(&removed));
         Ok(())
     }
 
-    fn open_window(self: &Arc<Self>) -> Result<()> {
+    fn window_closed(&self, window: Option<&Window>) {
+        if let Some(WindowSummary { index, name, .. }) = window.map(Window::summary) {
+            self.hooks.emit(HookEvent::WindowClosed {
+                session: self.name(),
+                window: index,
+                name,
+            });
+        }
+    }
+
+    fn new_window(self: &Arc<Self>) -> Result<()> {
+        let WindowSummary { index, name, .. } = self.open_window()?;
+        self.hooks.emit(HookEvent::WindowCreated {
+            session: self.name(),
+            window: index,
+            name,
+        });
+        Ok(())
+    }
+
+    fn open_window(self: &Arc<Self>) -> Result<WindowSummary> {
         let mut windows = self.state();
         if windows.signals.is_none() {
             bail!("the session has ended");
@@ -320,13 +386,12 @@ impl Session {
         let position = windows
             .list
             .partition_point(|window| window.index() < index);
-        windows.list.insert(
-            position,
-            Window::new(index, self.window_name.clone(), id, pane),
-        );
+        let window = Window::new(index, self.window_name.clone(), id, pane);
+        let summary = window.summary();
+        windows.list.insert(position, window);
         windows.active = position;
         windows.structure_changed();
-        Ok(())
+        Ok(summary)
     }
 
     fn split(self: &Arc<Self>, split: Split) -> Result<()> {
@@ -374,8 +439,25 @@ impl PaneObserver for Session {
         }
     }
 
-    fn pane_exited(&self, pane: PaneId) {
-        self.remove_pane(pane);
+    fn pane_exited(&self, pane: PaneId, exit: Option<ExitStatus>) {
+        let Some(removed) = self.state().remove_pane(pane) else {
+            return;
+        };
+        let (status, signal) = match &exit {
+            Some(exit) => match exit.signal() {
+                Some(signal) => (None, Some(signal.to_owned())),
+                None => (Some(exit.exit_code()), None),
+            },
+            None => (None, None),
+        };
+        self.hooks.emit(HookEvent::PaneExited {
+            session: self.name(),
+            window: removed.window,
+            pane: pane.0,
+            status,
+            signal,
+        });
+        self.window_closed(removed.closed.as_ref());
     }
 }
 
@@ -390,6 +472,12 @@ struct Windows {
 enum Cycle {
     Next,
     Previous,
+}
+
+struct RemovedPane {
+    window: usize,
+    closed: Option<Window>,
+    _pane: Option<Pane>,
 }
 
 struct Signals {
@@ -433,6 +521,13 @@ impl Windows {
             .expect("a free window index always exists")
     }
 
+    fn position(&self, window: Option<usize>) -> Result<usize> {
+        match window {
+            Some(index) => self.position_of(index),
+            None => Ok(self.active),
+        }
+    }
+
     fn position_of(&self, index: usize) -> Result<usize> {
         self.list
             .iter()
@@ -462,16 +557,22 @@ impl Windows {
         }
     }
 
-    fn remove_pane(&mut self, pane: PaneId) -> Option<Pane> {
+    fn remove_pane(&mut self, pane: PaneId) -> Option<RemovedPane> {
         let size = self.size;
         let position = self.list.iter().position(|window| window.contains(pane))?;
+        let window = self.list[position].index();
         let removed = self.list[position].remove(pane, size);
-        if self.list[position].is_empty() {
-            self.remove_window(position);
+        let closed = if self.list[position].is_empty() {
+            self.remove_window(position)
         } else {
             self.structure_changed();
-        }
-        removed
+            None
+        };
+        Some(RemovedPane {
+            window,
+            closed,
+            _pane: removed,
+        })
     }
 
     fn remove_window(&mut self, position: usize) -> Option<Window> {
@@ -564,7 +665,10 @@ mod tests {
             Size { rows: 24, cols: 80 },
             &[],
             None,
-            Arc::new(settings),
+            SessionHost {
+                settings: Arc::new(settings),
+                hooks: HookSink::default(),
+            },
         )
         .unwrap()
     }

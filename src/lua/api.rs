@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use super::runtime::Process;
-use super::{client, from_lua, function};
+use super::{client, from_lua, function, server};
 use crate::keys::Key;
 use crate::settings::{
     Binding, CallbackId, Keymap, PromptAction, Table as Bindings, TreeAction, PREFIX_TABLE,
@@ -80,8 +80,9 @@ pub fn install(lua: &Lua, opt: &Table, process: Process) -> mlua::Result<()> {
     api.set("action", guarded(lua, "amux.action", action)?)?;
     api.set("on", function(lua, on)?)?;
     api.set("process", process.name())?;
-    if process == Process::Client {
-        client::install(lua, &api, constructors)?;
+    match process {
+        Process::Client => client::install(lua, &api, constructors)?,
+        Process::Server => server::install(lua, &api)?,
     }
     api.set("hostname", function(lua, |_, ()| hostname())?)?;
     api.set("log", function(lua, log)?)?;

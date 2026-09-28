@@ -1,6 +1,7 @@
 mod connection;
 mod forward;
 mod layout;
+pub mod lua_host;
 mod mouse;
 mod pane;
 mod projects;
@@ -41,8 +42,9 @@ use crate::settings::{SessionSettings, Settings};
 use crate::target::{self, Candidate, Target};
 use connection::Origin;
 use forward::{Host, RemoteSession};
+use lua_host::{HookEvent, HookSink};
 use projects::{blocking, Projects, REGISTRY_FILE};
-use session::{Binding, Session};
+use session::{Binding, Session, SessionHost};
 
 const LOG_FILTER_ENV: &str = "AMUX_LOG";
 const EVENT_CAPACITY: usize = 256;
@@ -112,6 +114,9 @@ pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
     server.lan.start(&server.cluster);
     server.discovery.start();
     info!(socket = %socket.display(), version = %Version::current(), "server started");
+    server.hooks.emit(HookEvent::ServerStarted {
+        server: server.identity.name.clone(),
+    });
 
     loop {
         tokio::select! {
@@ -171,6 +176,7 @@ pub struct Server {
     config_path: PathBuf,
     state: Mutex<LocalState>,
     events: broadcast::Sender<Event>,
+    hooks: HookSink,
     cluster: Arc<Cluster>,
     lan: LanListener,
     discovery: Discovery,
@@ -230,6 +236,7 @@ impl Server {
                 config_path,
                 state: Mutex::new(state),
                 events: broadcast::channel(EVENT_CAPACITY).0,
+                hooks: HookSink::default(),
                 discovery: Discovery::new(Arc::clone(&cluster), discovery),
                 cluster,
                 lan: LanListener::new(lan),
@@ -332,7 +339,10 @@ impl Server {
             spec.size,
             spec.env,
             spec.binding,
-            Arc::clone(&self.settings),
+            SessionHost {
+                settings: Arc::clone(&self.settings),
+                hooks: self.hooks.clone(),
+            },
         )?;
         state.sessions.insert(name.clone(), Arc::clone(&session));
         self.publish(&mut state, StateEvent::SessionCreated(session.info()));
@@ -574,12 +584,13 @@ impl Server {
         }
     }
 
-    fn track_client(self: &Arc<Self>, session: &Arc<Session>) -> AttachedClient {
-        session.client_attached();
+    fn track_client(self: &Arc<Self>, session: &Arc<Session>, origin: Origin) -> AttachedClient {
+        session.client_attached(origin);
         self.session_changed(session);
         AttachedClient {
             server: Arc::clone(self),
             session: Arc::clone(session),
+            origin,
         }
     }
 
@@ -662,11 +673,12 @@ impl StateSource for Server {
 struct AttachedClient {
     server: Arc<Server>,
     session: Arc<Session>,
+    origin: Origin,
 }
 
 impl Drop for AttachedClient {
     fn drop(&mut self) {
-        self.session.client_detached();
+        self.session.client_detached(self.origin);
         self.server.session_changed(&self.session);
     }
 }

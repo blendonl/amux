@@ -1,14 +1,11 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use mlua::{
-    AppDataRefMut, Function, HookTriggers, IntoLua, IntoLuaMulti, Lua, MultiValue, Table, Value,
-    VmState,
-};
+use mlua::{AppDataRefMut, Function, IntoLua, IntoLuaMulti, Lua, MultiValue, Table, Value};
 use serde::Deserialize;
 
 use super::api::{bound, registry, Bound, Registry};
 use super::runtime::Loaded;
-use super::{describe, from_lua, function};
+use super::{call_within, describe, from_lua, function};
 use crate::client::scripting::{ClientContext, Effect, Scripting, StatusContext, StatusSpan};
 use crate::protocol::WindowSummary;
 use crate::settings::{CallbackId, Keymap, StyleSpec};
@@ -16,7 +13,6 @@ use crate::target::Target;
 
 const BINDING_BUDGET: Duration = Duration::from_secs(1);
 const STATUS_BUDGET: Duration = Duration::from_millis(50);
-const HOOK_INSTRUCTIONS: u32 = 1000;
 const PROMPT_FIELDS: [&str; 3] = ["initial", "label", "on_submit"];
 
 pub struct LuaScripting {
@@ -59,29 +55,8 @@ impl LuaScripting {
     where
         R: mlua::FromLuaMulti,
     {
-        let deadline = Instant::now() + budget;
-        let triggers = HookTriggers::new().every_nth_instruction(HOOK_INSTRUCTIONS);
-        let hooked = self.lua.set_global_hook(triggers, move |_, debug| {
-            if Instant::now() < deadline {
-                return Ok(VmState::Continue);
-            }
-            let location = debug
-                .current_line()
-                .zip(debug.source().short_src)
-                .map(|(line, source)| format!("{source}:{line}: "))
-                .unwrap_or_default();
-            Err(mlua::Error::runtime(format!(
-                "{location}{what} ran past its {} ms budget",
-                budget.as_millis()
-            )))
-        });
-        if let Err(error) = hooked {
-            return (Err(describe(&error)), call);
-        }
         self.lua.set_app_data(call);
-        let result = callback.call::<R>(arguments);
-        self.lua.remove_global_hook();
-        self.lua.remove_hook();
+        let result = call_within(&self.lua, callback, arguments, budget, what);
         let call = self.lua.remove_app_data::<Call>().unwrap_or_default();
         (result.map_err(|error| describe(&error)), call)
     }
@@ -372,6 +347,8 @@ fn status_spans(value: Value) -> Result<Option<Vec<StatusSpan>>, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::lua::runtime::load_init;
     use crate::lua::Process;

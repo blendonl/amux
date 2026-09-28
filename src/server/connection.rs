@@ -312,7 +312,7 @@ async fn attach(
     client: &mut ClientConnection,
     origin: Origin,
 ) -> Result<Outcome> {
-    let _client = server.track_client(session);
+    let _client = server.track_client(session, origin);
     session.resize(*size);
 
     let attached = ServerMessage::Attached(AttachedSession {

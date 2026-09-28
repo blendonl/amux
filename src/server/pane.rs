@@ -8,7 +8,9 @@ use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
 
 use anyhow::{anyhow, bail, Context, Result};
-use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{
+    native_pty_system, Child, ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtySize,
+};
 
 use super::layout::PaneId;
 use crate::protocol::{is_locale_variable, Size};
@@ -18,7 +20,7 @@ const READ_BUFFER_LEN: usize = 16 * 1024;
 
 pub trait PaneObserver: Send + Sync {
     fn pane_output(&self, pane: PaneId);
-    fn pane_exited(&self, pane: PaneId);
+    fn pane_exited(&self, pane: PaneId, exit: Option<ExitStatus>);
 }
 
 pub struct PaneSpec<'a> {
@@ -197,9 +199,9 @@ fn spawn_output_pump(
                 Err(_) => break,
             }
         }
-        let _ = child.wait();
+        let exit = child.wait().ok();
         if let Some(observer) = sinks.observer.upgrade() {
-            observer.pane_exited(sinks.pane);
+            observer.pane_exited(sinks.pane, exit);
         }
     });
 }
@@ -244,7 +246,7 @@ mod tests {
 
     impl PaneObserver for Quiet {
         fn pane_output(&self, _: PaneId) {}
-        fn pane_exited(&self, _: PaneId) {}
+        fn pane_exited(&self, _: PaneId, _: Option<ExitStatus>) {}
     }
 
     fn command(settings: &PaneSettings, env: &[(String, String)]) -> CommandBuilder {

@@ -4,18 +4,25 @@ pub mod data;
 pub mod emit;
 mod opt;
 mod runtime;
+mod server;
 
 use std::fmt;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
-use mlua::{DeserializeOptions, FromLuaMulti, Function, IntoLuaMulti, Lua, MultiValue, Value};
+use mlua::{
+    DeserializeOptions, FromLuaMulti, Function, HookTriggers, IntoLuaMulti, Lua, MultiValue, Value,
+    VmState,
+};
 use serde::de::DeserializeOwned;
 
 pub use api::{Callbacks, Hooks, EVENTS};
 pub use client::LuaScripting;
 pub use runtime::{find_init, load, ConfigPaths, Loaded, Process, INIT_FILE, SYSTEM_INIT};
+pub use server::{HookRun, LuaHooks};
 
 const TRACEBACK: &str = "\nstack traceback:";
+const BUDGET_CHECK_INSTRUCTIONS: u32 = 1000;
 
 fn chunk_name(path: &Path) -> String {
     format!("@{}", path.display())
@@ -32,6 +39,35 @@ where
             .and_then(|args| body(lua, args))
             .map_err(|error| located(lua, describe(&error)))
     })
+}
+
+fn call_within<R: FromLuaMulti>(
+    lua: &Lua,
+    callback: &Function,
+    arguments: impl IntoLuaMulti,
+    budget: Duration,
+    what: &'static str,
+) -> mlua::Result<R> {
+    let deadline = Instant::now() + budget;
+    let triggers = HookTriggers::new().every_nth_instruction(BUDGET_CHECK_INSTRUCTIONS);
+    lua.set_global_hook(triggers, move |_, debug| {
+        if Instant::now() < deadline {
+            return Ok(VmState::Continue);
+        }
+        let location = debug
+            .current_line()
+            .zip(debug.source().short_src)
+            .map(|(line, source)| format!("{source}:{line}: "))
+            .unwrap_or_default();
+        Err(mlua::Error::runtime(format!(
+            "{location}{what} ran past its {} ms budget",
+            budget.as_millis()
+        )))
+    })?;
+    let result = callback.call::<R>(arguments);
+    lua.remove_global_hook();
+    lua.remove_hook();
+    result
 }
 
 fn located(lua: &Lua, message: impl fmt::Display) -> mlua::Error {
