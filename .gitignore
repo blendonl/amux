@@ -21,3 +21,9 @@ target
 #.idea/
 
 .claude/worktrees/
+
+android/**/build
+android/.gradle
+android/local.properties
+android/app/src/main/jniLibs/
+android/.cache/
