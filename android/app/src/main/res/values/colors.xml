@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="terminal_background">#FF000000</color>
+    <color name="panel_text">#FFE6E6E6</color>
+    <color name="panel_text_dim">#FF9A9A9A</color>
+    <color name="key_background">#FF1C1C1C</color>
+    <color name="key_label">#FFE6E6E6</color>
+    <color name="accent">#FFA6E3A1</color>
+    <color name="ic_launcher_background">#FF1E1E2E</color>
+</resources>

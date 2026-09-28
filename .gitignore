@@ -24,6 +24,7 @@ target
 
 android/**/build
 android/.gradle
+android/.kotlin
 android/local.properties
 android/app/src/main/jniLibs/
 android/.cache/

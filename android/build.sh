@@ -10,11 +10,12 @@ readonly image=amux-android-build
 readonly image_label=io.github.blendonl.amux.dockerfile
 readonly smoke_image=termux/termux-docker:x86_64
 readonly jni_libs=android/app/src/main/jniLibs
+readonly apk=app/build/outputs/apk/debug/app-debug.apk
 readonly min_sdk=29
 readonly abis=(arm64-v8a x86_64)
 
 usage() {
-    echo "usage: $0 image|binary|smoke|all" >&2
+    echo "usage: $0 image|binary|smoke|apk|all" >&2
     exit 2
 }
 
@@ -40,7 +41,7 @@ build_image() {
 
 run_in_image() {
     local task=$1
-    mkdir -p "$cache_dir/cargo" "$cache_dir/target" "$cache_dir/home"
+    mkdir -p "$cache_dir/cargo" "$cache_dir/target" "$cache_dir/home" "$cache_dir/gradle" "$cache_dir/android"
     docker run --rm --init \
         --user "$(id -u):$(id -g)" \
         --volume "$repo_dir:/work" \
@@ -49,9 +50,11 @@ run_in_image() {
         --env HOME=/cache/home \
         --env CARGO_HOME=/cache/cargo \
         --env CARGO_TARGET_DIR=/cache/target \
+        --env GRADLE_USER_HOME=/cache/gradle \
+        --env ANDROID_USER_HOME=/cache/android \
         "$image" \
         bash -c "set -euo pipefail
-            $(declare -p jni_libs min_sdk abis)
+            $(declare -p jni_libs apk min_sdk abis)
             $(declare -f rust_target "$task")
             $task"
 }
@@ -81,6 +84,25 @@ cross_compile() {
 
 build_binary() {
     run_in_image cross_compile
+}
+
+require_binaries() {
+    local abi
+    for abi in "${abis[@]}"; do
+        [[ -f "$repo_dir/$jni_libs/$abi/libamux.so" ]] || die "$jni_libs/$abi/libamux.so is missing, run $0 binary first"
+    done
+}
+
+build_apk() {
+    cd android
+    ./gradlew --no-daemon assembleDebug testDebugUnitTest lintDebug
+
+    printf '\n$ ls -l %s\n' "$apk"
+    ls -l "$apk"
+    printf '\n$ unzip -l %s lib/*\n' "$apk"
+    unzip -l "$apk" 'lib/*'
+    printf '\n$ aapt2 dump badging %s\n' "$apk"
+    aapt2 dump badging "$apk" | grep -E "^(package|minSdkVersion|targetSdkVersion|uses-permission|application-label|native-code)"
 }
 
 smoke_script() {
@@ -168,10 +190,16 @@ main() {
         smoke)
             smoke
             ;;
+        apk)
+            build_image
+            require_binaries
+            run_in_image build_apk
+            ;;
         all)
             build_image
             build_binary
             smoke
+            run_in_image build_apk
             ;;
         *)
             usage

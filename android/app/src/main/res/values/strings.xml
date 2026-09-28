@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">amux</string>
+
+    <string name="key_escape">Esc</string>
+    <string name="key_tab">Tab</string>
+    <string name="key_control">Ctrl</string>
+    <string name="key_alt">Alt</string>
+    <string name="key_left">←</string>
+    <string name="key_down">↓</string>
+    <string name="key_up">↑</string>
+    <string name="key_right">→</string>
+    <string name="key_prefix">Prefix</string>
+
+    <string name="status_starting">Starting amux…</string>
+    <string name="status_stopping">Stopping amux…</string>
+    <string name="status_detached">Detached</string>
+    <string name="status_client_exited">The client exited with status %1$d</string>
+    <string name="status_server_failed">The amux server failed</string>
+    <string name="status_stopped">amux stopped</string>
+    <string name="action_reattach">Reattach</string>
+    <string name="action_stop_amux">Stop amux</string>
+
+    <string name="notification_channel">amux server</string>
+    <string name="notification_channel_description">Shows while the amux server runs in the background.</string>
+    <string name="notification_title">amux</string>
+    <string name="notification_starting">Starting the server</string>
+    <string name="notification_running">Server running</string>
+    <string name="notification_running_awake">Server running, keeping the phone awake</string>
+    <string name="notification_stopping">Stopping the server</string>
+    <string name="notification_keep_awake">Keep awake</string>
+    <string name="notification_allow_sleep">Allow sleep</string>
+    <string name="notification_stop">Stop</string>
+
+    <string name="server_restarting">The server %1$s. Restarting in %2$d s.</string>
+    <string name="server_failed">The server %1$s.</string>
+    <string name="failure_exit">exited with status %1$d</string>
+    <string name="failure_exit_with_log">exited with status %1$d: %2$s</string>
+    <string name="failure_no_answer">did not answer on %1$s within %2$d s</string>
+    <string name="failure_launch">could not run %1$s: %2$s</string>
+    <string name="failure_prepare">could not prepare %1$s: %2$s</string>
+</resources>

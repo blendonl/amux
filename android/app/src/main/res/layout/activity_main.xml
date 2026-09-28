@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical">
+
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <com.termux.view.TerminalView
+            android:id="@+id/terminal"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:focusable="true"
+            android:focusableInTouchMode="true"
+            android:visibility="invisible" />
+
+        <LinearLayout
+            android:id="@+id/status"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:gravity="center_horizontal"
+            android:orientation="vertical"
+            android:padding="24dp">
+
+            <TextView
+                android:id="@+id/status_title"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:text="@string/status_starting"
+                android:textColor="@color/panel_text"
+                android:textSize="20sp" />
+
+            <TextView
+                android:id="@+id/status_detail"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:gravity="center"
+                android:textColor="@color/panel_text_dim"
+                android:textIsSelectable="true"
+                android:textSize="14sp"
+                android:visibility="gone" />
+
+            <LinearLayout
+                android:id="@+id/status_actions"
+                style="?android:attr/buttonBarStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:orientation="horizontal"
+                android:visibility="gone">
+
+                <Button
+                    android:id="@+id/reattach"
+                    style="?android:attr/buttonBarButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/action_reattach" />
+
+                <Button
+                    android:id="@+id/stop"
+                    style="?android:attr/buttonBarButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/action_stop_amux" />
+            </LinearLayout>
+        </LinearLayout>
+    </FrameLayout>
+
+    <LinearLayout
+        android:id="@+id/extra_keys"
+        android:layout_width="match_parent"
+        android:layout_height="40dp"
+        android:background="@color/key_background"
+        android:orientation="horizontal"
+        android:visibility="gone">
+
+        <Button
+            android:id="@+id/key_escape"
+            style="@style/ExtraKey"
+            android:text="@string/key_escape" />
+
+        <Button
+            android:id="@+id/key_tab"
+            style="@style/ExtraKey"
+            android:text="@string/key_tab" />
+
+        <Button
+            android:id="@+id/key_control"
+            style="@style/ExtraKey"
+            android:text="@string/key_control" />
+
+        <Button
+            android:id="@+id/key_alt"
+            style="@style/ExtraKey"
+            android:text="@string/key_alt" />
+
+        <Button
+            android:id="@+id/key_left"
+            style="@style/ExtraKey"
+            android:text="@string/key_left" />
+
+        <Button
+            android:id="@+id/key_down"
+            style="@style/ExtraKey"
+            android:text="@string/key_down" />
+
+        <Button
+            android:id="@+id/key_up"
+            style="@style/ExtraKey"
+            android:text="@string/key_up" />
+
+        <Button
+            android:id="@+id/key_right"
+            style="@style/ExtraKey"
+            android:text="@string/key_right" />
+
+        <Button
+            android:id="@+id/key_prefix"
+            style="@style/ExtraKey"
+            android:text="@string/key_prefix" />
+    </LinearLayout>
+</LinearLayout>
