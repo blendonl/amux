@@ -142,7 +142,8 @@ pub async fn handle(
                 new_key,
                 verbose,
             };
-            let paired = pairing::join(server.discovery(), joining, &mut client).await;
+            let paired =
+                pairing::join(server.discovery(), server.config(), joining, &mut client).await;
             return match paired {
                 Ok(()) => Ok(()),
                 Err(err) => send(&client.outgoing, ServerMessage::Error(format!("{err:#}"))).await,

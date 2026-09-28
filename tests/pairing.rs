@@ -349,6 +349,38 @@ fn a_joiner_without_lan_discovery_pairs_through_host() {
 }
 
 #[test]
+fn a_joiner_through_host_saves_the_host_and_links_to_it_again() {
+    let lan = FakeLan::new();
+    let a = lan_server("a", &lan);
+    let b = TestServer::builder().name("b").start();
+    let mut pairing = PairingHost::start(&a, &[]);
+    let code = pairing.code();
+    let host = format!("127.0.0.1:{}", a.wait_for_lan_port());
+    let address = format!("tcp://{host}");
+
+    let joined = b.run_ok(&["pair", &code, "--host", &host]);
+
+    assert!(
+        joined.contains(&format!(
+            "saved a as a server at {address}, so this machine links to it again after the link drops\n{}",
+            paired_line(&a)
+        )),
+        "{joined}"
+    );
+    let (hosted, _, stderr) = pairing.finish();
+    assert!(hosted, "{stderr}");
+    let servers = fs::read_to_string(b.servers_path()).unwrap();
+    assert!(servers.contains(&common::lua(&address)), "{servers}");
+    wait_for_noise_link(&b, &a);
+    let links_up = b.log().matches("link up").count();
+
+    b.run_ok(&["debug", "drop-link", "a"]);
+
+    b.wait_for_log_count("link up", links_up + 1);
+    wait_for_noise_link(&b, &a);
+}
+
+#[test]
 fn verbose_pairing_prints_each_step_on_both_machines() {
     let lan = FakeLan::new();
     let a = lan_server("a", &lan);

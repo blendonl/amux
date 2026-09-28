@@ -256,6 +256,10 @@ impl Server {
         &self.discovery
     }
 
+    pub fn config(&self) -> &ConfigPaths {
+        &self.config
+    }
+
     async fn forget_server(&self, server: &str) -> Result<Option<String>> {
         let forgotten = self.cluster.forget(server)?;
         if forgotten.configured.is_empty() {

@@ -325,6 +325,7 @@ pub async fn pair(endpoint: &Endpoint, args: PairArgs) -> Result<()> {
             Some(ServerMessage::PairingStep(step)) => {
                 println!("{}", listing::pairing_step(started.elapsed(), &step));
             }
+            Some(ServerMessage::Notice(notice)) => println!("{notice}"),
             Some(ServerMessage::Paired {
                 name,
                 id,

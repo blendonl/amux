@@ -18,9 +18,11 @@ use tracing::{debug, info};
 use crate::cluster::{noise, Cluster, NoiseKey, Secured, Voucher, Witnessed};
 use crate::discovery::{lan, Discovery};
 use crate::identity::ServerId;
+use crate::lua::ConfigPaths;
 use crate::protocol::{
     self, ClientMessage, Duplex, PublicKey, ServerMessage, SourceState, TcpKind,
 };
+use crate::settings::ServerConfig;
 
 pub type PairingClient = Duplex<ClientMessage, ServerMessage>;
 
@@ -37,6 +39,7 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 const JOINER_LABEL: &[u8] = b"amux pair joiner";
 const HOST_LABEL: &[u8] = b"amux pair host";
 const WRONG_CODE: &str = "wrong code";
+const TCP_SCHEME: &str = "tcp://";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -442,6 +445,7 @@ where
 
 pub async fn join(
     discovery: &Discovery,
+    config: &ConfigPaths,
     joining: Joining,
     client: &mut PairingClient,
 ) -> Result<()> {
@@ -451,7 +455,7 @@ pub async fn join(
     if joining.new_key {
         cluster.rotate_key()?;
     }
-    let endpoints = match &joining.host {
+    let given = match &joining.host {
         Some(host) => {
             let endpoint = host_endpoint(discovery, host)?;
             narrator
@@ -459,8 +463,12 @@ pub async fn join(
                     "dialing {endpoint}, the address --host {host} names"
                 ))
                 .await;
-            vec![endpoint]
+            Some(endpoint)
         }
+        None => None,
+    };
+    let endpoints = match given {
+        Some(endpoint) => vec![endpoint],
         None => advertised_endpoints(discovery, &code, &narrator).await?,
     };
     narrator.step(lan_addresses()).await;
@@ -488,12 +496,53 @@ pub async fn join(
         id: peer.id,
         fingerprint: peer.key.fingerprint(),
     };
+    let name = peer.name.clone();
+    let linking = Arc::clone(&cluster);
     tokio::spawn(async move {
-        if let Err(err) = cluster.dial_secured(secured, Voucher::Pairing).await {
+        if let Err(err) = linking.dial_secured(secured, Voucher::Pairing).await {
             info!(peer = %peer.name, "linking over the pairing connection failed: {err:#}");
         }
     });
+    if let Some(endpoint) = given {
+        let notice = remember(config, &cluster, &name, endpoint).await;
+        reply(client, ServerMessage::Notice(notice)).await?;
+    }
     reply(client, paired).await
+}
+
+async fn remember(
+    config: &ConfigPaths,
+    cluster: &Arc<Cluster>,
+    name: &str,
+    endpoint: SocketAddr,
+) -> String {
+    let address = format!("{TCP_SCHEME}{endpoint}");
+    let server = ServerConfig {
+        address: address.clone(),
+        amux_path: None,
+        socket: None,
+    };
+    let saving = {
+        let (paths, name, server) = (config.clone(), name.to_owned(), server.clone());
+        tokio::task::spawn_blocking(move || crate::config::add_server(&paths, &name, &server))
+    };
+    let saved = match saving.await {
+        Ok(saved) => saved.and_then(|()| cluster.add_server(name.to_owned(), server)),
+        Err(err) => Err(anyhow!("saving the server stopped: {err}")),
+    };
+    match saved {
+        Ok(()) => {
+            info!(server = %name, %address, "saved the address this machine paired over");
+            format!("saved {name} as a server at {address}, so this machine links to it again after the link drops")
+        }
+        Err(err) => {
+            info!(server = %name, %address, "saving the address this machine paired over failed: {err:#}");
+            format!(
+                "saving {name} as a server at {address} failed: {err:#}, so if this machine \
+                 cannot find it over mDNS, run `amux servers add {name} {address}`"
+            )
+        }
+    }
 }
 
 async fn pair_with(
