@@ -15,7 +15,7 @@ use crate::settings::CALLBACK_SLOT;
 
 const ROOT: &str = "amux.opt";
 
-const SERIALIZE: SerializeOptions = SerializeOptions::new()
+pub(super) const SERIALIZE: SerializeOptions = SerializeOptions::new()
     .set_array_metatable(false)
     .serialize_none_to_null(false)
     .serialize_unit_to_null(false);

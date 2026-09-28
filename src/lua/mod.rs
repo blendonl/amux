@@ -18,14 +18,33 @@ use serde::de::DeserializeOwned;
 
 pub use api::{Callbacks, Hooks, EVENTS};
 pub use client::LuaScripting;
-pub use runtime::{find_init, load, ConfigPaths, Loaded, Process, INIT_FILE, SYSTEM_INIT};
+pub use runtime::{
+    find_init, load, load_servers, ConfigPaths, Loaded, Process, INIT_FILE, SERVERS_FILE,
+    SYSTEM_INIT,
+};
 pub use server::{HookRun, LuaHooks};
 
 const TRACEBACK: &str = "\nstack traceback:";
+const SHORTENED: &str = "...";
 const BUDGET_CHECK_INSTRUCTIONS: u32 = 1000;
 
 fn chunk_name(path: &Path) -> String {
     format!("@{}", path.display())
+}
+
+fn with_full_path(message: String, path: &Path) -> String {
+    let Some(shown) = message.strip_prefix(SHORTENED) else {
+        return message;
+    };
+    let full = path.display().to_string();
+    let tail = full
+        .char_indices()
+        .map(|(index, _)| &full[index..])
+        .find(|tail| shown.starts_with(tail) && shown[tail.len()..].starts_with(':'));
+    match tail {
+        Some(tail) => format!("{full}{}", &shown[tail.len()..]),
+        None => message,
+    }
 }
 
 fn function<A, R, F>(lua: &Lua, body: F) -> mlua::Result<Function>
@@ -130,4 +149,26 @@ fn from_lua<T: DeserializeOwned>(value: Value) -> Result<T, Invalid> {
         path: error.path().to_string(),
         message: describe(error.inner()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_shortened_source_gets_its_full_path_back() {
+        let path = Path::new("/home/someone/a/very/long/path/to/the/amux/config/dir/init.lua");
+        assert_eq!(
+            with_full_path("...the/amux/config/dir/init.lua:3: boom".into(), path),
+            format!("{}:3: boom", path.display())
+        );
+        assert_eq!(
+            with_full_path("/short/init.lua:1: boom".into(), path),
+            "/short/init.lua:1: boom"
+        );
+        assert_eq!(
+            with_full_path("...lua/other.lua:1: boom".into(), path),
+            "...lua/other.lua:1: boom"
+        );
+    }
 }

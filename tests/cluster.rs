@@ -139,14 +139,21 @@ fn servers_learn_addresses_from_their_peers() {
 }
 
 #[test]
-fn servers_add_and_remove_edit_the_config_and_the_running_server() {
+fn servers_add_and_remove_edit_servers_lua_and_the_running_server() {
     let b = TestServer::builder().name("b").start();
     let a = TestServer::builder().name("a").start();
+    let init = fs::read_to_string(a.config_path()).unwrap();
 
     a.run_ok(&["servers", "add", "b", &b.bridge_address()]);
 
-    let config = fs::read_to_string(a.config_path()).unwrap();
-    assert!(config.contains("[servers.b]"), "{config}");
+    let servers = fs::read_to_string(a.servers_path()).unwrap();
+    assert_eq!(
+        servers,
+        format!(
+            "return {{\n  b = {{\n    address = {},\n  }},\n}}\n",
+            common::lua(&b.bridge_address())
+        )
+    );
     a.wait_for_ls("b after servers add", |ls| ls.is_online("b"));
     let servers = a.wait_for_output(&["servers"], "b's latency", |servers| {
         servers
@@ -162,12 +169,39 @@ fn servers_add_and_remove_edit_the_config_and_the_running_server() {
 
     let duplicate = a.run(&["servers", "add", "b", "ssh://elsewhere"]);
     assert!(!duplicate.status.success());
+    let stderr = String::from_utf8_lossy(&duplicate.stderr);
+    assert!(stderr.contains("b is already in "), "{stderr}");
 
     a.run_ok(&["servers", "remove", "b"]);
 
-    let config = fs::read_to_string(a.config_path()).unwrap();
-    assert!(!config.contains("servers.b"), "{config}");
+    assert_eq!(fs::read_to_string(a.servers_path()).unwrap(), "return {}\n");
+    assert_eq!(fs::read_to_string(a.config_path()).unwrap(), init);
     a.wait_for_ls("b to be forgotten", |ls| ls.server("b").is_none());
+}
+
+#[test]
+fn a_server_set_in_init_lua_is_not_added_twice_or_removed_by_the_cli() {
+    let b = TestServer::builder().name("b").start();
+    let a = TestServer::builder().name("a").peer(&b).start();
+    a.wait_for_ls("b from init.lua", |ls| ls.is_online("b"));
+
+    let duplicate = a.run(&["servers", "add", "b", "ssh://elsewhere"]);
+    assert!(!duplicate.status.success());
+    let stderr = String::from_utf8_lossy(&duplicate.stderr);
+    assert!(
+        stderr.contains(&format!("b is already in {}", a.config_path().display())),
+        "{stderr}"
+    );
+
+    let removed = a.run(&["servers", "remove", "b"]);
+    assert!(!removed.status.success());
+    let stderr = String::from_utf8_lossy(&removed.stderr);
+    assert!(
+        stderr.contains("b is set in ") && stderr.contains("remove it from "),
+        "{stderr}"
+    );
+    assert!(!a.servers_path().exists());
+    a.wait_for_ls("b to stay", |ls| ls.is_online("b"));
 }
 
 #[test]
@@ -176,10 +210,9 @@ fn servers_add_without_a_running_server_only_edits_the_config() {
 
     a.run_ok(&["servers", "add", "b", "ssh://me@b.example:2222"]);
 
-    let config = fs::read_to_string(a.config_path()).unwrap();
-    assert!(
-        config.contains("[servers.b]\naddress = \"ssh://me@b.example:2222\"\n"),
-        "{config}"
+    assert_eq!(
+        fs::read_to_string(a.servers_path()).unwrap(),
+        "return {\n  b = {\n    address = \"ssh://me@b.example:2222\",\n  },\n}\n"
     );
     assert!(!a.is_listening());
     let invalid = a.run(&["servers", "add", "c", "ftp://c"]);
@@ -187,10 +220,33 @@ fn servers_add_without_a_running_server_only_edits_the_config() {
 }
 
 #[test]
+fn the_server_merges_servers_lua_before_init_lua_runs() {
+    let a = TestServer::builder()
+        .name("a")
+        .config(
+            "assert(amux.opt.servers.nowhere.address == 'exec:false')\n\
+             amux.opt.servers.elsewhere = { address = 'exec:true' }",
+        )
+        .prepare();
+    fs::create_dir_all(a.servers_path().parent().unwrap()).unwrap();
+    fs::write(
+        a.servers_path(),
+        "return { nowhere = { address = \"exec:false\" } }\n",
+    )
+    .unwrap();
+    let mut a = a;
+    a.start_process();
+
+    let servers = a.run_ok(&["servers"]);
+    assert!(lists_server(&servers, "nowhere"), "{servers}");
+    assert!(lists_server(&servers, "elsewhere"), "{servers}");
+}
+
+#[test]
 fn a_configured_server_that_was_never_reached_is_listed_as_never_seen() {
     let a = TestServer::builder()
         .name("a")
-        .config("[servers.nowhere]\naddress = \"exec:false\"")
+        .config("amux.opt.servers.nowhere = { address = \"exec:false\" }")
         .start();
 
     let servers = a.run_ok(&["servers"]);
@@ -242,7 +298,10 @@ fn a_peer_with_another_protocol_major_is_listed_as_incompatible() {
     );
     fs::write(
         a.config_path(),
-        format!("name = \"a\"\n{DISCOVERY_OFF}[servers.future]\naddress = {address:?}\n"),
+        format!(
+            "amux.opt.name = \"a\"\n{DISCOVERY_OFF}amux.opt.servers.future = {{ address = {} }}\n",
+            common::lua(&address)
+        ),
     )
     .unwrap();
     let mut a = a;
@@ -310,7 +369,7 @@ fn an_ssh_peer_links_when_amux_is_only_in_its_cargo_bin() {
     let a = TestServer::builder()
         .name("a")
         .ssh(&network)
-        .config("[servers.b]\naddress = \"ssh://me@b\"")
+        .config("amux.opt.servers.b = { address = \"ssh://me@b\" }")
         .start();
 
     a.wait_for_ls("b over ssh", |ls| ls.is_online("b"));
@@ -350,17 +409,18 @@ fn servers_forget_drops_a_gossiped_peer_and_keeps_refusing_it() {
 }
 
 #[test]
-fn servers_forget_removes_a_configured_peer_from_the_config() {
+fn servers_forget_removes_a_configured_peer_from_servers_lua() {
     let [a, b] = linked([
         TestServer::builder().name("a"),
         TestServer::builder().name("b"),
     ]);
     a.wait_for_ls("b", |ls| ls.is_online("b"));
 
-    a.run_ok(&["servers", "forget", "b"]);
+    let forgot = a.run(&["servers", "forget", "b"]);
+    assert!(forgot.status.success());
+    assert!(forgot.stderr.is_empty(), "{forgot:?}");
 
-    let config = fs::read_to_string(a.config_path()).unwrap();
-    assert!(!config.contains("servers.b"), "{config}");
+    assert_eq!(fs::read_to_string(a.servers_path()).unwrap(), "return {}\n");
     b.wait_for_log(&format!("the peer refused the link: {FORGOTTEN}"));
     a.wait_for_ls("b to be gone", |ls| ls.server("b").is_none());
     assert!(!lists_server(&a.run_ok(&["servers"]), "b"));
@@ -369,4 +429,29 @@ fn servers_forget_removes_a_configured_peer_from_the_config() {
     assert!(!again.status.success());
     let stderr = String::from_utf8_lossy(&again.stderr);
     assert!(stderr.contains("no server named b is known"), "{stderr}");
+}
+
+#[test]
+fn servers_forget_succeeds_but_says_when_init_lua_still_sets_the_server() {
+    let b = TestServer::builder().name("b").start();
+    let a = TestServer::builder().name("a").peer(&b).start();
+    a.wait_for_ls("b", |ls| ls.is_online("b"));
+    let init = fs::read_to_string(a.config_path()).unwrap();
+
+    let forgot = a.run(&["servers", "forget", "b"]);
+    assert!(forgot.status.success(), "{forgot:?}");
+    let stderr = String::from_utf8_lossy(&forgot.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "forgot b, but b is still set in {}; remove it there too",
+            a.config_path().display()
+        )),
+        "{stderr}"
+    );
+
+    a.wait_for_ls("b to be gone", |ls| ls.server("b").is_none());
+    assert_eq!(fs::read_to_string(a.config_path()).unwrap(), init);
+    assert!(!a.servers_path().exists());
+    let trust = fs::read_to_string(a.state_dir().join("trust.toml")).unwrap();
+    assert!(trust.contains(&b.server_id()), "{trust}");
 }

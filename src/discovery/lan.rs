@@ -220,7 +220,7 @@ fn is_dialable(ip: &IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ServerId;
+    use crate::identity::ServerId;
     use crate::protocol::PublicKey;
 
     fn advertisement(addresses: &[&str]) -> Advertisement {

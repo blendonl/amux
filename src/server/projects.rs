@@ -161,7 +161,7 @@ impl Server {
     }
 
     pub(super) fn default_server(&self, project: Option<&ProjectRef>) -> Option<&str> {
-        self.config
+        self.settings
             .projects
             .get(&project?.name)?
             .default_server
@@ -233,7 +233,7 @@ impl Server {
                 project.name
             );
         }
-        let dest = self.config.projects_dir.join(&project.name);
+        let dest = self.settings.projects_dir.join(&project.name);
         let id = project.id.clone();
         info!(%url, dest = %dest.display(), "cloning project");
         let cloned = self
@@ -255,7 +255,7 @@ impl Server {
     fn worktrees_dir(&self, project: &ProjectRef, checkout: &ProjectCheckout) -> PathBuf {
         [&project.name, &checkout.name]
             .into_iter()
-            .find_map(|name| self.config.projects.get(name)?.worktrees_dir.clone())
+            .find_map(|name| self.settings.projects.get(name)?.worktrees_dir.clone())
             .unwrap_or_else(|| {
                 project::default_worktrees_dir(
                     &checkout.path,

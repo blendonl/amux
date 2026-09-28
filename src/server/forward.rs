@@ -8,7 +8,7 @@ use super::connection::{send, switch_or_refuse, ClientConnection, Origin, Outcom
 use super::status::StatusFeed;
 use super::Server;
 use crate::cluster::{Channel, ChannelEnd};
-use crate::config::ServerId;
+use crate::identity::ServerId;
 use crate::protocol::{AttachedSession, ClientMessage, NewSession, ServerMessage, Size};
 use crate::target::Target;
 

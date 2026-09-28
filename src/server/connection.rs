@@ -112,8 +112,12 @@ pub async fn handle(
             return send(&client.outgoing, done_or_error(reply)).await;
         }
         ClientMessage::ForgetServer { name } => {
-            let reply = server.forget_server(&name).await;
-            return send(&client.outgoing, done_or_error(reply)).await;
+            let reply = match server.forget_server(&name).await {
+                Ok(None) => ServerMessage::Done,
+                Ok(Some(notice)) => ServerMessage::Notice(notice),
+                Err(err) => ServerMessage::Error(format!("{err:#}")),
+            };
+            return send(&client.outgoing, reply).await;
         }
         ClientMessage::Discover => {
             let report = ServerMessage::Discovery(server.discovery().report());

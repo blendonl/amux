@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::Peer;
-use crate::config::ServerId;
+use crate::identity::ServerId;
 use crate::protocol::Via;
 
 pub const CACHE_FILE: &str = "cluster-cache";
@@ -126,7 +126,7 @@ mod tests {
 
     use super::*;
     use crate::cluster::CachedState;
-    use crate::config::Incarnation;
+    use crate::identity::Incarnation;
     use crate::protocol::{ServerState, Version};
 
     fn peer(name: &str) -> Peer {

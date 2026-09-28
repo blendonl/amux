@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use mlua::{Lua, LuaOptions, StdLib, Table, Value};
 use serde::de::DeserializeOwned;
 
-use super::{chunk_name, describe, from_lua, function};
+use super::{chunk_name, describe, from_lua, function, with_full_path};
 
 pub fn load<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let source = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
@@ -19,7 +19,7 @@ pub fn parse<T: DeserializeOwned>(path: &Path, source: &[u8]) -> Result<T> {
         .set_name(chunk_name(path))
         .set_environment(sealed_environment(&lua)?)
         .call(())
-        .map_err(|error| anyhow::Error::msg(describe(&error)))?;
+        .map_err(|error| anyhow::Error::msg(with_full_path(describe(&error), path)))?;
     if !value.is_table() {
         bail!(
             "{}: expected the file to return a table, not {}",

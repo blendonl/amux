@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::os::unix::net::UnixStream as StdUnixStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Instant, SystemTime};
 
@@ -29,8 +29,10 @@ use crate::cluster::{
     self, Cluster, ClusterOptions, LanListener, LanOptions, NoiseKey, StateSource, TransportAuth,
     TrustStore, TRUST_FILE,
 };
-use crate::config::{self, Config, Incarnation, ServerId, ServerIdentity};
+use crate::config;
 use crate::discovery::{Discovery, DiscoveryOptions};
+use crate::identity::{self, Incarnation, ServerId, ServerIdentity};
+use crate::lua::ConfigPaths;
 use crate::paths;
 use crate::project::Registry;
 use crate::protocol::{
@@ -42,28 +44,26 @@ use crate::settings::{SessionSettings, Settings};
 use crate::target::{self, Candidate, Target};
 use connection::Origin;
 use forward::{Host, RemoteSession};
-use lua_host::{HookEvent, HookSink};
+use lua_host::{HookEvent, HookSink, LuaHost};
 use projects::{blocking, Projects, REGISTRY_FILE};
 use session::{Binding, Session, SessionHost};
 
 const LOG_FILTER_ENV: &str = "AMUX_LOG";
 const EVENT_CAPACITY: usize = 256;
 
-pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
+pub async fn run(socket: &Path, config: Option<&Path>) -> Result<()> {
     init_logging();
-    let config_path = match config_path {
-        Some(path) => path.to_owned(),
-        None => paths::config_path()?,
-    };
-    let config = Config::load(&config_path)?;
+    let config_paths = paths::config_paths(config)?;
+    let (settings, host) = LuaHost::start(config_paths.clone())?;
+    let settings = settings.expand_home(&paths::home_dir()?);
     info!(
-        path = %config_path.display(),
-        servers = config.servers.len(),
-        projects = config.projects.len(),
+        init = ?config_paths.init,
+        servers = settings.servers.len(),
+        projects = settings.projects.len(),
         "config loaded"
     );
     let state_dir = paths::state_dir(socket)?;
-    let identity = ServerIdentity::load(&state_dir, config.name.clone())?;
+    let identity = ServerIdentity::load(&state_dir, server_name(&settings)?)?;
     let key = NoiseKey::load_or_create(&state_dir)?;
     info!(
         name = %identity.name,
@@ -84,11 +84,6 @@ pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
     let listener = bind(socket)?;
     let mut terminate = signal(SignalKind::terminate())?;
     let socket_name = paths::socket_name(socket)?;
-    let settings = Settings {
-        discovery: config.discovery.clone(),
-        lan: config.lan.clone(),
-        ..Settings::default()
-    };
     let discovery = DiscoveryOptions {
         settings: settings.discovery.clone(),
         lan: settings.lan.clone(),
@@ -101,20 +96,20 @@ pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
         socket_name,
         settings: cluster::with_env(settings.cluster.clone())?,
         state_dir: Some(state_dir),
-        servers: config.servers.clone(),
+        servers: settings.servers.clone(),
         discovery: settings.discovery.clone(),
         trust,
         key,
     };
     let server = Server::new(
         identity,
-        config,
         settings,
-        config_path,
+        config_paths,
         registry,
         options,
         discovery,
     );
+    server.attach_lua(host);
     server.cluster.start();
     server.lan.start(&server.cluster);
     server.discovery.start();
@@ -176,9 +171,8 @@ enum Resolved {
 
 pub struct Server {
     identity: ServerIdentity,
-    config: Config,
     settings: Arc<Settings>,
-    config_path: PathBuf,
+    config: ConfigPaths,
     state: Mutex<LocalState>,
     events: broadcast::Sender<Event>,
     hooks: HookSink,
@@ -215,9 +209,8 @@ struct SessionSpec<'a> {
 impl Server {
     fn new(
         identity: ServerIdentity,
-        config: Config,
         settings: Settings,
-        config_path: PathBuf,
+        config: ConfigPaths,
         registry: Registry,
         options: ClusterOptions,
         discovery: DiscoveryOptions,
@@ -237,9 +230,8 @@ impl Server {
             let lan = LanListener::new(lan);
             Self {
                 identity,
-                config,
                 settings: Arc::new(settings),
-                config_path,
+                config,
                 state: Mutex::new(state),
                 events: broadcast::channel(EVENT_CAPACITY).0,
                 hooks: HookSink::default(),
@@ -256,10 +248,6 @@ impl Server {
         &self.identity
     }
 
-    pub fn config(&self) -> &Config {
-        &self.config
-    }
-
     pub fn cluster(&self) -> &Arc<Cluster> {
         &self.cluster
     }
@@ -268,30 +256,30 @@ impl Server {
         &self.discovery
     }
 
-    async fn forget_server(&self, server: &str) -> Result<()> {
+    async fn forget_server(&self, server: &str) -> Result<Option<String>> {
         let forgotten = self.cluster.forget(server)?;
         if forgotten.configured.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
-        let path = self.config_path.clone();
+        let paths = self.config.clone();
         let names = forgotten.configured.clone();
-        blocking(move || {
-            let config = Config::load(&path)?;
-            for name in names
-                .iter()
-                .filter(|name| config.servers.contains_key(*name))
-            {
-                config::remove_server(&path, name)?;
-            }
-            Ok(())
-        })
-        .await
-        .with_context(|| {
-            format!(
-                "forgot {}, but removing it from the config failed",
-                forgotten.name
-            )
-        })
+        let kept = blocking(move || config::forget_servers(&paths, &names))
+            .await
+            .with_context(|| {
+                format!(
+                    "forgot {}, but removing it from the config failed",
+                    forgotten.name
+                )
+            })?;
+        if kept.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(format!(
+            "forgot {}, but {} is still set in {}; remove it there too",
+            forgotten.name,
+            kept.join(", "),
+            config::init_name(&self.config)
+        )))
     }
 
     fn incarnation(&self) -> Incarnation {
@@ -741,6 +729,17 @@ fn next_free_name(sessions: &BTreeMap<String, Arc<Session>>, settings: &SessionS
         .numbered_names()
         .find(|name| !sessions.contains_key(name))
         .expect("an unused session index always exists")
+}
+
+fn server_name(settings: &Settings) -> Result<String> {
+    let name = match &settings.name {
+        Some(name) => name.clone(),
+        None => identity::hostname()?,
+    };
+    if name.trim().is_empty() {
+        bail!("the hostname is blank, so set amux.opt.name");
+    }
+    Ok(name)
 }
 
 fn bind(socket: &Path) -> Result<UnixListener> {

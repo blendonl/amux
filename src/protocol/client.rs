@@ -5,8 +5,9 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use super::{PublicKey, Version};
-use crate::config::{Incarnation, ServerConfig, ServerId};
+use crate::identity::{Incarnation, ServerId};
 use crate::project::ProjectId;
+use crate::settings::ServerConfig;
 use crate::target::Target;
 
 pub const MIN_ROWS: u16 = 2;
@@ -402,4 +403,5 @@ pub enum ServerMessage {
         reason: String,
         attempts_left: u8,
     },
+    Notice(String),
 }

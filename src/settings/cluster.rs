@@ -147,6 +147,14 @@ impl Default for LanSettings {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerConfig {
+    pub address: String,
+    pub amux_path: Option<String>,
+    pub socket: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::Settings;

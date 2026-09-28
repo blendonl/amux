@@ -15,6 +15,7 @@ use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use amux::lua::emit;
 use amux::protocol::{
     self, AttachedSession, ClientMessage, ClusterStatus, Duplex, NewSession, Role, ServerMessage,
     SessionCommand, SessionInfo, SessionState, Size, Version, Welcome, WindowSummary,
@@ -33,10 +34,13 @@ pub const DETACH: &str = "\x02d";
 const POLL: Duration = Duration::from_millis(10);
 const COMMAND_POLL: Duration = Duration::from_millis(50);
 const SOCKET_NAME: &str = "amux.sock";
+const INIT_FILE: &str = "init.lua";
+const SERVERS_FILE: &str = "servers.lua";
 const LAN_PORT_FILE: &str = "lan-port";
 const FAST_DISCOVERY_MS: &str = "100";
 const REMOTE_PATH: &str = "PATH=/usr/bin:/bin";
-pub const DISCOVERY_OFF: &str = "[discovery]\ntailscale = false\nlan = false\n";
+pub const DISCOVERY_OFF: &str =
+    "amux.opt.discovery.tailscale = false\namux.opt.discovery.lan = false\n";
 
 const FAKE_SSH: &str = r#"#!/bin/sh
 while [ $# -gt 0 ]; do
@@ -155,8 +159,8 @@ impl TestServerBuilder {
 
     pub fn prepare(self) -> TestServer {
         assert!(
-            !self.config.contains("[discovery]"),
-            "turn discovery sources on with the builder, not with a [discovery] table"
+            !self.config.contains("amux.opt.discovery"),
+            "turn discovery sources on with the builder, not with amux.opt.discovery"
         );
         let root = tempfile::tempdir().expect("creating a temp dir");
         let dir = |name: &str| {
@@ -173,18 +177,29 @@ impl TestServerBuilder {
         let state = dir("state");
         let config = dir("config");
         fs::create_dir_all(config.join("amux")).expect("creating the config dir");
-        let mut discovery = format!(
-            "[discovery]\ntailscale = {}\nlan = {}\ntailscale_tags = {:?}\n",
-            self.tailscale, self.lan, self.tailscale_tags
-        );
-        if let Some(port) = self.tailscale_port {
-            discovery.push_str(&format!("tailscale_port = {port}\n"));
+        let mut discovery = String::new();
+        if !self.tailscale_tags.is_empty() {
+            discovery.push_str(&format!(
+                "amux.opt.discovery.tailscale_tags = {}\n",
+                lua(&self.tailscale_tags)
+            ));
         }
+        if let Some(port) = self.tailscale_port {
+            discovery.push_str(&format!("amux.opt.discovery.tailscale_port = {port}\n"));
+        }
+        discovery.push_str(&format!(
+            "amux.opt.discovery.tailscale = {}\namux.opt.discovery.lan = {}\n",
+            self.tailscale, self.lan
+        ));
         fs::write(
-            config.join("amux").join("config.toml"),
-            format!("name = {:?}\n{}\n{discovery}", self.name, self.config),
+            config.join("amux").join(INIT_FILE),
+            format!(
+                "amux.opt.name = {}\n{}\n{discovery}",
+                lua(&self.name),
+                self.config
+            ),
         )
-        .expect("writing the config");
+        .expect("writing init.lua");
 
         let mut env: Vec<(String, OsString)> = vec![
             ("HOME".into(), home.into()),
@@ -264,10 +279,14 @@ pub fn settled_pair(first: TestServerBuilder, second: TestServerBuilder) -> [Tes
 
 fn peer_entry(peer: &TestServer) -> String {
     format!(
-        "\n[servers.{:?}]\naddress = {:?}\n",
-        peer.name(),
-        peer.bridge_address()
+        "\namux.opt.servers[{}] = {{ address = {} }}\n",
+        lua(peer.name()),
+        lua(&peer.bridge_address())
     )
+}
+
+pub fn lua<T: serde::Serialize + ?Sized>(value: &T) -> String {
+    emit::literal(value).expect("writing a Lua literal")
 }
 
 impl TestServer {
@@ -305,7 +324,11 @@ impl TestServer {
     }
 
     pub fn config_path(&self) -> PathBuf {
-        self.root().join("config").join("amux").join("config.toml")
+        self.root().join("config").join("amux").join(INIT_FILE)
+    }
+
+    pub fn servers_path(&self) -> PathBuf {
+        self.root().join("config").join("amux").join(SERVERS_FILE)
     }
 
     pub fn state_dir(&self) -> PathBuf {
@@ -381,10 +404,10 @@ impl TestServer {
         let mut config = File::options()
             .append(true)
             .open(self.config_path())
-            .expect("opening the config");
+            .expect("opening init.lua");
         config
             .write_all(peer_entry(peer).as_bytes())
-            .expect("adding a peer to the config");
+            .expect("adding a peer to init.lua");
     }
 
     pub fn command(&self) -> Command {

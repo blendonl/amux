@@ -74,14 +74,54 @@ fn the_readme_commands_work() {
 #[test]
 fn a_server_started_by_the_client_uses_the_client_config() {
     let server = TestServer::builder().prepare();
-    let custom = server.root().join("custom.toml");
-    fs::write(&custom, format!("name = \"custom\"\n{DISCOVERY_OFF}")).unwrap();
+    let custom = server.root().join("custom.lua");
+    fs::write(
+        &custom,
+        format!("amux.opt.name = \"custom\"\n{DISCOVERY_OFF}"),
+    )
+    .unwrap();
 
     let mut client = server.terminal(&["--config", custom.to_str().unwrap(), "new"]);
     server.wait_for_log("name=custom");
     client.type_text(DETACH);
     client.wait_for_text("[detached (from session 0)]");
     assert!(client.wait_for_exit().success());
+}
+
+#[test]
+fn config_check_accepts_the_printed_defaults_and_names_a_bad_line() {
+    let server = TestServer::builder().prepare();
+    let init = server.config_path().display().to_string();
+    assert_eq!(server.run_ok(&["config", "path"]), format!("{init}\n"));
+    assert_eq!(
+        server.run_ok(&["config", "check"]),
+        format!("init     {init}\nservers  none\n")
+    );
+
+    let defaults = server.root().join("defaults.lua");
+    fs::write(&defaults, server.run_ok(&["config", "defaults"])).unwrap();
+    let defaults = defaults.to_str().unwrap();
+    let checked = server
+        .command()
+        .env("AMUX_CONFIG", defaults)
+        .args(["config", "check"])
+        .output()
+        .unwrap();
+    assert!(checked.status.success(), "{checked:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&checked.stdout),
+        format!("init     {defaults}\nservers  none\n")
+    );
+
+    fs::write(server.config_path(), "amux.opt.bogus = 1\n").unwrap();
+    let failed = server.run(&["config", "check"]);
+    assert!(!failed.status.success());
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        stderr.contains(&format!("{init}:1: unknown option amux.opt.bogus")),
+        "{stderr}"
+    );
+    assert!(!server.is_listening());
 }
 
 #[test]

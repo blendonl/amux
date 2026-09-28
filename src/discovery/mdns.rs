@@ -13,7 +13,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use super::{Advertisement, LanDiscovery};
-use crate::config::ServerId;
+use crate::identity::ServerId;
 use crate::settings::LanSettings;
 
 pub const SERVICE_ENV: &str = "AMUX_MDNS_SERVICE";

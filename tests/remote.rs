@@ -1,6 +1,6 @@
 mod common;
 
-use amux::config::Incarnation;
+use amux::identity::Incarnation;
 use amux::protocol::{
     ClientMessage, Direction, NewSession, ServerMessage, ServerView, SessionCommand, Size, Split,
 };

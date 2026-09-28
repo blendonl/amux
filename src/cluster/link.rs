@@ -15,7 +15,7 @@ use tracing::{debug, warn};
 
 use super::channel::Channels;
 use super::{Cluster, LinkGuard, Rejection, StateSource, TransportAuth};
-use crate::config::ServerId;
+use crate::identity::ServerId;
 use crate::protocol::{
     self, read_frame, write_message, Farewell, Hello, IncompatibleServer, PeerMessage, Refusal,
     Role, Welcome,
@@ -619,7 +619,7 @@ mod tests {
     use crate::cluster::{
         Channel, ChannelEnd, ClusterOptions, NoiseKey, TrustStore, Voucher, CREDIT_WINDOW,
     };
-    use crate::config::{Incarnation, ServerIdentity};
+    use crate::identity::{Incarnation, ServerIdentity};
     use crate::protocol::{
         ClientMessage, Duplex, Event, ServerMessage, ServerState, ServerStatus, SessionId,
         SessionInfo, Snapshot, StateEvent, TcpKind, Version, WindowSummary, PROTOCOL_MAJOR,

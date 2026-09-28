@@ -668,7 +668,7 @@ mod tests {
 
     use super::*;
     use crate::client::chrome::testing::{row_text, screen_text, terminal};
-    use crate::config::Incarnation;
+    use crate::identity::Incarnation;
     use crate::protocol::{
         Direction, ServerStatus, SessionCommand, SessionId, SessionInfo, WindowSummary,
     };
@@ -1239,10 +1239,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let init = dir.path().join(INIT_FILE);
             fs::write(&init, source).unwrap();
-            let paths = ConfigPaths {
-                dir: dir.path().to_owned(),
-                init: Some(init),
-            };
+            let paths = ConfigPaths::new(dir.path().to_owned(), Some(init));
             let loaded = lua::load(&paths, Process::Client).unwrap();
             let relay = Relay::new(
                 "laptop".into(),

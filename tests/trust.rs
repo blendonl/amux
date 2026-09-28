@@ -4,7 +4,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use amux::cluster::{NoiseKey, TrustStore, TRUST_FILE};
-use amux::config::ServerId;
+use amux::identity::ServerId;
 use amux::protocol::{PublicKey, TrustedPeer};
 use common::{linked, FakeLan, FakeNetwork, TestServer, TIMEOUT};
 

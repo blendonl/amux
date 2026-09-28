@@ -21,7 +21,7 @@ cargo run -- ls --by project             # the same sessions, grouped by project
 cargo run -- projects                    # every project and where it is checked out
 cargo run -- project add [path]          # register the repo at path (default: here) with this server
 cargo run -- servers                     # status, latency and version of every server
-cargo run -- servers add laptop ssh://laptop
+cargo run -- servers add laptop ssh://laptop  # link to laptop and remember it in servers.lua
 cargo run -- servers remove laptop
 cargo run -- servers forget laptop       # drop laptop, its key and its addresses, and refuse that key from now on
 cargo run -- discover                    # what Tailscale and the LAN found, and how linking each machine goes
@@ -29,6 +29,8 @@ cargo run -- pair                        # open a pairing window on this machine
 cargo run -- pair k7-4821-9930           # on the other machine: pair with the one that printed the code
 cargo run -- pair k7-4821-9930 --host 192.168.0.24:40123  # the same, when multicast does not reach it
 cargo run -- pair --new-key              # pair with a new key, so a forgotten machine can come back
+cargo run -- config check                # load init.lua and servers.lua and say which files were read
+cargo run -- config defaults             # every default setting, as Lua for a starting init.lua
 cargo run -- kill-server                 # stop the server and all sessions
 ```
 
@@ -115,42 +117,56 @@ Panes are numbered from 0 in layout order. `attach -t work:1.0` makes window 1 a
 
 ### Config
 
-The server reads `$XDG_CONFIG_HOME/amux/config.toml` (usually `~/.config/amux/config.toml`) when it starts. `--config <path>` or `AMUX_CONFIG` points it somewhere else. A missing file means defaults, and unknown keys are an error, so a typo stops the server instead of being ignored.
+amux is configured in Lua. The server loads the config when it starts, and so do `amux servers add`, `amux servers remove` and `amux config`. It runs the first of these that applies:
 
-```toml
-name = "desktop"
-projects_dir = "~/projects"
+1. The file named by `--config <path>` or `AMUX_CONFIG`, which must exist
+2. `$XDG_CONFIG_HOME/amux/init.lua`, usually `~/.config/amux/init.lua`
+3. `/etc/amux/init.lua`, which amux only ever reads
+4. None, which means the built-in defaults
 
-[servers.laptop]
-address = "ssh://laptop"
-amux_path = "~/.cargo/bin/amux"
-socket = "default"
+Your `init.lua` replaces the system file rather than adding to it. To build on the system file, start yours with `dofile("/etc/amux/init.lua")`. `AMUX_CONFIG=/dev/null` runs amux with the defaults. `require` finds modules in the `lua/` directory next to `init.lua`.
 
-[projects.amux]
-default_server = "desktop"
-worktrees_dir = "~/projects/amux-worktrees"
+```lua
+local opt = amux.opt
 
-[discovery]
-tailscale = true
-lan = true
-tailscale_tags = ["tag:server"]
+opt.name = "desktop"
+opt.projects_dir = "~/projects"
 
-[lan]
-port = 0
+opt.servers.laptop = {
+  address = "ssh://laptop",
+  amux_path = "~/.cargo/bin/amux",
+  socket = "default",
+}
+
+opt.projects.amux = {
+  default_server = "desktop",
+  worktrees_dir = "~/projects/amux-worktrees",
+}
+
+opt.discovery.tailscale_tags = { "tag:server" }
+opt.lan.port = 7448
 ```
 
-`name` defaults to the hostname and `projects_dir` to `~/projects`. Each entry under `servers` is a peer to link to. Each entry under `projects` is keyed by project name: `default_server` is where `amux new` puts that project's sessions when you don't pass `--on`, and `worktrees_dir` is where its worktrees go instead of the default `<checkout>/../<project>-worktrees`.
+Every option has a built-in default, so a config only sets what it changes. `amux.opt` is strict: an unknown option or a value of the wrong type is an error that names the file and line, such as `init.lua:3: unknown option amux.opt.bogus, expected one of …`. Values that would break the server, such as a zero interval or a blank `name`, are errors too. A bad config stops the server before it starts listening, so a typo is never ignored.
 
-`[discovery]` controls how servers find each other without a config entry (see [Cluster](#cluster)):
+| Command                | Does                                                                                        |
+| ---------------------- | ------------------------------------------------------------------------------------------- |
+| `amux config check`    | Loads the config as the server and as the client, then prints the files it read             |
+| `amux config defaults` | Prints every default as assignments to `amux.opt`, which works as a starting `init.lua`     |
+| `amux config path`     | Prints where your `init.lua` is or goes: the `--config` file, or the one in the config dir  |
 
-| Key              | Default                                    | Means                                                                 |
+`name` defaults to the hostname and `projects_dir` to `~/projects`. A leading `~` in `projects_dir` and `worktrees_dir` means your home directory. Each entry under `servers` is a peer to link to. Each entry under `projects` is keyed by project name: `default_server` is where `amux new` puts that project's sessions when you don't pass `--on`, and `worktrees_dir` is where its worktrees go instead of the default `<checkout>/../<project>-worktrees`.
+
+`amux.opt.discovery` controls how servers find each other without a config entry (see [Cluster](#cluster)):
+
+| Option           | Default                                    | Means                                                                 |
 | ---------------- | ------------------------------------------ | --------------------------------------------------------------------- |
 | `tailscale`      | `true`                                     | Link to the machines on the tailnet and listen on the tailnet address |
 | `lan`            | `true`                                     | Find servers over mDNS, listen on the LAN and allow `amux pair`       |
-| `tailscale_tags` | `[]`                                       | Tailscale tags whose machines count as yours, such as `"tag:server"`  |
+| `tailscale_tags` | `{}`                                       | Tailscale tags whose machines count as yours, such as `"tag:server"`  |
 | `tailscale_port` | 7447, or a port derived from the `-L` name | The port of the tailnet listener, the same on every machine           |
 
-`[lan] port` is the port of the LAN listener. The default, `0`, takes a free port each time the listener opens, which mDNS then advertises. A fixed port helps with firewall rules and with `amux pair --host` without a port.
+`amux.opt.lan.port` is the port of the LAN listener. The default, `0`, takes a free port each time the listener opens, which mDNS then advertises. A fixed port helps with firewall rules and with `amux pair --host` without a port.
 
 A server's `address` is one of:
 
@@ -159,7 +175,21 @@ A server's `address` is one of:
 - `tcp://host:port`, which links over Noise to that address. The other server's key must already be trusted, or vouched for by the tailnet. Tailscale discovery uses this form.
 - `lan://<server id>`, the form LAN discovery uses. The IP addresses and port come from mDNS each time amux dials.
 
-`amux servers add` and `amux servers remove` edit the config file in place, keeping its comments, and tell a running server about the change. `amux servers forget` also removes the server from the config.
+#### servers.lua
+
+`amux servers add` and `amux servers remove` never edit `init.lua`. They rewrite `servers.lua`, which amux owns and which always sits in the config directory: next to the `--config` file when you pass one, otherwise in `$XDG_CONFIG_HOME/amux`. It holds data only, a table of servers that can't call functions or read globals:
+
+```lua
+return {
+  laptop = {
+    address = "ssh://laptop",
+  },
+}
+```
+
+amux loads `servers.lua` before `init.lua` and merges its entries into `amux.opt.servers`, so `init.lua` can read them, change them or add more. Assigning a whole table, as in `amux.opt.servers = { … }`, replaces all of them, including the ones from `servers.lua`. Set one server at a time instead: `amux.opt.servers.laptop = { … }`.
+
+A rewrite goes to a temporary file first, and replaces `servers.lua` only when the whole config still loads with it. `servers add` refuses a name that `init.lua` or `servers.lua` already has, and `servers remove` refuses a server that only `init.lua` sets and tells you to remove it there. Both then tell a running server about the change. `amux servers forget` removes the server from `servers.lua` too. When `init.lua` also sets it, the server is still forgotten, and amux says it is still in `init.lua`.
 
 Each server also has a random ID, stored in `$XDG_STATE_HOME/amux/<socket name>/server-id`, and a fresh incarnation ID every time it starts. The log shows both. Its Noise key and the keys it trusts live next to the ID (see [Trust](#trust)).
 
@@ -168,6 +198,8 @@ Each server also has a random ID, stored in `$XDG_STATE_HOME/amux/<socket name>/
 Every connection starts with a greeting that carries the protocol version. When the client and the running server speak different major versions, the client names both and asks you to run `amux kill-server`. `kill-server` also works on a server that is too old to answer the greeting.
 
 This version speaks protocol 7, which added the Noise keys, trust updates and discovery, so every machine in the cluster needs the new build. Servers on different major versions refuse to link, and `amux servers` lists the older one as `incompatible, runs amux … (protocol 6.0)`. An older build doesn't listen on TCP, so Tailscale and LAN discovery can't reach it either. The cluster cache of the older build still loads.
+
+amux no longer reads `config.toml`. Move its settings into `init.lua` as assignments to `amux.opt`: `name = "desktop"` becomes `amux.opt.name = "desktop"`, a `[servers.laptop]` table with `address = "ssh://laptop"` becomes `amux.opt.servers.laptop = { address = "ssh://laptop" }`, and `tailscale = false` under `[discovery]` becomes `amux.opt.discovery.tailscale = false`. Then run `amux config check`, and restart the server with `amux kill-server` so it loads the new file.
 
 ### Cluster
 
@@ -205,14 +237,14 @@ Discovery only links servers that are already running, because nothing starts a 
 
 Servers on one tailnet link on their own. There is nothing to configure, no SSH and no keys to copy, because the tailnet vouches for each machine.
 
-- Every 30 seconds a server reads `tailscale status --json` and dials the peers that are online, run Linux, macOS, FreeBSD or OpenBSD, and either belong to the same Tailscale user as this machine or carry a tag listed in `[discovery] tailscale_tags`. It dials them at `tcp://<tailnet IPv4>:<port>`. Phones, sleeping machines and other users' machines are never dialed.
-- A server listens on its own tailnet IPv4 address and nowhere else, at port 7447 for the default socket. Any other `-L` name gets a port between 7448 and 7947 derived from the name, so servers with the same `-L` name find each other. `[discovery] tailscale_port` sets the port. A server dials its peers at its own port setting, so give every machine the same one. The listener follows the tailnet address as it appears, changes or goes away, and a server dials its tailnet peers from that address.
+- Every 30 seconds a server reads `tailscale status --json` and dials the peers that are online, run Linux, macOS, FreeBSD or OpenBSD, and either belong to the same Tailscale user as this machine or carry a tag listed in `amux.opt.discovery.tailscale_tags`. It dials them at `tcp://<tailnet IPv4>:<port>`. Phones, sleeping machines and other users' machines are never dialed.
+- A server listens on its own tailnet IPv4 address and nowhere else, at port 7447 for the default socket. Any other `-L` name gets a port between 7448 and 7947 derived from the name, so servers with the same `-L` name find each other. `amux.opt.discovery.tailscale_port` sets the port. A server dials its peers at its own port setting, so give every machine the same one. The listener follows the tailnet address as it appears, changes or goes away, and a server dials its tailnet peers from that address.
 - The first time two servers meet, neither trusts the other's key, so each asks `tailscale whois` about the other's tailnet address: the dialing side about the address it dialed, the accepting side about the address the connection came from. The tailnet vouches for a machine of the same user, or one with an allowed tag, as long as it isn't this machine's own node. Each side then trusts the other's key first hand and needs no whois for it again. If whois fails, for example because `tailscaled` is down, the link is refused, so an address in 100.64.0.0/10 that isn't on the tailnet is never trusted.
 - Tailscale gives every tagged machine the same owner, so a tagged machine accepts other machines by tag only. Two tagged machines link when each lists the other's tag in `tailscale_tags`. A tagged and an untagged machine never link on their own, because the untagged one carries no tag the tagged one could accept. Pair them on the LAN or link them over SSH instead.
 - A machine that goes offline or leaves the tailnet is not dialed again, through any address discovery found or a peer passed on, until Tailscale lists it as online again. Addresses in the config are still dialed.
 - A tailnet machine shows up in `amux servers`, `amux ls` and the status bar only once amux has reached an amux server there. Until then only `amux discover` lists it, and its retries back off up to 10 minutes.
 
-`[discovery] tailscale = false` turns this off. When Tailscale isn't installed, the server logs it once and stops looking. `AMUX_DISCOVERY_INTERVAL_MS` changes how often it reads the status, which the tests use to see changes quickly.
+`amux.opt.discovery.tailscale = false` turns this off. When Tailscale isn't installed, the server logs it once and stops looking. `AMUX_DISCOVERY_INTERVAL_MS` changes how often it reads the status, which the tests use to see changes quickly.
 
 #### On the LAN, with a pairing code
 
@@ -234,14 +266,14 @@ paired with laptop (5be0c7a1f29d4e8b93a6d10c7e42f851), key fingerprint 3f9a:1c07
 
 The first part of the code, `k7`, names the pairing window, which the server advertises over mDNS while it is open. The eight digits are the secret. `amux pair k7-4821-9930` on the other machine finds the server that advertises `k7`, pairs with it, and prints the same warning and a `paired with` line naming the first machine.
 
-- Where multicast doesn't get through, as on many guest and office networks, add `--host <ip[:port]>` with the first machine's IP address and the port `amux pair` printed. It takes an IP address, not a host name. Without a port, amux uses the port that mDNS saw for that address, or this machine's own `[lan] port` if it is set. The joining machine doesn't need LAN discovery for this.
+- Where multicast doesn't get through, as on many guest and office networks, add `--host <ip[:port]>` with the first machine's IP address and the port `amux pair` printed. It takes an IP address, not a host name. Without a port, amux uses the port that mDNS saw for that address, or this machine's own `amux.opt.lan.port` if it is set. The joining machine doesn't need LAN discovery for this.
 - A window is good for one pairing and five minutes. It also closes after three attempts or when you leave `amux pair`, and only one `amux pair` can wait on a server at a time. One pairing connection runs at a time, and an attempt counts as soon as its first pairing message arrives. A wrong code fails on the machine that tried it, and the waiting machine prints how many attempts are left.
 - The code itself never crosses the network. The two machines open a Noise connection and run SPAKE2 inside it, bound to both machines' keys and to that connection's handshake, so the exchange only succeeds between the two machines that hold the code.
 - Pairing merges two clusters. The two machines trust each other first hand, the pairing connection becomes their first link, and trust spreads from there (see [Trust](#trust)): every machine linked to either one learns the keys of the other cluster and links to those machines wherever it can reach them. That is what the warning at the top is about.
 - Afterwards the two find each other over mDNS whenever they share a LAN, even when DHCP moves them. Their address is `lan://<server id>`, and amux looks up the current IP addresses and port each time it dials.
 - `amux pair --new-key`, with or without a code, gives this server a new key before it pairs. That is how a forgotten machine comes back.
 
-A server browses for `_amux._tcp.local.` on every interface except loopback and interfaces named `tailscale*`, `utun*`, `docker*`, `br-*` and `veth*`. It advertises itself only while its LAN listener is open (see [Listening ports](#listening-ports)), with its server ID as the instance name and its name, key, `-L` socket name, protocol version and any open pairing window in the TXT record. Servers with another `-L` name are ignored. `[discovery] lan = false` turns off LAN discovery and the LAN listener, and `amux pair` then only works on the joining side, with `--host`.
+A server browses for `_amux._tcp.local.` on every interface except loopback and interfaces named `tailscale*`, `utun*`, `docker*`, `br-*` and `veth*`. It advertises itself only while its LAN listener is open (see [Listening ports](#listening-ports)), with its server ID as the instance name and its name, key, `-L` socket name, protocol version and any open pairing window in the TXT record. Servers with another `-L` name are ignored. `amux.opt.discovery.lan = false` turns off LAN discovery and the LAN listener, and `amux pair` then only works on the joining side, with `--host`.
 
 #### Over SSH, configured by hand
 
@@ -262,7 +294,7 @@ Cluster membership means full trust: any member can open a shell on any other, a
 
 `amux servers forget <name or id>` takes a machine out of the cluster for good:
 
-- It drops the link, the server's record, every address of it, its entry in the config and its key.
+- It drops the link, the server's record, every address of it, its entry in `servers.lua` and its key. An entry in `init.lua` stays, and amux tells you to remove it there.
 - It records a tombstone for that server ID and key and sends it through the cluster, so every member forgets the machine too and closes its links to it.
 - The keys the forgotten server introduced go as well, unless a member saw them first hand.
 - From then on the server is refused on every transport and discovery skips it. This is permanent for that key. To bring the machine back, run `amux pair --new-key` on it and pair it with any member: it gets a new key and rejoins the whole cluster, and its old key stays out.
@@ -300,10 +332,10 @@ LAN servers this machine trusts show `paired, ` before their status. A refusal s
 
 With both discovery sources off, amux opens no ports. Otherwise it listens on TCP in two cases, and only for other amux servers: clients always use the unix socket, and a TCP connection that greets as a client is refused.
 
-| Listener | Address                                                    | Open while                                                                           | Turn it off                     |
-| -------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------ | ------------------------------- |
-| Tailnet  | This machine's tailnet IPv4, port 7447 or `tailscale_port` | Tailscale discovery runs and Tailscale is up with an IPv4 address for this machine   | `[discovery] tailscale = false` |
-| LAN      | Every interface (`0.0.0.0`), `[lan] port` or a free port   | LAN discovery is on and the trust store holds a key or an `amux pair` window is open | `[discovery] lan = false`       |
+| Listener | Address                                                         | Open while                                                                           | Turn it off                             |
+| -------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------ | --------------------------------------- |
+| Tailnet  | This machine's tailnet IPv4, port 7447 or `tailscale_port`      | Tailscale discovery runs and Tailscale is up with an IPv4 address for this machine   | `amux.opt.discovery.tailscale = false`  |
+| LAN      | Every interface (`0.0.0.0`), `amux.opt.lan.port` or a free port | LAN discovery is on and the trust store holds a key or an `amux pair` window is open | `amux.opt.discovery.lan = false`        |
 
 - The LAN listener writes its port to `$XDG_STATE_HOME/amux/<socket name>/lan-port` while it is open and advertises it over mDNS. It closes again when the trust store is empty and no window is open.
 - LAN discovery also takes part in mDNS on UDP port 5353 whenever it is on, to browse for other servers, and answers for this server only while the LAN listener is open.
@@ -370,8 +402,11 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 | `src/main.rs`                | Parses the command line and dispatches                                                                             |
 | `src/lib.rs`                 | The library the binary and the tests share                                                                         |
 | `src/cli.rs`                 | Command-line interface                                                                                             |
-| `src/paths.rs`               | Runtime, config and state paths                                                                                    |
-| `src/config.rs`              | Config file, server ID and incarnation                                                                             |
+| `src/paths.rs`               | Runtime, config and state paths, and the `init.lua` lookup order                                                   |
+| `src/config/`                | `amux config check`, `defaults` and `path`, and the checked, atomic rewrites of `servers.lua`                      |
+| `src/identity.rs`            | Server ID, incarnation and hostname                                                                                |
+| `src/settings/`              | Every setting with its built-in default, as one `Settings` tree                                                    |
+| `src/lua/`                   | The Lua runtime: the strict `amux.opt`, the `amux` API, data files like `servers.lua` and the Lua writer           |
 | `src/target.rs`              | `session@server` targets: parsing, validation and resolution                                                       |
 | `src/project/id.rs`          | Project ids from origin URLs, local paths and root commits                                                         |
 | `src/project/detect.rs`      | Finding the project, branch and main checkout of a directory                                                       |
@@ -453,5 +488,6 @@ Phases 1 to 7 of the design are done. What remains is its phase 8, "Later":
 
 Beyond the design:
 
-- [ ] Prefix key, shell and key bindings in the config file
+- [x] A Lua config: `init.lua` and `servers.lua` in place of `config.toml`, and `amux config check`, `defaults` and `path`
+- [ ] Prefix key and key bindings from the config in the client, which still uses the defaults
 - [ ] Scrollback and copy mode

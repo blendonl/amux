@@ -73,7 +73,7 @@ A peer link is a byte stream that carries the same length-prefixed postcard fram
 - **Authentication.** A link records how it was authenticated: `Ssh`, or `Noise { key, vouched_by }`, where the trust store, the tailnet or a pairing vouches for the key. A Noise key that nothing vouches for, or that was forgotten, is refused right after the Noise handshake, before this server sends its `Hello`. When the peer's `Hello` arrives, its server ID must be the one the trust store binds to the key. A key the tailnet or a pairing vouched for becomes trusted first hand instead, as does the key in the `Hello` of an SSH or exec link. A key that another server ID already holds is never trusted, and a Noise link that presents one is refused.
 - **Tailnet whois.** When a Noise key isn't trusted yet and the other end is on the tailnet (100.64.0.0/10, `fd7a:115c:a1e0::/48` or an address `tailscale status` lists), each side runs `tailscale whois --json` on the other's address: the dialer on the address it dialed, the acceptor on the connection's source. The dialer binds its own tailnet address as the source so that the acceptor sees it. The tailnet vouches for a node with a tag from `tailscale_tags` or, when this machine isn't tagged itself, a node of this machine's user. It never vouches for this machine's own node. Lookups are cached for five seconds, and a failed lookup vouches for nobody.
 - **Pairing.** A `Pair` connection runs the same Noise handshake and then SPAKE2 (Ed25519 group), with the code's eight digits as the password. Each side's SPAKE2 identity is a side label, that side's static key and the Noise handshake hash, so the shared key is bound to both static keys and to this handshake. The joiner confirms first with an HMAC-SHA256 over the handshake hash and both SPAKE2 messages, the host answers with its own HMAC, ID and name, and the joiner sends its ID and name. Both then trust the other's key first hand, and the connection carries on as a peer link.
-- **Listeners.** amux listens on TCP only for peers, and only in two cases. The tailnet listener binds this machine's tailnet IPv4 while Tailscale discovery runs and Tailscale reports one, at 7447 for the default socket, a port in 7448–7947 derived from any other socket name, or `tailscale_port`, and re-binds when the address changes. The LAN listener binds `0.0.0.0` at `[lan] port` (a free port by default) while LAN discovery is on and the trust store holds a key or a pairing window is open, and writes its port to `<state>/lan-port`. Before authentication a connection has ten seconds, at most sixteen handshakes run at once and further connections are dropped, and one pairing connection runs at a time. With both discovery sources off, amux opens no ports.
+- **Listeners.** amux listens on TCP only for peers, and only in two cases. The tailnet listener binds this machine's tailnet IPv4 while Tailscale discovery runs and Tailscale reports one, at 7447 for the default socket, a port in 7448–7947 derived from any other socket name, or `tailscale_port`, and re-binds when the address changes. The LAN listener binds `0.0.0.0` at `amux.opt.lan.port` (a free port by default) while LAN discovery is on and the trust store holds a key or a pairing window is open, and writes its port to `<state>/lan-port`. Before authentication a connection has ten seconds, at most sixteen handshakes run at once and further connections are dropped, and one pairing connection runs at a time. With both discovery sources off, amux opens no ports.
 - **Tailscale** also works through SSH: `ssh://desktop`, served by a normal sshd over the tailnet or by Tailscale SSH.
 
 The trust model is that **cluster membership means full trust**. Any server in the cluster can spawn shells on any other, which gives the same access as SSH to that machine. A cluster is one user's machines, and every link runs as that user. A machine joins in one of three ways, and each one proves who it is: an SSH login, a tailnet that vouches for it as the same user's machine or an allowed tag, or a pairing code entered on both machines. Its key then spreads through the cluster, so joining through one member joins all of them, and `amux servers forget` takes a machine out everywhere. Nothing links without authentication.
@@ -111,7 +111,7 @@ The trust model is that **cluster membership means full trust**. Any server in t
 
 ### Forget
 
-`amux servers forget <name|id>` works on any peer, configured, gossiped or discovered. It drops the link, the peer record and every target of that peer, removes configured entries from the config file, drops the key, and records and gossips the `{ id, key }` tombstone. `check()` then refuses the forgotten ID or key on every transport, discovery skips it, and the keys it introduced go too. The only way back is a new key: `amux pair --new-key` on that machine rotates `<state>/noise-key` atomically, and pairing it with any member clears the tombstone for its ID there.
+`amux servers forget <name|id>` works on any peer, configured, gossiped or discovered. It drops the link, the peer record and every target of that peer, removes configured entries from `servers.lua` (an entry that `init.lua` sets stays, and the reply says so), drops the key, and records and gossips the `{ id, key }` tombstone. `check()` then refuses the forgotten ID or key on every transport, discovery skips it, and the keys it introduced go too. The only way back is a new key: `amux pair --new-key` on that machine rotates `<state>/noise-key` atomically, and pairing it with any member clears the tombstone for its ID there.
 
 ## State sync
 
@@ -215,27 +215,33 @@ Inside a session, `Ctrl-b s` opens a tree of servers, projects, sessions and win
 
 ## Config
 
-Each machine has its own `~/.config/amux/config.toml`:
+Each machine has its own Lua config. amux runs the first of `--config` or `AMUX_CONFIG`, `~/.config/amux/init.lua` (under `$XDG_CONFIG_HOME`) and `/etc/amux/init.lua`, and uses the built-in defaults when there is none. The user file replaces the system file, and amux never writes `/etc`:
 
-```toml
-name = "desktop"
-projects_dir = "~/projects"
+```lua
+local opt = amux.opt
 
-[servers.laptop]
-address = "ssh://laptop"
+opt.name = "desktop"
+opt.projects_dir = "~/projects"
 
-[servers.home-server]
-address = "ssh://notpc@home-server"
-amux_path = "~/.cargo/bin/amux"
+opt.servers.laptop = { address = "ssh://laptop" }
+opt.servers["home-server"] = {
+  address = "ssh://notpc@home-server",
+  amux_path = "~/.cargo/bin/amux",
+}
 
-[projects.amux]
-default_server = "desktop"
-worktrees_dir = "~/projects/amux-worktrees"
+opt.projects.amux = {
+  default_server = "desktop",
+  worktrees_dir = "~/projects/amux-worktrees",
+}
 ```
+
+Every option lives in one `Settings` tree with a built-in default in Rust, and `amux.opt` is a strict view of it that rejects unknown options and wrong types at the line that sets them. The loaded tree is then checked for values that would break the server, such as a zero interval. Either kind of error stops the server before it listens.
+
+`amux servers add` and `remove` write only `servers.lua`, a data file in the config directory that amux owns. It is merged into `amux.opt.servers` before `init.lua` runs, so `init.lua` can read and override its entries. Each rewrite is checked by loading the whole config with it, then renamed into place.
 
 `amux_path` covers machines where amux is neither on the `PATH` of a non-interactive ssh shell nor in `~/.cargo/bin`, `~/.local/bin`, `/usr/local/bin` or `/opt/homebrew/bin`.
 
-`[discovery]` turns Tailscale discovery (`tailscale`) and LAN discovery (`lan`) on and off, both on by default, and takes `tailscale_tags` and `tailscale_port`. `[lan] port` fixes the LAN listener's port, which is otherwise a free one.
+`amux.opt.discovery` turns Tailscale discovery (`tailscale`) and LAN discovery (`lan`) on and off, both on by default, and takes `tailscale_tags` and `tailscale_port`. `amux.opt.lan.port` fixes the LAN listener's port, which is otherwise a free one.
 
 ## Failure
 
@@ -250,7 +256,10 @@ worktrees_dir = "~/projects/amux-worktrees"
 
 | Path                      | Responsibility                                      |
 | ------------------------- | --------------------------------------------------- |
-| `src/config.rs`           | Config file, server name and ID                     |
+| `src/config/`             | `amux config` and the rewrites of `servers.lua`     |
+| `src/identity.rs`         | Server ID, incarnation and hostname                 |
+| `src/settings/`           | Every setting and its built-in default              |
+| `src/lua/`                | The Lua runtime, `amux.opt` and Lua data files      |
 | `src/target.rs`           | Target parsing and resolution                       |
 | `src/project.rs`          | Git detection, project identity, worktrees          |
 | `src/protocol/`           | Client protocol, peer protocol, framing, versioning |

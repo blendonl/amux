@@ -20,6 +20,21 @@ pub fn chunk<T: Serialize + ?Sized>(value: &T) -> Result<String> {
     Ok(format!("return {}\n", literal(value)?))
 }
 
+pub fn assignments<T: Serialize + ?Sized>(target: &str, value: &T) -> Result<String> {
+    let Literal::Table(entries) = value.serialize(Emitter)? else {
+        anyhow::bail!("only the fields of a table can be assigned to {target}");
+    };
+    let mut out = String::new();
+    for (key, value) in entries.iter().filter(|(_, value)| !value.is_empty()) {
+        out.push_str(target);
+        key.write_index(&mut out);
+        out.push_str(" = ");
+        value.write(&mut out, 0);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 enum Literal {
     Nil,
     Boolean(bool),
@@ -39,6 +54,14 @@ enum Key {
 impl Literal {
     fn is_scalar(&self) -> bool {
         !matches!(self, Self::List(_) | Self::Table(_))
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::List(items) => items.is_empty(),
+            Self::Table(entries) => entries.is_empty(),
+            _ => false,
+        }
     }
 
     fn write(&self, out: &mut String, depth: usize) {
@@ -71,6 +94,24 @@ impl Literal {
 }
 
 impl Key {
+    fn write_index(&self, out: &mut String) {
+        if let Self::String(name) = self {
+            if let Some(name) = identifier(name) {
+                out.push('.');
+                out.push_str(name);
+                return;
+            }
+        }
+        match self {
+            Self::String(name) => {
+                out.push('[');
+                write_string(out, name);
+                out.push(']');
+            }
+            Self::Integer(_) => self.write(out),
+        }
+    }
+
     fn write(&self, out: &mut String) {
         match self {
             Self::String(name) => match identifier(name) {
@@ -525,7 +566,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::lua::data;
+    use crate::lua::{data, runtime, Process};
     use crate::settings::Settings;
 
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -599,6 +640,53 @@ mod tests {
              }"
         );
         assert_eq!(literal(&sample()).unwrap(), literal(&sample()).unwrap());
+    }
+
+    #[test]
+    fn assignments_set_each_field_and_skip_empty_tables() {
+        assert_eq!(
+            assignments("config", &sample()).unwrap(),
+            "config.alpha = \"a\"\n\
+             config.servers = {\n\
+             \x20 [\"end\"] = 1,\n\
+             \x20 [\"my-host\"] = 22,\n\
+             \x20 web = 80,\n\
+             }\n\
+             config.shapes = {\n\
+             \x20 \"dot\",\n\
+             \x20 {\n\
+             \x20   circle = 2,\n\
+             \x20 },\n\
+             \x20 {\n\
+             \x20   line = {\n\
+             \x20     length = 3,\n\
+             \x20   },\n\
+             \x20 },\n\
+             }\n\
+             config.tags = { \"x\", \"y\" }\n\
+             config.zeta = true\n"
+        );
+        let odd = BTreeMap::from([("my-host", 1), ("end", 2)]);
+        assert_eq!(
+            assignments("t", &odd).unwrap(),
+            "t[\"end\"] = 2\nt[\"my-host\"] = 1\n"
+        );
+        assert!(assignments("t", &[1, 2]).is_err());
+        assert!(assignments("t", &5).is_err());
+    }
+
+    #[test]
+    fn default_settings_assigned_to_amux_opt_load_unchanged() {
+        let written = assignments("amux.opt", &Settings::default()).unwrap();
+        let loaded = runtime::load_init(&written, Process::Server).unwrap();
+        assert_eq!(loaded.settings, Settings::default());
+        assert!(
+            written.contains("amux.opt.escape_time_ms = 50\n"),
+            "{written}"
+        );
+        assert!(written.contains("amux.opt.cluster = {\n"), "{written}");
+        assert!(!written.contains("amux.opt.name"), "{written}");
+        assert!(!written.contains("amux.opt.servers"), "{written}");
     }
 
     #[test]

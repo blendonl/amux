@@ -10,7 +10,7 @@ use tokio::sync::{watch, Notify};
 use tracing::{debug, warn};
 
 use super::{Advertisement, LanDiscovery};
-use crate::config::ServerId;
+use crate::identity::ServerId;
 
 pub const LAN_DIR_ENV: &str = "AMUX_LAN_DIR";
 const TEMPORARY_SUFFIX: &str = ".tmp";

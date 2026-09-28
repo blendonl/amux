@@ -7,8 +7,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use nix::unistd::getuid;
 
+use crate::lua::{ConfigPaths, INIT_FILE, SYSTEM_INIT};
+
 const PRIVATE_DIR_MODE: u32 = 0o700;
-const CONFIG_FILE: &str = "config.toml";
+const CONFIG_DIR: &str = "amux";
 
 pub fn default_socket(name: &str) -> Result<PathBuf> {
     Ok(runtime_dir()?.join(name))
@@ -27,10 +29,38 @@ pub fn home_dir() -> Result<PathBuf> {
         .context("HOME is not set")
 }
 
-pub fn config_path() -> Result<PathBuf> {
-    Ok(xdg_dir("XDG_CONFIG_HOME", ".config")?
-        .join("amux")
-        .join(CONFIG_FILE))
+pub fn config_dir(given: Option<&Path>) -> Result<PathBuf> {
+    match given {
+        Some(init) => Ok(init
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_owned()),
+        None => Ok(xdg_dir("XDG_CONFIG_HOME", ".config")?.join(CONFIG_DIR)),
+    }
+}
+
+pub fn config_paths(given: Option<&Path>) -> Result<ConfigPaths> {
+    Ok(ConfigPaths::find(
+        config_dir(given)?,
+        given,
+        Path::new(SYSTEM_INIT),
+    ))
+}
+
+pub fn user_init(given: Option<&Path>) -> Result<PathBuf> {
+    match given {
+        Some(init) => Ok(init.to_owned()),
+        None => Ok(config_dir(None)?.join(INIT_FILE)),
+    }
+}
+
+pub fn expand_home(path: PathBuf, home: &Path) -> PathBuf {
+    match path.strip_prefix("~") {
+        Ok(rest) if rest.as_os_str().is_empty() => home.to_owned(),
+        Ok(rest) => home.join(rest),
+        Err(_) => path,
+    }
 }
 
 pub fn socket_name(socket: &Path) -> Result<String> {
@@ -83,4 +113,43 @@ fn runtime_dir() -> Result<PathBuf> {
         );
     }
     Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_leading_tilde_is_expanded() {
+        let home = Path::new("/home/tester");
+        assert_eq!(expand_home("~".into(), home), PathBuf::from("/home/tester"));
+        assert_eq!(
+            expand_home("~/a".into(), home),
+            PathBuf::from("/home/tester/a")
+        );
+        assert_eq!(
+            expand_home("~other/a".into(), home),
+            PathBuf::from("~other/a")
+        );
+        assert_eq!(expand_home("/srv/~".into(), home), PathBuf::from("/srv/~"));
+    }
+
+    #[test]
+    fn a_given_config_file_sets_the_config_dir() {
+        let given = Path::new("/etc/amux-test/desk.lua");
+        assert_eq!(
+            config_dir(Some(given)).unwrap(),
+            PathBuf::from("/etc/amux-test")
+        );
+        assert_eq!(
+            config_dir(Some(Path::new("init.lua"))).unwrap(),
+            PathBuf::from(".")
+        );
+        assert_eq!(user_init(Some(given)).unwrap(), given);
+
+        let paths = config_paths(Some(given)).unwrap();
+        assert_eq!(paths.dir, PathBuf::from("/etc/amux-test"));
+        assert_eq!(paths.init.as_deref(), Some(given));
+        assert_eq!(paths.servers, PathBuf::from("/etc/amux-test/servers.lua"));
+    }
 }

@@ -89,8 +89,8 @@ async fn concurrent_news_for_one_worktree_end_up_in_one_session() {
     let worktrees = repos.path("configured-worktrees");
     let server = TestServer::builder()
         .config(&format!(
-            "[projects.amux]\nworktrees_dir = {:?}",
-            path_str(&worktrees)
+            "amux.opt.projects.amux = {{ worktrees_dir = {} }}",
+            common::lua(path_str(&worktrees))
         ))
         .start();
     let checkout = repos.clone_to(&repos.path("work/amux"));
@@ -289,7 +289,7 @@ fn default_server_routes_a_project_session_to_that_server() {
     add_project(&b, &checkout);
     let a = TestServer::builder()
         .name("a")
-        .config("[projects.amux]\ndefault_server = \"b\"")
+        .config("amux.opt.projects.amux = { default_server = \"b\" }")
         .peer(&b)
         .start();
     a.wait_for_output(

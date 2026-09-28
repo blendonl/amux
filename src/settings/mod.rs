@@ -7,15 +7,18 @@ mod style;
 pub mod template;
 mod theme;
 
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 pub use callback::{CallbackId, CALLBACK_SLOT};
 pub use client::{StatusSettings, TreeSettings};
-pub use cluster::{ClusterSettings, DiscoverySettings, LanSettings, SshSettings};
+pub use cluster::{ClusterSettings, DiscoverySettings, LanSettings, ServerConfig, SshSettings};
 pub use host::{
-    BorderSettings, MouseSettings, PaneSettings, SessionSettings, WindowSettings, WorktreeSettings,
+    BorderSettings, MouseSettings, PaneSettings, ProjectConfig, SessionSettings, WindowSettings,
+    WorktreeSettings,
 };
 pub use keymap::{
     Binding, Keymap, PromptAction, Table, TreeAction, PREFIX_TABLE, PROMPT_TABLE, ROOT_TABLE,
@@ -25,10 +28,17 @@ pub use style::{Color, StyleSpec};
 pub use theme::Theme;
 
 use crate::keys::Key;
+use crate::paths;
+
+const DEFAULT_PROJECTS_DIR: &str = "~/projects";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
+    pub name: Option<String>,
+    pub projects_dir: PathBuf,
+    pub servers: BTreeMap<String, ServerConfig>,
+    pub projects: BTreeMap<String, ProjectConfig>,
     pub prefix: Key,
     pub escape_time_ms: u64,
     pub notice_ms: u64,
@@ -54,11 +64,75 @@ impl Settings {
     pub fn notice_time(&self) -> Duration {
         Duration::from_millis(self.notice_ms)
     }
+
+    pub fn expand_home(mut self, home: &Path) -> Self {
+        self.projects_dir = paths::expand_home(self.projects_dir, home);
+        for project in self.projects.values_mut() {
+            project.worktrees_dir = project
+                .worktrees_dir
+                .take()
+                .map(|dir| paths::expand_home(dir, home));
+        }
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self
+            .name
+            .as_deref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            return Err("amux.opt.name must not be blank".into());
+        }
+        if self.projects_dir.as_os_str().is_empty() {
+            return Err("amux.opt.projects_dir must not be empty".into());
+        }
+        let cluster = &self.cluster;
+        let positive = [
+            ("cluster.ping_interval_ms", cluster.ping_interval_ms),
+            ("cluster.missed_pings", u64::from(cluster.missed_pings)),
+            ("cluster.handshake_timeout_ms", cluster.handshake_timeout_ms),
+            ("cluster.connect_timeout_ms", cluster.connect_timeout_ms),
+            ("cluster.backoff_min_ms", cluster.backoff_min_ms),
+            (
+                "cluster.max_unverified_backoff_ms",
+                cluster.max_unverified_backoff_ms,
+            ),
+            ("cluster.status_interval_ms", cluster.status_interval_ms),
+            ("discovery.interval_ms", self.discovery.interval_ms),
+            ("lan.pairing_window_ms", self.lan.pairing_window_ms),
+            (
+                "worktrees.fetch_timeout_ms",
+                self.worktrees.fetch_timeout_ms,
+            ),
+        ];
+        if let Some((option, _)) = positive.iter().find(|(_, value)| *value == 0) {
+            return Err(format!("amux.opt.{option} must be a positive number"));
+        }
+        if cluster.backoff_min_ms > cluster.backoff_max_ms {
+            return Err(format!(
+                "amux.opt.cluster.backoff_min_ms ({}) must not be more than \
+                 amux.opt.cluster.backoff_max_ms ({})",
+                cluster.backoff_min_ms, cluster.backoff_max_ms
+            ));
+        }
+        if self.pane.shell.as_ref().is_some_and(Vec::is_empty) {
+            return Err("amux.opt.pane.shell must name a program".into());
+        }
+        if self.worktrees.suffix.is_empty() {
+            return Err("amux.opt.worktrees.suffix must not be empty".into());
+        }
+        Ok(())
+    }
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            name: None,
+            projects_dir: PathBuf::from(DEFAULT_PROJECTS_DIR),
+            servers: BTreeMap::new(),
+            projects: BTreeMap::new(),
             prefix: Key::ctrl('b'),
             escape_time_ms: 50,
             notice_ms: 3000,
@@ -157,6 +231,106 @@ mod tests {
             Some(Color::Indexed(12))
         );
         assert_eq!(settings.theme.pane_border, StyleSpec::EMPTY);
+    }
+
+    #[test]
+    fn the_defaults_are_valid() {
+        assert_eq!(Settings::default().validate(), Ok(()));
+        assert_eq!(Settings::default().name, None);
+        assert_eq!(
+            Settings::default().projects_dir,
+            PathBuf::from("~/projects")
+        );
+    }
+
+    #[test]
+    fn values_that_would_break_the_server_are_rejected() {
+        let rejected = |change: fn(&mut Settings)| {
+            let mut settings = Settings::default();
+            change(&mut settings);
+            settings.validate().unwrap_err()
+        };
+        assert_eq!(
+            rejected(|settings| settings.name = Some(" ".into())),
+            "amux.opt.name must not be blank"
+        );
+        assert_eq!(
+            rejected(|settings| settings.projects_dir = PathBuf::new()),
+            "amux.opt.projects_dir must not be empty"
+        );
+        assert_eq!(
+            rejected(|settings| settings.cluster.status_interval_ms = 0),
+            "amux.opt.cluster.status_interval_ms must be a positive number"
+        );
+        assert_eq!(
+            rejected(|settings| settings.cluster.missed_pings = 0),
+            "amux.opt.cluster.missed_pings must be a positive number"
+        );
+        assert_eq!(
+            rejected(|settings| settings.discovery.interval_ms = 0),
+            "amux.opt.discovery.interval_ms must be a positive number"
+        );
+        assert_eq!(
+            rejected(|settings| settings.cluster.backoff_min_ms = 120_000),
+            "amux.opt.cluster.backoff_min_ms (120000) must not be more than \
+             amux.opt.cluster.backoff_max_ms (60000)"
+        );
+        assert_eq!(
+            rejected(|settings| settings.pane.shell = Some(Vec::new())),
+            "amux.opt.pane.shell must name a program"
+        );
+        assert_eq!(
+            rejected(|settings| settings.worktrees.suffix.clear()),
+            "amux.opt.worktrees.suffix must not be empty"
+        );
+
+        let named = Settings {
+            name: Some("desk".into()),
+            ..Settings::default()
+        };
+        assert_eq!(named.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_leading_tilde_in_project_paths_means_the_home_directory() {
+        let settings = Settings {
+            projects: BTreeMap::from([
+                (
+                    "amux".into(),
+                    ProjectConfig {
+                        default_server: Some("desk".into()),
+                        worktrees_dir: Some("~/trees/amux".into()),
+                    },
+                ),
+                ("notes".into(), ProjectConfig::default()),
+                (
+                    "srv".into(),
+                    ProjectConfig {
+                        default_server: None,
+                        worktrees_dir: Some("/srv/~".into()),
+                    },
+                ),
+            ]),
+            ..Settings::default()
+        }
+        .expand_home(Path::new("/home/tester"));
+
+        assert_eq!(
+            settings.projects_dir,
+            PathBuf::from("/home/tester/projects")
+        );
+        assert_eq!(
+            settings.projects["amux"],
+            ProjectConfig {
+                default_server: Some("desk".into()),
+                worktrees_dir: Some("/home/tester/trees/amux".into()),
+            }
+        );
+        assert_eq!(settings.projects["notes"], ProjectConfig::default());
+        assert_eq!(
+            settings.projects["srv"].worktrees_dir,
+            Some(PathBuf::from("/srv/~"))
+        );
     }
 
     #[test]

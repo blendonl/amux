@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     ClientMessage, ProjectCheckout, PublicKey, ServerMessage, SessionId, SessionInfo, Version,
 };
-use crate::config::{Incarnation, ServerId};
+use crate::identity::{Incarnation, ServerId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ChannelId(pub u64);

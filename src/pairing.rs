@@ -16,8 +16,8 @@ use tokio::time::Instant;
 use tracing::{debug, info};
 
 use crate::cluster::{noise, Cluster, NoiseKey, Secured, Voucher, Witnessed};
-use crate::config::ServerId;
 use crate::discovery::{lan, Discovery};
+use crate::identity::ServerId;
 use crate::protocol::{
     self, ClientMessage, Duplex, PublicKey, ServerMessage, SourceState, TcpKind,
 };

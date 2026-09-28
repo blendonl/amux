@@ -3,7 +3,7 @@ mod common;
 use std::fs;
 
 use amux::cluster::NoiseKey;
-use amux::config::{Incarnation, ServerId};
+use amux::identity::{Incarnation, ServerId};
 use amux::protocol::{self, Hello, PeerMessage, Role, Version, PROTOCOL_MAJOR};
 use common::TestServer;
 use tokio::net::UnixStream;
@@ -95,23 +95,26 @@ fn the_server_id_survives_a_restart_and_the_incarnation_does_not() {
 
 #[test]
 fn an_invalid_config_stops_the_server_from_starting() {
-    let server = TestServer::builder().config("prefix = \"C-a\"").prepare();
+    let server = TestServer::builder()
+        .config("amux.opt.bogus = true")
+        .prepare();
 
     let output = server.run(&["server"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
-    assert!(stderr.contains("unknown field `prefix`"), "{stderr}");
+    assert!(stderr.contains("unknown option amux.opt.bogus"), "{stderr}");
     assert!(
-        stderr.contains(&server.config_path().display().to_string()),
+        stderr.contains(&format!("{}:2:", server.config_path().display())),
         "{stderr}"
     );
+    assert!(!server.socket().exists());
 }
 
 #[test]
 fn the_config_flag_and_environment_variable_override_the_default_path() {
     let server = TestServer::builder().prepare();
-    let custom = server.root().join("custom.toml");
-    fs::write(&custom, "bogus = true\n").unwrap();
+    let custom = server.root().join("custom.lua");
+    fs::write(&custom, "amux.opt.bogus = true\n").unwrap();
     let custom = custom.to_str().unwrap();
 
     let flag = server.run(&["--config", custom, "server"]);

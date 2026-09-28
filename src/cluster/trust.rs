@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::ServerId;
+use crate::identity::ServerId;
 use crate::protocol::{ForgottenPeer, PublicKey, TrustUpdate, TrustedPeer};
 
 pub const TRUST_FILE: &str = "trust.toml";

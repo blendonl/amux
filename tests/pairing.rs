@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use amux::cluster::{NoiseKey, TrustStore, NOISE_KEY_FILE, TRUST_FILE};
-use amux::config::ServerId;
+use amux::identity::ServerId;
 use amux::protocol::{PublicKey, TrustedPeer};
 use common::{FakeLan, FakeNetwork, TestServer, TIMEOUT};
 use nix::sys::signal::{kill, Signal};

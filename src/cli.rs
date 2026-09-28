@@ -31,7 +31,7 @@ pub struct Cli {
         global = true,
         env = "AMUX_CONFIG",
         value_name = "PATH",
-        help = "Config file, defaults to $XDG_CONFIG_HOME/amux/config.toml"
+        help = "Lua config file to use instead of $XDG_CONFIG_HOME/amux/init.lua or /etc/amux/init.lua; servers.lua is read from its directory"
     )]
     pub config: Option<PathBuf>,
 
@@ -92,6 +92,12 @@ pub enum Command {
         about = "Pair with a server on the LAN: run it without a code on one machine, then with the code it prints on the other"
     )]
     Pair(PairArgs),
+
+    #[command(
+        subcommand,
+        about = "Check the Lua config, print its defaults or its path"
+    )]
+    Config(ConfigAction),
 
     #[command(about = "Stop the server and every session it owns")]
     KillServer,
@@ -171,6 +177,20 @@ pub enum ProjectAction {
     },
 }
 
+#[derive(Debug, Clone, Copy, Subcommand)]
+pub enum ConfigAction {
+    #[command(
+        about = "Load the config as the client and the server do, and print the files it read"
+    )]
+    Check,
+
+    #[command(about = "Print every default as Lua assignments to amux.opt, a valid init.lua")]
+    Defaults,
+
+    #[command(about = "Print the path of your init.lua, whether or not it exists yet")]
+    Path,
+}
+
 #[derive(Debug, Args)]
 pub struct AttachArgs {
     #[arg(
@@ -221,17 +241,17 @@ pub struct ServersArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ServersAction {
-    #[command(about = "Add a server to the config and link to it")]
+    #[command(about = "Add a server to servers.lua and link to it")]
     Add(AddServerArgs),
 
-    #[command(visible_alias = "rm", about = "Remove a server from the config")]
+    #[command(visible_alias = "rm", about = "Remove a server from servers.lua")]
     Remove {
-        #[arg(help = "Name of the server in the config")]
+        #[arg(help = "Name of the server in servers.lua")]
         name: String,
     },
 
     #[command(
-        about = "Forget a server: drop its link and addresses, remove it from the config and refuse it from now on"
+        about = "Forget a server: drop its link and addresses, remove it from servers.lua and refuse it from now on"
     )]
     Forget {
         #[arg(help = "Name or id of the server")]

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -153,6 +154,13 @@ impl Default for WorktreeSettings {
             fetch_timeout_ms: 30_000,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectConfig {
+    pub default_server: Option<String>,
+    pub worktrees_dir: Option<PathBuf>,
 }
 
 #[cfg(test)]

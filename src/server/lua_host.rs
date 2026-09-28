@@ -481,8 +481,8 @@ mod tests {
     use super::super::{SessionName, SessionSpec};
     use super::*;
     use crate::cluster::{ClusterOptions, NoiseKey, TrustStore};
-    use crate::config::{Config, Incarnation, ServerId, ServerIdentity};
     use crate::discovery::DiscoveryOptions;
+    use crate::identity::{Incarnation, ServerId, ServerIdentity};
     use crate::lua::{EVENTS, INIT_FILE};
     use crate::project::Registry;
     use crate::protocol::{Size, Version};
@@ -558,10 +558,7 @@ mod tests {
     fn start_in(dir: TempDir, source: &str) -> Hosted {
         let init = dir.path().join(INIT_FILE);
         fs::write(&init, source).unwrap();
-        let paths = ConfigPaths {
-            dir: dir.path().to_owned(),
-            init: Some(init),
-        };
+        let paths = ConfigPaths::new(dir.path().to_owned(), Some(init));
         let logs = Logs::default();
         let (settings, host) =
             tracing::subscriber::with_default(logs.subscriber(), || LuaHost::start(paths)).unwrap();
@@ -840,7 +837,6 @@ mod tests {
             name: name.clone(),
             incarnation: Incarnation::random().unwrap(),
         };
-        let config = Config::parse("", dir, &name).unwrap();
         let registry = Registry::load(&dir.join("projects.toml")).unwrap();
         let discovery = DiscoveryOptions {
             settings: settings.discovery.clone(),
@@ -861,9 +857,8 @@ mod tests {
         };
         Server::new(
             identity,
-            config,
             settings,
-            dir.join(INIT_FILE),
+            ConfigPaths::new(dir.to_owned(), Some(dir.join(INIT_FILE))),
             registry,
             options,
             discovery,

@@ -23,14 +23,15 @@ use tokio::sync::mpsc;
 
 use crate::cli::{Grouping, NewArgs};
 use crate::cluster::{Address, LAN_PORT_FILE};
-use crate::config::{self, ServerConfig};
+use crate::config;
+use crate::lua::ConfigPaths;
 use crate::paths;
 use crate::project::{self, Detected};
 use crate::protocol::{
     self, is_locale_variable, ClientMessage, DebugCommand, Duplex, IncompatibleServer, NewSession,
     ProjectRef, Role, ServerMessage, ServerView, SessionInfo, Version,
 };
-use crate::settings::{Keymap, Settings};
+use crate::settings::{Keymap, ServerConfig, Settings};
 use crate::target::{self, Target};
 use relay::Relay;
 use terminal::RawTerminal;
@@ -224,18 +225,25 @@ pub async fn list_servers(endpoint: &Endpoint) -> Result<()> {
 
 pub async fn add_server(endpoint: &Endpoint, name: String, server: ServerConfig) -> Result<()> {
     server.address.parse::<Address>()?;
-    config::add_server(&config_path(endpoint)?, &name, &server)?;
+    config::add_server(&config_paths(endpoint)?, &name, &server)?;
     notify_running_server(endpoint, ClientMessage::AddServer { name, server }).await
 }
 
 pub async fn remove_server(endpoint: &Endpoint, name: String) -> Result<()> {
-    config::remove_server(&config_path(endpoint)?, &name)?;
+    config::remove_server(&config_paths(endpoint)?, &name)?;
     notify_running_server(endpoint, ClientMessage::RemoveServer { name }).await
 }
 
 pub async fn forget_server(endpoint: &Endpoint, server: String) -> Result<()> {
     let connection = handshake(connect_or_start_server(endpoint).await?).await?;
-    expect_done(request_reply(connection, ClientMessage::ForgetServer { name: server }).await?)
+    match request_reply(connection, ClientMessage::ForgetServer { name: server }).await? {
+        ServerMessage::Done => Ok(()),
+        ServerMessage::Notice(notice) => {
+            eprintln!("amux: {notice}");
+            Ok(())
+        }
+        other => bail!("unexpected reply from server: {other:?}"),
+    }
 }
 
 pub async fn discover(endpoint: &Endpoint) -> Result<()> {
@@ -416,11 +424,8 @@ async fn notify_running_server(endpoint: &Endpoint, message: ClientMessage) -> R
     expect_done(request_reply(server, message).await?)
 }
 
-fn config_path(endpoint: &Endpoint) -> Result<PathBuf> {
-    match &endpoint.config {
-        Some(path) => Ok(path.clone()),
-        None => paths::config_path(),
-    }
+fn config_paths(endpoint: &Endpoint) -> Result<ConfigPaths> {
+    paths::config_paths(endpoint.config.as_deref())
 }
 
 async fn attach(

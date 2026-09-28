@@ -4,7 +4,7 @@ use std::str::FromStr;
 use anyhow::{bail, Context, Result};
 
 use super::ssh;
-use crate::config::ServerId;
+use crate::identity::ServerId;
 use crate::protocol::{LinkTransport, PublicKey};
 use crate::settings::SshSettings;
 

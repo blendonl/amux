@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::cluster::Cluster;
-use crate::config::ServerId;
+use crate::identity::ServerId;
 use crate::protocol::{DiscoveryReport, PublicKey, SourceState, SourceView, Via};
 use crate::settings::{DiscoverySettings, LanSettings};
 use lan::Lan;

@@ -21,8 +21,8 @@ use tokio::net::TcpStream;
 use tokio::sync::{broadcast, watch, Notify, Semaphore};
 use tracing::{debug, info, warn};
 
-use crate::config::{Incarnation, ServerConfig, ServerId, ServerIdentity};
 use crate::discovery::tailscale::Tailnet;
+use crate::identity::{Incarnation, ServerId, ServerIdentity};
 use crate::pairing::Pairing;
 use crate::protocol::{
     self, ClientMessage, DiscoveryStatus, DiscoveryView, Duplex, Event, Farewell, Hello, LinkInfo,
@@ -30,6 +30,7 @@ use crate::protocol::{
     ServerState, ServerStatus, ServerView, Snapshot, StateEvent, TcpKind, TrustUpdate, Version,
     Via,
 };
+use crate::settings::ServerConfig;
 use crate::settings::{ClusterSettings, DiscoverySettings, SshSettings};
 use cache::{Cache, CachedOrigin, CachedTarget, CACHE_FILE};
 pub use channel::{Channel, ChannelEnd, CREDIT_WINDOW};

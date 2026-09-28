@@ -1,17 +1,21 @@
+use std::collections::BTreeMap;
 use std::fs;
+use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use mlua::{Lua, Table};
+use mlua::{Lua, LuaSerdeExt, Table};
 
 use super::api::{self, Callbacks, Hooks, Registry};
-use super::opt::Opt;
-use super::{chunk_name, describe};
-use crate::settings::{Keymap, Settings};
+use super::opt::{Opt, SERIALIZE};
+use super::{chunk_name, data, describe, with_full_path};
+use crate::settings::{Keymap, ServerConfig, Settings};
 
 pub const INIT_FILE: &str = "init.lua";
+pub const SERVERS_FILE: &str = "servers.lua";
 pub const SYSTEM_INIT: &str = "/etc/amux/init.lua";
+const SERVERS_OPTION: &str = "servers";
 const MODULE_DIR: &str = "lua";
 const MODULE_PATTERNS: [&str; 2] = ["?.lua", "?/init.lua"];
 
@@ -34,19 +38,36 @@ impl Process {
 pub struct ConfigPaths {
     pub dir: PathBuf,
     pub init: Option<PathBuf>,
+    pub servers: PathBuf,
 }
 
 impl ConfigPaths {
-    pub fn find(dir: PathBuf, system_init: &Path) -> Self {
-        let init = find_init(&dir, system_init);
-        Self { dir, init }
+    pub fn new(dir: PathBuf, init: Option<PathBuf>) -> Self {
+        let servers = dir.join(SERVERS_FILE);
+        Self { dir, init, servers }
+    }
+
+    pub fn find(dir: PathBuf, given: Option<&Path>, system_init: &Path) -> Self {
+        let init = find_init(&dir, given, system_init);
+        Self::new(dir, init)
     }
 }
 
-pub fn find_init(dir: &Path, system_init: &Path) -> Option<PathBuf> {
+pub fn find_init(dir: &Path, given: Option<&Path>, system_init: &Path) -> Option<PathBuf> {
+    if let Some(given) = given {
+        return Some(given.to_owned());
+    }
     [dir.join(INIT_FILE), system_init.to_path_buf()]
         .into_iter()
         .find(|path| path.exists())
+}
+
+pub fn load_servers(path: &Path) -> Result<BTreeMap<String, ServerConfig>> {
+    match fs::read(path) {
+        Ok(source) => data::parse(path, &source),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
 }
 
 #[derive(Debug)]
@@ -63,12 +84,13 @@ pub fn load(paths: &ConfigPaths, process: Process) -> Result<Loaded> {
     add_module_path(&lua, &paths.dir)?;
     let opt = Opt::<Settings>::install(&lua)?;
     api::install(&lua, opt.proxy(), process)?;
+    merge_servers(&lua, &opt, &paths.servers)?;
     if let Some(init) = &paths.init {
         let source = fs::read(init).with_context(|| format!("reading {}", init.display()))?;
         lua.load(source)
             .set_name(chunk_name(init))
             .exec()
-            .map_err(|error| anyhow!(describe(&error)))?;
+            .map_err(|error| anyhow!(with_full_path(describe(&error), init)))?;
     }
     let Registry {
         keymap,
@@ -79,6 +101,7 @@ pub fn load(paths: &ConfigPaths, process: Process) -> Result<Loaded> {
         .context("the amux registry is missing")?;
     let settings = opt
         .settings(&lua, |callback| callbacks.register(callback).0)
+        .and_then(|settings| settings.validate().map(|()| settings))
         .map_err(|message| match &paths.init {
             Some(init) => anyhow!("{}: {message}", init.display()),
             None => anyhow!(message),
@@ -91,6 +114,14 @@ pub fn load(paths: &ConfigPaths, process: Process) -> Result<Loaded> {
         hooks,
         lua,
     })
+}
+
+fn merge_servers(lua: &Lua, opt: &Opt<Settings>, path: &Path) -> Result<()> {
+    let servers: Table = opt.proxy().get(SERVERS_OPTION)?;
+    for (name, server) in load_servers(path)? {
+        servers.set(name, lua.to_value_with(&server, SERIALIZE)?)?;
+    }
+    Ok(())
 }
 
 fn add_module_path(lua: &Lua, dir: &Path) -> mlua::Result<()> {
@@ -111,10 +142,7 @@ pub(super) fn load_init(source: &str, process: Process) -> Result<Loaded> {
     let init = dir.path().join(INIT_FILE);
     fs::write(&init, source)?;
     load(
-        &ConfigPaths {
-            dir: dir.path().to_owned(),
-            init: Some(init),
-        },
+        &ConfigPaths::new(dir.path().to_owned(), Some(init)),
         process,
     )
 }
@@ -124,7 +152,8 @@ mod tests {
     use super::*;
     use crate::keys::Key;
     use crate::settings::{
-        ClusterSettings, Color, DiscoverySettings, LanSettings, SshSettings, StyleSpec, Theme,
+        ClusterSettings, Color, DiscoverySettings, LanSettings, ProjectConfig, SshSettings,
+        StyleSpec, Theme,
     };
 
     fn loaded(source: &str) -> Loaded {
@@ -141,10 +170,7 @@ mod tests {
     #[test]
     fn without_an_init_file_everything_is_default() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = ConfigPaths {
-            dir: dir.path().to_owned(),
-            init: None,
-        };
+        let paths = ConfigPaths::new(dir.path().to_owned(), None);
         let loaded = load(&paths, Process::Server).unwrap();
         assert_eq!(loaded.settings, Settings::default());
         assert_eq!(loaded.keymap, Keymap::default());
@@ -317,8 +343,9 @@ mod tests {
         );
         assert!(
             error.contains(
-                "borders, cluster, discovery, escape_time_ms, lan, mouse, notice_ms, pane, \
-                 prefix, session, status, theme, tree, window, worktrees"
+                "borders, cluster, discovery, escape_time_ms, lan, mouse, name, notice_ms, pane, \
+                 prefix, projects, projects_dir, servers, session, status, theme, tree, window, \
+                 worktrees"
             ),
             "{error}"
         );
@@ -373,6 +400,38 @@ mod tests {
     }
 
     #[test]
+    fn errors_name_the_whole_path_of_a_deeply_nested_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir
+            .path()
+            .join("a-directory-name-long-enough")
+            .join("to-push-the-path-past-what-lua-shows");
+        fs::create_dir_all(&deep).unwrap();
+        let init = deep.join(INIT_FILE);
+        fs::write(&init, "\namux.opt.bogus = 1").unwrap();
+        fs::write(
+            deep.join(SERVERS_FILE),
+            "return {\n  laptop = { address = nil + 1 },\n}",
+        )
+        .unwrap();
+        let paths = ConfigPaths::new(deep.clone(), Some(init.clone()));
+
+        let error = load(&paths, Process::Server).unwrap_err().to_string();
+        let servers = deep.join(SERVERS_FILE).display().to_string();
+        assert!(error.starts_with(&format!("{servers}:2: ")), "{error}");
+
+        fs::remove_file(deep.join(SERVERS_FILE)).unwrap();
+        let error = load(&paths, Process::Server).unwrap_err().to_string();
+        assert!(
+            error.starts_with(&format!(
+                "{}:2: unknown option amux.opt.bogus",
+                init.display()
+            )),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn modules_are_required_from_the_lua_directory() {
         let dir = tempfile::tempdir().unwrap();
         let modules = dir.path().join(MODULE_DIR);
@@ -389,10 +448,7 @@ mod tests {
         .unwrap();
         fs::write(modules.join("broken.lua"), "\namux.opt.bogus = 1").unwrap();
         let init = dir.path().join(INIT_FILE);
-        let paths = ConfigPaths {
-            dir: dir.path().to_owned(),
-            init: Some(init.clone()),
-        };
+        let paths = ConfigPaths::new(dir.path().to_owned(), Some(init.clone()));
 
         fs::write(&init, "assert(require('theme').applied)\nrequire('keys')").unwrap();
         let loaded = load(&paths, Process::Client).unwrap();
@@ -487,33 +543,212 @@ mod tests {
     }
 
     #[test]
-    fn the_user_init_wins_over_the_system_init() {
+    fn the_given_file_wins_then_the_user_init_then_the_system_init() {
         let config = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
         let system_init = system.path().join(INIT_FILE);
         let user_init = config.path().join(INIT_FILE);
+        let given = system.path().join("given.lua");
 
-        assert_eq!(find_init(config.path(), &system_init), None);
+        assert_eq!(find_init(config.path(), None, &system_init), None);
+        assert_eq!(
+            find_init(config.path(), Some(&given), &system_init),
+            Some(given.clone())
+        );
 
         fs::write(&system_init, "").unwrap();
         assert_eq!(
-            find_init(config.path(), &system_init),
+            find_init(config.path(), None, &system_init),
             Some(system_init.clone())
         );
 
         fs::write(&user_init, "").unwrap();
         assert_eq!(
-            find_init(config.path(), &system_init),
+            find_init(config.path(), None, &system_init),
             Some(user_init.clone())
+        );
+        assert_eq!(
+            find_init(config.path(), Some(&given), &system_init),
+            Some(given)
         );
 
         fs::remove_file(&system_init).unwrap();
         assert_eq!(
-            ConfigPaths::find(config.path().to_owned(), &system_init),
+            ConfigPaths::find(config.path().to_owned(), None, &system_init),
             ConfigPaths {
                 dir: config.path().to_owned(),
                 init: Some(user_init),
+                servers: config.path().join(SERVERS_FILE),
             }
+        );
+    }
+
+    fn with_servers(servers: &str, init: &str) -> (tempfile::TempDir, Result<Loaded>) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(SERVERS_FILE), servers).unwrap();
+        let path = dir.path().join(INIT_FILE);
+        fs::write(&path, init).unwrap();
+        let paths = ConfigPaths::new(dir.path().to_owned(), Some(path));
+        let loaded = load(&paths, Process::Server);
+        (dir, loaded)
+    }
+
+    fn server(address: &str) -> ServerConfig {
+        ServerConfig {
+            address: address.into(),
+            amux_path: None,
+            socket: None,
+        }
+    }
+
+    #[test]
+    fn servers_lua_is_merged_before_init_lua_runs() {
+        let (_dir, loaded) = with_servers(
+            "return {\n\
+               laptop = { address = 'ssh://laptop', socket = 'dev' },\n\
+               nas = { address = 'ssh://nas' },\n\
+             }",
+            "local servers = amux.opt.servers\n\
+             assert(servers.laptop.address == 'ssh://laptop')\n\
+             assert(servers.laptop.amux_path == nil)\n\
+             servers.nas = { address = 'ssh://nas.lan' }\n\
+             servers.desk = { address = 'ssh://desk' }",
+        );
+        let servers = loaded.unwrap().settings.servers;
+        assert_eq!(
+            servers,
+            BTreeMap::from([
+                ("desk".into(), server("ssh://desk")),
+                (
+                    "laptop".into(),
+                    ServerConfig {
+                        socket: Some("dev".into()),
+                        ..server("ssh://laptop")
+                    }
+                ),
+                ("nas".into(), server("ssh://nas.lan")),
+            ])
+        );
+    }
+
+    #[test]
+    fn replacing_amux_opt_servers_drops_the_servers_lua_entries() {
+        let (_dir, loaded) = with_servers(
+            "return { laptop = { address = 'ssh://laptop' } }",
+            "amux.opt.servers = { desk = { address = 'ssh://desk' } }",
+        );
+        assert_eq!(
+            loaded.unwrap().settings.servers,
+            BTreeMap::from([("desk".into(), server("ssh://desk"))])
+        );
+    }
+
+    #[test]
+    fn a_broken_servers_lua_names_its_file() {
+        let (dir, loaded) = with_servers("return { laptop = { adress = 'x' } }", "");
+        let error = loaded.unwrap_err().to_string();
+        let path = dir.path().join(SERVERS_FILE);
+        assert!(
+            error.starts_with(&format!("{}: laptop", path.display())),
+            "{error}"
+        );
+        assert!(error.contains("unknown field `adress`"), "{error}");
+
+        let (_dir, loaded) =
+            with_servers("return { laptop = { address = os.getenv('HOME') } }", "");
+        let error = loaded.unwrap_err().to_string();
+        assert!(
+            error.contains("servers.lua:1: a data file cannot read the global os"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_missing_servers_lua_means_no_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load_servers(&dir.path().join(SERVERS_FILE)).unwrap(),
+            BTreeMap::new()
+        );
+        assert!(load_servers(dir.path()).is_err());
+    }
+
+    #[test]
+    fn project_and_server_options_are_set_through_amux_opt() {
+        let loaded = loaded(
+            "local opt = amux.opt\n\
+             assert(opt.name == nil)\n\
+             assert(opt.projects_dir == '~/projects')\n\
+             opt.name = 'desktop'\n\
+             opt.projects_dir = '~/code'\n\
+             opt.servers.laptop = { address = 'ssh://laptop' }\n\
+             opt.servers['home-server'] = {\n\
+               address = 'ssh://notpc@home-server',\n\
+               amux_path = '~/.cargo/bin/amux',\n\
+               socket = 'dev',\n\
+             }\n\
+             opt.projects.amux = { default_server = 'desktop', worktrees_dir = '~/projects/amux-worktrees' }\n\
+             opt.projects.notes = {}",
+        );
+        let settings = loaded.settings;
+        assert_eq!(settings.name.as_deref(), Some("desktop"));
+        assert_eq!(settings.projects_dir, PathBuf::from("~/code"));
+        assert_eq!(settings.servers["laptop"], server("ssh://laptop"));
+        assert_eq!(
+            settings.servers["home-server"],
+            ServerConfig {
+                address: "ssh://notpc@home-server".into(),
+                amux_path: Some("~/.cargo/bin/amux".into()),
+                socket: Some("dev".into()),
+            }
+        );
+        assert_eq!(
+            settings.projects["amux"],
+            ProjectConfig {
+                default_server: Some("desktop".into()),
+                worktrees_dir: Some(PathBuf::from("~/projects/amux-worktrees")),
+            }
+        );
+        assert_eq!(settings.projects["notes"], ProjectConfig::default());
+    }
+
+    #[test]
+    fn unknown_project_and_server_fields_are_rejected() {
+        let error = failure("amux.opt.servers.laptop = { address = 'ssh://laptop', port = 22 }");
+        assert!(
+            error.contains("init.lua: amux.opt.servers.laptop.port: unknown field `port`"),
+            "{error}"
+        );
+        let error = failure("amux.opt.servers.laptop = { amux_path = 'amux' }");
+        assert!(
+            error.contains("amux.opt.servers.laptop: missing field `address`"),
+            "{error}"
+        );
+        let error = failure("amux.opt.projects.amux = { branch = 'main' }");
+        assert!(
+            error.contains("init.lua: amux.opt.projects.amux.branch: unknown field `branch`"),
+            "{error}"
+        );
+        let error = failure("amux.opt.discovery.mdns = true");
+        assert!(
+            error.contains("init.lua:1: unknown option amux.opt.discovery.mdns"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn invalid_values_are_reported_against_the_init_file() {
+        let error = failure("amux.opt.name = ' '");
+        assert!(
+            error.ends_with("init.lua: amux.opt.name must not be blank"),
+            "{error}"
+        );
+        let error = failure("amux.opt.cluster.status_interval_ms = 0");
+        assert!(
+            error.ends_with(
+                "init.lua: amux.opt.cluster.status_interval_ms must be a positive number"
+            ),
+            "{error}"
         );
     }
 }

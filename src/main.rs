@@ -1,11 +1,14 @@
+use std::path::Path;
+
 use anyhow::Result;
 use clap::Parser;
 
-use amux::cli::{Cli, Command, DebugAction, ProjectAction, ServersAction};
+use amux::cli::{Cli, Command, ConfigAction, DebugAction, ProjectAction, ServersAction};
 use amux::client::{self, Endpoint};
 use amux::cluster::ssh;
-use amux::config::ServerConfig;
+use amux::config;
 use amux::server;
+use amux::settings::ServerConfig;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -49,6 +52,7 @@ async fn main() -> Result<()> {
         Some(Command::Pair(args)) => {
             client::pair(&endpoint, args.code, args.host, args.new_key).await
         }
+        Some(Command::Config(action)) => run_config(action, endpoint.config.as_deref()),
         Some(Command::KillServer) => client::kill_server(&endpoint).await,
         Some(Command::Server) => server::run(&endpoint.socket, endpoint.config.as_deref()).await,
         Some(Command::Bridge(args)) => ssh::bridge(&endpoint, args.no_start).await,
@@ -57,4 +61,13 @@ async fn main() -> Result<()> {
             client::drop_link(&endpoint, peer).await
         }
     }
+}
+
+fn run_config(action: ConfigAction, given: Option<&Path>) -> Result<()> {
+    match action {
+        ConfigAction::Check => print!("{}", config::check(given)?),
+        ConfigAction::Defaults => print!("{}", config::defaults()?),
+        ConfigAction::Path => println!("{}", config::path(given)?.display()),
+    }
+    Ok(())
 }

@@ -3,6 +3,7 @@ pub mod client;
 pub mod cluster;
 pub mod config;
 pub mod discovery;
+pub mod identity;
 pub mod keys;
 pub mod lua;
 pub mod pairing;

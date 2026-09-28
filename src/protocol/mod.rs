@@ -246,7 +246,7 @@ mod tests {
     #[tokio::test]
     async fn discovery_and_pairing_replies_survive_a_round_trip() {
         let (mut server, mut client) = byte_pipe(1024);
-        let id = crate::config::ServerId::random().unwrap();
+        let id = crate::identity::ServerId::random().unwrap();
         let sent = vec![
             ServerMessage::Discovery(DiscoveryReport {
                 sources: vec![
