@@ -185,6 +185,14 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    if let Err(reason) = cluster.admit(&auth) {
+        let _ = write_message(&mut writer, &PeerMessage::Refused(reason)).await;
+        return Ok(Handshake::Refused {
+            reason,
+            by_peer: false,
+            peer: None,
+        });
+    }
     write_message(&mut writer, &PeerMessage::Hello(cluster.hello())).await?;
     let peer = match receive(&mut reader).await? {
         PeerMessage::Hello(hello) => hello,
@@ -484,8 +492,9 @@ where
                     %peer,
                     trusted = update.trusted.len(),
                     forgotten = update.forgotten.len(),
-                    "ignoring a trust update"
+                    "received a trust update"
                 );
+                cluster.merge_trust(peer, &update);
                 true
             }
             other => {
@@ -613,11 +622,14 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::*;
-    use crate::cluster::{Channel, ChannelEnd, ClusterOptions, TrustStore, CREDIT_WINDOW};
+    use crate::cluster::noise;
+    use crate::cluster::{
+        Channel, ChannelEnd, ClusterOptions, NoiseKey, TrustStore, Voucher, CREDIT_WINDOW,
+    };
     use crate::config::{DiscoveryConfig, Incarnation, ServerIdentity};
     use crate::protocol::{
         ClientMessage, Duplex, Event, ServerMessage, ServerState, ServerStatus, SessionId,
-        SessionInfo, Snapshot, StateEvent, Version, WindowSummary, PROTOCOL_MAJOR,
+        SessionInfo, Snapshot, StateEvent, TcpKind, Version, WindowSummary, PROTOCOL_MAJOR,
     };
 
     type HostEnd = Duplex<ClientMessage, ServerMessage>;
@@ -727,6 +739,7 @@ mod tests {
                 servers: BTreeMap::new(),
                 discovery: DiscoveryConfig::default(),
                 trust: TrustStore::default(),
+                key: NoiseKey::generate().unwrap(),
             };
             Node {
                 cluster: Cluster::new(options, weak),
@@ -904,6 +917,58 @@ mod tests {
             assert!(dialer.cluster.links().is_empty());
             assert!(acceptor.cluster.links().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn a_noise_link_vouched_by_pairing_trusts_both_keys_first_hand() {
+        let lower = node(LOWER, "low").build();
+        let higher = node(HIGHER, "high").build();
+        let (dial_end, accept_end) = duplex(PIPE_CAPACITY);
+        let acceptor = Arc::clone(&higher.cluster);
+        let accepted = tokio::spawn(async move {
+            let mut stream = accept_end;
+            let kind = noise::read_opening(&mut stream).await?.unwrap();
+            let secured = noise::respond(stream, &acceptor.noise_key(), kind).await?;
+            acceptor.accept_noise(secured, Voucher::Pairing).await
+        });
+
+        let secured = noise::initiate(dial_end, &lower.cluster.noise_key(), TcpKind::Link)
+            .await
+            .unwrap();
+        let auth = TransportAuth::Noise {
+            key: secured.remote,
+            vouched_by: Voucher::Pairing,
+        };
+        let (reader, writer) = split(secured.stream);
+        let link = linked(dial(&lower.cluster, reader, writer, auth).await.unwrap());
+
+        let trusted = |node: &Node, peer: &Node| {
+            node.cluster.members().trust.key_of(peer.cluster.id())
+                == Some(peer.cluster.public_key())
+        };
+        assert!(trusted(&lower, &higher));
+        eventually("the acceptor to trust the dialer", || {
+            trusted(&higher, &lower)
+        })
+        .await;
+        let transports: Vec<String> = lower
+            .cluster
+            .links()
+            .iter()
+            .map(|link| format!("{} {:?}", link.transport, link.key))
+            .collect();
+        assert_eq!(
+            transports,
+            [format!("noise {:?}", Some(higher.cluster.public_key()))]
+        );
+
+        drop(link);
+        tokio::time::timeout(PATIENCE, accepted)
+            .await
+            .expect("the accepted link never ended")
+            .unwrap()
+            .unwrap();
+        assert!(higher.cluster.links().is_empty());
     }
 
     #[tokio::test]

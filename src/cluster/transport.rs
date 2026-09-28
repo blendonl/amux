@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
 use anyhow::{bail, Context, Result};
@@ -97,6 +97,19 @@ impl FromStr for Address {
 }
 
 impl Address {
+    pub fn is_local_only(&self) -> bool {
+        let Self::Tcp { host, .. } = self else {
+            return false;
+        };
+        match host.parse::<IpAddr>() {
+            Ok(ip) => {
+                let ip = ip.to_canonical();
+                ip.is_loopback() || ip.is_unspecified()
+            }
+            Err(_) => host.eq_ignore_ascii_case("localhost"),
+        }
+    }
+
     pub fn connect(
         &self,
         amux_path: Option<&str>,
@@ -361,6 +374,37 @@ mod tests {
                 "[fe80::2]:40123"
             ])))
         );
+    }
+
+    #[test]
+    fn only_loopback_and_unspecified_tcp_hosts_are_local_only() {
+        for address in [
+            "tcp://127.0.0.1:7447",
+            "tcp://127.1.2.3:7447",
+            "tcp://0.0.0.0:7447",
+            "tcp://[::1]:7447",
+            "tcp://[::]:7447",
+            "tcp://[::ffff:127.0.0.1]:7447",
+            "tcp://localhost:7447",
+        ] {
+            assert!(
+                address.parse::<Address>().unwrap().is_local_only(),
+                "{address}"
+            );
+        }
+        for address in [
+            "tcp://192.168.0.10:7447",
+            "tcp://100.64.0.2:7447",
+            "tcp://[fd7a:115c:a1e0::1]:7447",
+            "tcp://desk.tail0.ts.net:7447",
+            "ssh://localhost",
+            "exec:amux bridge",
+        ] {
+            assert!(
+                !address.parse::<Address>().unwrap().is_local_only(),
+                "{address}"
+            );
+        }
     }
 
     #[test]

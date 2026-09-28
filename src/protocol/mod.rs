@@ -20,9 +20,10 @@ pub use client::{
     Via, WindowSummary, MIN_COLS, MIN_ROWS,
 };
 pub use greeting::{
-    accept, greet, Greeting, IncompatibleServer, Role, Version, Welcome, MAGIC, PROTOCOL_MAJOR,
-    PROTOCOL_MINOR, RELEASE,
+    accept, greet, Greeting, IncompatibleServer, Role, TcpKind, TcpOpen, Version, Welcome, MAGIC,
+    PROTOCOL_MAJOR, PROTOCOL_MINOR, RELEASE, TCP_MAGIC,
 };
+pub(crate) use key::{from_hex, hex};
 pub use key::{PublicKey, PUBLIC_KEY_LEN};
 pub use peer::{
     ChannelId, Event, Farewell, ForgottenPeer, Hello, PeerAddress, PeerMessage, Refusal,

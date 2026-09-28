@@ -25,7 +25,8 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::cluster::{
-    Cluster, ClusterOptions, LinkSettings, StateSource, TransportAuth, TrustStore, TRUST_FILE,
+    Cluster, ClusterOptions, LanListener, LanOptions, LinkSettings, NoiseKey, StateSource,
+    TransportAuth, TrustStore, TRUST_FILE,
 };
 use crate::config::{self, Config, Incarnation, ServerId, ServerIdentity};
 use crate::discovery::{Discovery, DiscoveryOptions};
@@ -61,10 +62,12 @@ pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
     );
     let state_dir = paths::state_dir(socket)?;
     let identity = ServerIdentity::load(&state_dir, config.name.clone())?;
+    let key = NoiseKey::load_or_create(&state_dir)?;
     info!(
         name = %identity.name,
         id = %identity.id,
         incarnation = %identity.incarnation,
+        key = %key.public(),
         "server identity"
     );
 
@@ -94,6 +97,7 @@ pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
         servers: config.servers.clone(),
         discovery: config.discovery.clone(),
         trust,
+        key,
     };
     let server = Server::new(
         identity,
@@ -105,6 +109,7 @@ pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
         discovery,
     );
     server.cluster.start();
+    server.lan.start(&server.cluster);
     server.discovery.start();
     info!(socket = %socket.display(), version = %Version::current(), "server started");
 
@@ -127,6 +132,7 @@ pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
     }
 
     server.discovery.stop().await;
+    server.lan.stop().await;
     server.cluster.shutdown().await;
     server.state().sessions.clear();
     if let Err(err) = fs::remove_file(socket) {
@@ -166,6 +172,7 @@ pub struct Server {
     state: Mutex<LocalState>,
     events: broadcast::Sender<Event>,
     cluster: Arc<Cluster>,
+    lan: LanListener,
     discovery: Discovery,
     projects: Projects,
     shutdown: Notify,
@@ -208,6 +215,11 @@ impl Server {
             projects: projects::checkouts(&registry),
             ..LocalState::default()
         };
+        let lan = LanOptions {
+            enabled: discovery.config.lan,
+            port: discovery.lan.port,
+            state_dir: discovery.state_dir.clone(),
+        };
         Arc::new_cyclic(|server: &Weak<Self>| {
             let source: Weak<dyn StateSource> = server.clone();
             let cluster = Cluster::new(options, source);
@@ -220,6 +232,7 @@ impl Server {
                 events: broadcast::channel(EVENT_CAPACITY).0,
                 discovery: Discovery::new(Arc::clone(&cluster), discovery),
                 cluster,
+                lan: LanListener::new(lan),
                 projects: Projects::new(registry),
                 shutdown: Notify::new(),
             }

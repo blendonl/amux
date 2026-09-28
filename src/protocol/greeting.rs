@@ -8,6 +8,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use super::{read_frame, write_message};
 
 pub const MAGIC: [u8; 4] = *b"AMUX";
+pub const TCP_MAGIC: [u8; 4] = *b"AMXT";
 pub const PROTOCOL_MAJOR: u16 = 7;
 pub const PROTOCOL_MINOR: u16 = 0;
 pub const RELEASE: &str = env!("CARGO_PKG_VERSION");
@@ -27,6 +28,27 @@ pub struct Greeting {
     pub major: u16,
     pub minor: u16,
     pub role: Role,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TcpKind {
+    Link,
+    Pair,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TcpOpen {
+    pub magic: [u8; 4],
+    pub kind: TcpKind,
+}
+
+impl TcpOpen {
+    pub fn new(kind: TcpKind) -> Self {
+        Self {
+            magic: TCP_MAGIC,
+            kind,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,6 +343,11 @@ mod tests {
         assert_eq!(
             postcard::to_stdvec(&welcome).unwrap(),
             [1, b'a', 3, b'0', b'.', b'1', 3, 4]
+        );
+
+        assert_eq!(
+            postcard::to_stdvec(&TcpOpen::new(TcpKind::Pair)).unwrap(),
+            [b'A', b'M', b'X', b'T', 1]
         );
     }
 }

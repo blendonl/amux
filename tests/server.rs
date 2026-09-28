@@ -2,6 +2,7 @@ mod common;
 
 use std::fs;
 
+use amux::cluster::NoiseKey;
 use amux::config::{Incarnation, ServerId};
 use amux::protocol::{self, Hello, PeerMessage, Role, Version, PROTOCOL_MAJOR};
 use common::TestServer;
@@ -64,7 +65,8 @@ async fn a_peer_greeting_is_answered_with_a_hello() {
             assert_eq!(hello.name, "desk");
             assert_eq!(hello.id.to_string(), server.server_id());
             assert_eq!(hello.version, Version::current());
-            assert_eq!(hello.public_key, None);
+            let key = NoiseKey::load_or_create(&server.state_dir()).unwrap();
+            assert_eq!(hello.public_key, Some(key.public()));
         }
         other => panic!("expected a hello, got {other:?}"),
     }

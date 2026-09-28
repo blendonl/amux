@@ -1,6 +1,8 @@
 mod cache;
 mod channel;
 mod link;
+pub mod listener;
+pub mod noise;
 pub mod ssh;
 pub mod transport;
 pub mod trust;
@@ -13,22 +15,26 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{broadcast, watch, Notify};
+use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadHalf, WriteHalf};
+use tokio::net::TcpStream;
+use tokio::sync::{broadcast, watch, Notify, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::config::{DiscoveryConfig, Incarnation, ServerConfig, ServerId, ServerIdentity};
 use crate::protocol::{
-    ClientMessage, DiscoveryStatus, DiscoveryView, Duplex, Event, Farewell, Hello, LinkInfo,
-    LinkState, LinkTransport, PeerAddress, PeerMessage, PublicKey, Refusal, ServerMessage,
-    ServerState, ServerStatus, ServerView, Snapshot, StateEvent, Version, Via,
+    self, ClientMessage, DiscoveryStatus, DiscoveryView, Duplex, Event, Farewell, Hello, LinkInfo,
+    LinkState, LinkTransport, PeerAddress, PeerMessage, PublicKey, Refusal, Role, ServerMessage,
+    ServerState, ServerStatus, ServerView, Snapshot, StateEvent, TcpKind, TrustUpdate, Version,
+    Via,
 };
 use cache::{Cache, CachedOrigin, CachedTarget, CACHE_FILE};
 pub use channel::{Channel, ChannelEnd, CREDIT_WINDOW};
 pub use link::LinkSettings;
 use link::{Handshake, LinkHandle};
+pub use listener::{LanListener, LanOptions, Listener, LAN_PORT_FILE};
+pub use noise::{NoiseKey, Secured, NOISE_KEY_FILE};
 pub use transport::{Address, Connect, TransportAuth, Voucher};
-pub use trust::{TrustStore, TRUST_FILE};
+pub use trust::{TrustStore, Witnessed, TRUST_FILE};
 
 const SAVE_DELAY: Duration = Duration::from_millis(500);
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
@@ -36,7 +42,10 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const MAX_UNVERIFIED_BACKOFF: Duration = Duration::from_secs(10 * 60);
 const ADDRESS_EXPIRY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
-const TCP_UNAVAILABLE: &str = "tcp links are not available yet";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const FLUSH_GRACE: Duration = Duration::from_secs(2);
+
+type NoiseHandshake = Handshake<ReadHalf<DuplexStream>, WriteHalf<DuplexStream>>;
 
 pub trait StateSource: Send + Sync {
     fn subscribe(&self) -> (Snapshot, broadcast::Receiver<Event>);
@@ -53,6 +62,7 @@ pub struct ClusterOptions {
     pub servers: BTreeMap<String, ServerConfig>,
     pub discovery: DiscoveryConfig,
     pub trust: TrustStore,
+    pub key: NoiseKey,
 }
 
 pub struct Cluster {
@@ -60,8 +70,11 @@ pub struct Cluster {
     version: Version,
     socket_name: String,
     settings: LinkSettings,
+    state_dir: Option<PathBuf>,
     cache_path: Option<PathBuf>,
     trust_path: Option<PathBuf>,
+    key: Mutex<NoiseKey>,
+    handshakes: Arc<Semaphore>,
     source: Weak<dyn StateSource>,
     members: Mutex<Members>,
     changes: watch::Sender<()>,
@@ -403,8 +416,11 @@ impl Cluster {
             version: options.version,
             socket_name: options.socket_name,
             settings: options.settings,
+            state_dir: options.state_dir,
             cache_path,
             trust_path,
+            key: Mutex::new(options.key),
+            handshakes: Arc::new(Semaphore::new(listener::MAX_PENDING_HANDSHAKES)),
             source,
             members: Mutex::new(members),
             changes: watch::channel(()).0,
@@ -442,6 +458,29 @@ impl Cluster {
         .await
         .context("the peer handshake timed out")??;
         self.conclude(handshake, None).await;
+        Ok(())
+    }
+
+    pub async fn accept_noise(
+        self: &Arc<Self>,
+        secured: Secured,
+        vouched_by: Voucher,
+    ) -> Result<()> {
+        let Secured {
+            remote,
+            stream,
+            flushed,
+            ..
+        } = secured;
+        let handshake = tokio::time::timeout(
+            self.settings.handshake_timeout,
+            self.noise_handshake(stream, remote, vouched_by),
+        )
+        .await
+        .context("the peer handshake timed out")??;
+        let _transport = self.count_transport();
+        self.conclude(handshake, None).await;
+        let _ = tokio::time::timeout(FLUSH_GRACE, flushed).await;
         Ok(())
     }
 
@@ -555,12 +594,62 @@ impl Cluster {
         views
     }
 
+    pub fn noise_key(&self) -> NoiseKey {
+        self.key
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn public_key(&self) -> PublicKey {
+        self.noise_key().public()
+    }
+
+    pub fn rotate_key(&self) -> Result<PublicKey> {
+        let key = match &self.state_dir {
+            Some(dir) => NoiseKey::rotate(dir)?,
+            None => NoiseKey::generate()?,
+        };
+        let public = key.public();
+        *self.key.lock().unwrap_or_else(PoisonError::into_inner) = key;
+        info!(key = %public, "rotated the noise key");
+        Ok(public)
+    }
+
+    pub fn voucher(&self, key: &PublicKey) -> Voucher {
+        if self.members().trust.is_trusted(key) {
+            Voucher::TrustStore
+        } else {
+            Voucher::Nobody
+        }
+    }
+
+    pub fn trusts_anyone(&self) -> bool {
+        !self.members().trust.trusted.is_empty()
+    }
+
+    pub fn witness(&self, id: ServerId, name: &str, key: PublicKey) -> Witnessed {
+        let witnessed = self.members().trust.witness(id, name, key);
+        self.witnessed(id, name, key, witnessed);
+        witnessed
+    }
+
+    pub fn unforget(&self, id: ServerId) -> bool {
+        let unforgotten = self.members().trust.unforget(id);
+        if unforgotten {
+            info!(%id, "no longer refusing a forgotten server");
+            self.trust_changed();
+        }
+        unforgotten
+    }
+
     pub fn gossip(&self) -> Vec<PeerAddress> {
         let members = self.members();
         members
             .targets
             .iter()
             .filter(|(_, target)| target.verified && !target.is_self && !target.is_discovered())
+            .filter(|(address, _)| is_shareable(address))
             .filter_map(|(address, target)| {
                 let id = target.peer?;
                 let name = members
@@ -804,6 +893,7 @@ impl Cluster {
             }
         };
         let saved = self.save_trust();
+        self.share_trust();
         self.changed();
         self.dirty.notify_one();
         self.peers_changed();
@@ -968,7 +1058,22 @@ impl Cluster {
             name: self.identity.name.clone(),
             version: self.version.clone(),
             peers: self.gossip(),
-            public_key: None,
+            public_key: Some(self.public_key()),
+        }
+    }
+
+    fn admit(&self, auth: &TransportAuth) -> Result<(), Refusal> {
+        let TransportAuth::Noise { key, vouched_by } = auth else {
+            return Ok(());
+        };
+        let members = self.members();
+        if members.trust.is_key_forgotten(key) {
+            return Err(Refusal::Forgotten);
+        }
+        match vouched_by {
+            Voucher::Tailnet | Voucher::Pairing => Ok(()),
+            Voucher::Nobody | Voucher::TrustStore if members.trust.is_trusted(key) => Ok(()),
+            Voucher::Nobody | Voucher::TrustStore => Err(Refusal::Untrusted),
         }
     }
 
@@ -976,31 +1081,138 @@ impl Cluster {
         if hello.id == self.identity.id {
             return Err(Refusal::SelfDial);
         }
-        let members = self.members();
-        let key_forgotten = auth
-            .key()
-            .is_some_and(|key| members.trust.is_key_forgotten(&key));
-        if key_forgotten
-            || members
-                .trust
-                .is_forgotten(hello.id, hello.public_key.as_ref())
-        {
-            return Err(Refusal::Forgotten);
-        }
-        if !self.version.is_compatible_with(hello.version.major) {
-            return Err(Refusal::Incompatible);
-        }
-        if hello.name == self.identity.name {
-            return Err(Refusal::NameTaken);
-        }
-        if members
-            .links
-            .iter()
-            .any(|(id, link)| *id != hello.id && link.name == hello.name)
-        {
-            return Err(Refusal::NameTaken);
+        let witnessed = {
+            let mut members = self.members();
+            let key_forgotten = auth
+                .key()
+                .is_some_and(|key| members.trust.is_key_forgotten(&key));
+            if key_forgotten
+                || members
+                    .trust
+                    .is_forgotten(hello.id, hello.public_key.as_ref())
+            {
+                return Err(Refusal::Forgotten);
+            }
+            if let TransportAuth::Noise {
+                key,
+                vouched_by: Voucher::Nobody | Voucher::TrustStore,
+            } = auth
+            {
+                if members.trust.key_of(hello.id) != Some(*key) {
+                    return Err(Refusal::Untrusted);
+                }
+            }
+            if !self.version.is_compatible_with(hello.version.major) {
+                return Err(Refusal::Incompatible);
+            }
+            if hello.name == self.identity.name {
+                return Err(Refusal::NameTaken);
+            }
+            if members
+                .links
+                .iter()
+                .any(|(id, link)| *id != hello.id && link.name == hello.name)
+            {
+                return Err(Refusal::NameTaken);
+            }
+            let evidence = match auth {
+                TransportAuth::Ssh => hello.public_key,
+                TransportAuth::Noise {
+                    key,
+                    vouched_by: Voucher::Tailnet | Voucher::Pairing,
+                } => Some(*key),
+                TransportAuth::Noise { .. } => None,
+            };
+            match evidence.map(|key| (key, members.trust.witness(hello.id, &hello.name, key))) {
+                Some((_, Witnessed::HeldBy(_))) if auth.key().is_some() => {
+                    return Err(Refusal::Untrusted);
+                }
+                witnessed => witnessed,
+            }
+        };
+        if let Some((key, witnessed)) = witnessed {
+            self.witnessed(hello.id, &hello.name, key, witnessed);
         }
         Ok(())
+    }
+
+    fn witnessed(&self, id: ServerId, name: &str, key: PublicKey, witnessed: Witnessed) {
+        match witnessed {
+            Witnessed::Trusted => info!(server = %name, %id, %key, "trusting the server's key"),
+            Witnessed::Replaced(old) => {
+                info!(server = %name, %id, %old, new = %key, "the server's key changed");
+            }
+            Witnessed::Confirmed => {
+                debug!(server = %name, %id, %key, "saw the server's key first hand")
+            }
+            Witnessed::HeldBy(holder) => {
+                warn!(server = %name, %id, %key, %holder, "not trusting a key that another server holds");
+            }
+            Witnessed::Renamed | Witnessed::Unchanged => {}
+        }
+        if witnessed.changed() {
+            self.trust_changed();
+        }
+    }
+
+    fn merge_trust(&self, sender: ServerId, update: &TrustUpdate) {
+        let merged = {
+            let mut members = self.members();
+            if members.stopping {
+                return;
+            }
+            let merged = members.trust.merge(update, sender, self.identity.id);
+            let by = members
+                .links
+                .get(&sender)
+                .map_or_else(|| sender.to_string(), |link| link.name.clone());
+            for id in &merged.forgotten {
+                let name = members.drop_server(*id).unwrap_or_else(|| id.to_string());
+                info!(server = %name, %id, %by, "forgetting a server that a peer forgot");
+            }
+            merged
+        };
+        if merged.changed {
+            self.trust_changed();
+        }
+        if !merged.forgotten.is_empty() {
+            self.dirty.notify_one();
+            self.peers_changed();
+        }
+    }
+
+    fn trust_changed(&self) {
+        if let Err(err) = self.save_trust() {
+            warn!("saving the trust store failed: {err:#}");
+        }
+        self.share_trust();
+        self.changed();
+    }
+
+    fn share_trust(&self) {
+        let members = self.members();
+        let update = members.trust.update();
+        for (id, link) in &members.links {
+            if members.trust.is_forgotten(*id, link.key.as_ref()) {
+                link.handle.stop.notify_one();
+                continue;
+            }
+            let unbound = link.transport == LinkTransport::Noise
+                && (link.key.is_none() || members.trust.key_of(*id) != link.key);
+            if unbound {
+                info!(peer = %link.name, "dropping a link whose key is no longer trusted");
+                link.handle.stop.notify_one();
+                continue;
+            }
+            if link
+                .handle
+                .control
+                .try_send(PeerMessage::Trust(update.clone()))
+                .is_err()
+            {
+                debug!(peer = %link.name, "the link had no room for a trust update");
+            }
+        }
     }
 
     fn next_generation(&self) -> u64 {
@@ -1064,6 +1276,9 @@ impl Cluster {
     ) -> LinkGuard {
         members.last_link += 1;
         let id = members.last_link;
+        let _ = handle
+            .control
+            .try_send(PeerMessage::Trust(members.trust.update()));
         if let Some(replaced) = members.links.remove(&hello.id) {
             info!(peer = %hello.name, "replacing the previous link");
             replaced.handle.stop.notify_one();
@@ -1204,6 +1419,7 @@ impl Cluster {
                     || peer.name == self.identity.name
                     || members.names_configured(&peer.name)
                     || members.trust.is_forgotten(peer.id, None)
+                    || !is_shareable(&peer.address)
                 {
                     continue;
                 }
@@ -1338,12 +1554,83 @@ impl Cluster {
     async fn dial(self: &Arc<Self>, address: &str, connect: &Connect) -> bool {
         match connect {
             Connect::Command(command) => self.dial_command(address, command).await,
-            Connect::Tcp(_) => {
-                debug!(%address, "not dialing: {TCP_UNAVAILABLE}");
-                self.record_error(address, TCP_UNAVAILABLE.to_owned());
-                false
+            Connect::Tcp(endpoints) => self.dial_tcp(address, endpoints).await,
+        }
+    }
+
+    async fn dial_tcp(self: &Arc<Self>, address: &str, endpoints: &[String]) -> bool {
+        let mut failure = "there is no endpoint to dial".to_owned();
+        for endpoint in endpoints {
+            debug!(%address, %endpoint, "dialing");
+            let connected =
+                tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(endpoint.as_str())).await;
+            match connected {
+                Ok(Ok(stream)) => return self.dial_noise(address, stream).await,
+                Ok(Err(err)) => failure = format!("connecting to {endpoint}: {err}"),
+                Err(_) => failure = format!("connecting to {endpoint} timed out"),
             }
         }
+        info!(%address, "dialing failed: {failure}");
+        self.record_error(address, failure);
+        false
+    }
+
+    async fn dial_noise(self: &Arc<Self>, address: &str, stream: TcpStream) -> bool {
+        let _ = stream.set_nodelay(true);
+        let key = self.noise_key();
+        let handshake = tokio::time::timeout(self.settings.handshake_timeout, async {
+            let Secured {
+                remote,
+                stream,
+                flushed,
+                ..
+            } = noise::initiate(stream, &key, TcpKind::Link).await?;
+            let auth = TransportAuth::Noise {
+                key: remote,
+                vouched_by: self.voucher(&remote),
+            };
+            let (reader, writer) = tokio::io::split(stream);
+            let handshake = link::dial(self, reader, writer, auth).await?;
+            anyhow::Ok((handshake, flushed))
+        })
+        .await;
+        let failure = match handshake {
+            Ok(Ok((handshake, flushed))) => {
+                let _transport = self.count_transport();
+                let linked = self.conclude(handshake, Some(address)).await;
+                let _ = tokio::time::timeout(FLUSH_GRACE, flushed).await;
+                return linked;
+            }
+            Ok(Err(err)) => {
+                info!(%address, "linking failed: {err:#}");
+                format!("{err:#}")
+            }
+            Err(_) => {
+                warn!(%address, "the peer handshake timed out");
+                "the peer handshake timed out".to_owned()
+            }
+        };
+        self.record_error(address, failure);
+        false
+    }
+
+    async fn noise_handshake(
+        self: &Arc<Self>,
+        mut stream: DuplexStream,
+        remote: PublicKey,
+        vouched_by: Voucher,
+    ) -> Result<NoiseHandshake> {
+        match protocol::accept(&mut stream, &self.version, &self.identity.name).await? {
+            Some(Role::Peer) => {}
+            Some(Role::Client) => bail!("refused a client greeting over tcp"),
+            None => bail!("the connection closed before the greeting"),
+        }
+        let auth = TransportAuth::Noise {
+            key: remote,
+            vouched_by,
+        };
+        let (reader, writer) = tokio::io::split(stream);
+        link::accept(self, reader, writer, auth).await
     }
 
     async fn dial_command(self: &Arc<Self>, address: &str, command: &[String]) -> bool {
@@ -1597,6 +1884,26 @@ impl Members {
         discovered.peek().is_some() && discovered.all(Target::is_absent)
     }
 
+    fn drop_server(&mut self, id: ServerId) -> Option<String> {
+        let mut name = None;
+        self.targets.retain(|_, target| {
+            let dropped = !target.is_self && target.peer == Some(id);
+            if dropped {
+                target.stop.notify_one();
+                name.get_or_insert_with(|| target.name().to_owned());
+            }
+            !dropped
+        });
+        if let Some(link) = self.links.get(&id) {
+            name = Some(link.name.clone());
+            link.handle.stop.notify_one();
+        }
+        if let Some(peer) = self.peers.remove(&id) {
+            name = Some(peer.name);
+        }
+        name
+    }
+
     fn forget_gossip_named(&mut self, name: &str) {
         self.targets.retain(|_, target| {
             let forget =
@@ -1632,6 +1939,12 @@ impl Drop for TransportGuard {
     }
 }
 
+fn is_shareable(address: &str) -> bool {
+    address
+        .parse::<Address>()
+        .is_ok_and(|address| !address.is_local_only())
+}
+
 fn jittered(delay: Duration) -> Duration {
     let mut bytes = [0; 8];
     let fraction = match getrandom::fill(&mut bytes) {
@@ -1645,11 +1958,15 @@ fn jittered(delay: Duration) -> Duration {
 mod tests {
     use std::time::Instant;
 
+    use tokio::io::AsyncReadExt;
+
     use super::*;
+    use crate::protocol::TrustedPeer;
 
     const PATIENCE: Duration = Duration::from_secs(10);
     const DESK: &str = "000000000000000000000000000000d5";
     const LAPTOP: &str = "000000000000000000000000000000a7";
+    const OTHER: &str = "000000000000000000000000000000b3";
 
     struct Quiet(broadcast::Sender<Event>);
 
@@ -1723,6 +2040,7 @@ mod tests {
                 servers,
                 discovery: self.discovery,
                 trust: self.trust,
+                key: NoiseKey::generate().unwrap(),
             };
             Fixture {
                 cluster: Cluster::new(options, weak),
@@ -1751,6 +2069,17 @@ mod tests {
             peers: Vec::new(),
             public_key: None,
         }
+    }
+
+    fn keyed(id: ServerId, name: &str, key: PublicKey) -> Hello {
+        Hello {
+            public_key: Some(key),
+            ..hello(id, name)
+        }
+    }
+
+    fn noise(key: PublicKey, vouched_by: Voucher) -> TransportAuth {
+        TransportAuth::Noise { key, vouched_by }
     }
 
     fn peer_record(name: &str) -> Peer {
@@ -1826,20 +2155,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovered_tcp_targets_say_tcp_is_not_available_yet() {
+    async fn a_discovered_tcp_target_that_refuses_connections_says_why() {
         let fixture = setup().build();
         let cluster = &fixture.cluster;
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
 
         cluster.discovered(
             Via::Tailscale,
-            vec![Candidate::new("desk", "tcp://100.64.0.2:7447")],
+            vec![Candidate::new("desk", format!("tcp://127.0.0.1:{port}"))],
         );
 
-        eventually("the tcp error", || {
-            cluster
-                .discovery_view()
-                .first()
-                .is_some_and(|view| view.last_error.as_deref() == Some(TCP_UNAVAILABLE))
+        eventually("the connection error", || {
+            cluster.discovery_view().first().is_some_and(|view| {
+                view.last_error.as_deref().is_some_and(|error| {
+                    error.starts_with(&format!("connecting to 127.0.0.1:{port}"))
+                })
+            })
         })
         .await;
         assert!(cluster.view().is_empty());
@@ -2140,6 +2475,252 @@ mod tests {
             cluster.check(&hello(id(LAPTOP), "laptop"), &TransportAuth::Ssh),
             Ok(())
         );
+    }
+
+    #[tokio::test]
+    async fn a_noise_hello_must_come_from_the_id_its_key_is_trusted_for() {
+        let (desk, laptop) = (id(DESK), id(LAPTOP));
+        let (desk_key, laptop_key) = (PublicKey([1; 32]), PublicKey([2; 32]));
+        let mut trust = TrustStore::default();
+        trust.witness(desk, "desk", desk_key);
+        trust.witness(laptop, "laptop", laptop_key);
+        let fixture = Setup { trust, ..setup() }.build();
+        let cluster = &fixture.cluster;
+        let stranger = PublicKey([3; 32]);
+
+        assert_eq!(
+            cluster.check(&hello(desk, "desk"), &noise(desk_key, Voucher::TrustStore)),
+            Ok(())
+        );
+        assert_eq!(
+            cluster.check(
+                &hello(desk, "desk"),
+                &noise(laptop_key, Voucher::TrustStore)
+            ),
+            Err(Refusal::Untrusted)
+        );
+        assert_eq!(
+            cluster.check(&hello(laptop, "laptop"), &noise(desk_key, Voucher::Nobody)),
+            Err(Refusal::Untrusted)
+        );
+        assert_eq!(
+            cluster.check(
+                &hello(id(OTHER), "other"),
+                &noise(stranger, Voucher::Nobody)
+            ),
+            Err(Refusal::Untrusted)
+        );
+        assert_eq!(
+            cluster.admit(&noise(stranger, Voucher::Nobody)),
+            Err(Refusal::Untrusted)
+        );
+        assert_eq!(cluster.admit(&noise(desk_key, Voucher::TrustStore)), Ok(()));
+        assert_eq!(cluster.admit(&noise(stranger, Voucher::Tailnet)), Ok(()));
+        assert_eq!(cluster.admit(&TransportAuth::Ssh), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn ssh_and_vouched_links_record_their_key_as_direct_evidence() {
+        let (desk, laptop) = (id(DESK), id(LAPTOP));
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Setup {
+            state_dir: Some(dir.path().to_owned()),
+            ..setup()
+        }
+        .build();
+        let cluster = &fixture.cluster;
+
+        let first = PublicKey([1; 32]);
+        assert_eq!(
+            cluster.check(&keyed(desk, "desk", first), &TransportAuth::Ssh),
+            Ok(())
+        );
+        let rotated = PublicKey([2; 32]);
+        assert_eq!(
+            cluster.check(&keyed(desk, "desk", rotated), &TransportAuth::Ssh),
+            Ok(())
+        );
+        let vouched = PublicKey([3; 32]);
+        assert_eq!(
+            cluster.check(&hello(laptop, "laptop"), &noise(vouched, Voucher::Tailnet)),
+            Ok(())
+        );
+        assert_eq!(
+            cluster.check(
+                &hello(id(OTHER), "other"),
+                &noise(rotated, Voucher::Pairing)
+            ),
+            Err(Refusal::Untrusted)
+        );
+
+        let saved = TrustStore::load(&dir.path().join(TRUST_FILE)).unwrap();
+        assert_eq!(saved, cluster.members().trust);
+        assert_eq!(
+            saved.trusted,
+            [
+                TrustedPeer {
+                    id: desk,
+                    name: "desk".into(),
+                    key: rotated,
+                    introduced_by: None,
+                    direct: true,
+                },
+                TrustedPeer {
+                    id: laptop,
+                    name: "laptop".into(),
+                    key: vouched,
+                    introduced_by: None,
+                    direct: true,
+                },
+            ]
+        );
+        assert!(cluster.trusts_anyone());
+        assert_eq!(cluster.voucher(&rotated), Voucher::TrustStore);
+        assert_eq!(cluster.voucher(&first), Voucher::Nobody);
+    }
+
+    #[tokio::test]
+    async fn a_rotated_key_is_saved_and_carried_by_later_hellos() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Setup {
+            state_dir: Some(dir.path().to_owned()),
+            ..setup()
+        }
+        .build();
+        let cluster = &fixture.cluster;
+        let before = cluster.hello().public_key.unwrap();
+
+        let rotated = cluster.rotate_key().unwrap();
+
+        assert_ne!(rotated, before);
+        assert_eq!(cluster.hello().public_key, Some(rotated));
+        assert_eq!(cluster.public_key(), rotated);
+        assert_eq!(
+            NoiseKey::load_or_create(dir.path()).unwrap().public(),
+            rotated
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_tcp_addresses_are_never_gossiped_or_learned() {
+        let desk = id(DESK);
+        let fixture = setup()
+            .server("desk", "tcp://192.168.0.5:7447")
+            .server("desk-here", "tcp://127.0.0.1:7447")
+            .build();
+        let cluster = &fixture.cluster;
+        verify(cluster, "tcp://192.168.0.5:7447", desk);
+        verify(cluster, "tcp://127.0.0.1:7447", desk);
+
+        let gossiped: Vec<String> = cluster
+            .gossip()
+            .into_iter()
+            .map(|peer| peer.address)
+            .collect();
+        assert_eq!(gossiped, ["tcp://192.168.0.5:7447"]);
+
+        cluster.learn(&[PeerAddress {
+            id: id(LAPTOP),
+            name: "laptop".into(),
+            address: "tcp://0.0.0.0:7447".into(),
+        }]);
+        assert_eq!(cluster.members().targets.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_gossiped_tombstone_drops_the_server_like_forget() {
+        let (desk, laptop) = (id(DESK), id(LAPTOP));
+        let desk_key = PublicKey([1; 32]);
+        let mut trust = TrustStore::default();
+        trust.witness(desk, "desk", desk_key);
+        let fixture = Setup {
+            trust,
+            ..setup().server("desk", "tcp://192.168.0.5:7447")
+        }
+        .build();
+        let cluster = &fixture.cluster;
+        verify(cluster, "tcp://192.168.0.5:7447", desk);
+        cluster.members().peers.insert(desk, peer_record("desk"));
+        let tombstone = TrustUpdate {
+            trusted: Vec::new(),
+            forgotten: vec![crate::protocol::ForgottenPeer {
+                id: desk,
+                key: Some(desk_key),
+            }],
+        };
+
+        cluster.merge_trust(laptop, &tombstone);
+
+        assert!(cluster.members().targets.is_empty());
+        assert!(cluster.view().is_empty());
+        assert!(!cluster.trusts_anyone());
+        assert_eq!(
+            cluster.check(&hello(desk, "desk"), &TransportAuth::Ssh),
+            Err(Refusal::Forgotten)
+        );
+    }
+
+    async fn closed_by_the_server(stream: &mut TcpStream) -> bool {
+        let mut byte = [0; 1];
+        matches!(
+            tokio::time::timeout(PATIENCE, stream.read(&mut byte)).await,
+            Ok(Ok(0) | Err(_))
+        )
+    }
+
+    #[tokio::test]
+    async fn the_listener_drops_excess_handshakes_and_closes_pairing_connections() {
+        let fixture = setup().build();
+        let cluster = &fixture.cluster;
+        let listener = Listener::bind(cluster, "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let address = listener.local_addr();
+        let mut pending = Vec::new();
+        for _ in 0..listener::MAX_PENDING_HANDSHAKES {
+            pending.push(TcpStream::connect(address).await.unwrap());
+        }
+        eventually("every handshake slot to fill", || {
+            cluster.handshakes.available_permits() == 0
+        })
+        .await;
+
+        let mut excess = TcpStream::connect(address).await.unwrap();
+        assert!(closed_by_the_server(&mut excess).await);
+
+        drop(pending);
+        eventually("the handshake slots to free up", || {
+            cluster.handshakes.available_permits() == listener::MAX_PENDING_HANDSHAKES
+        })
+        .await;
+        let mut pairing = TcpStream::connect(address).await.unwrap();
+        protocol::write_message(&mut pairing, &crate::protocol::TcpOpen::new(TcpKind::Pair))
+            .await
+            .unwrap();
+        assert!(closed_by_the_server(&mut pairing).await);
+    }
+
+    #[tokio::test]
+    async fn the_listener_answers_only_peer_greetings() {
+        let fixture = setup().build();
+        let listener = Listener::bind(&fixture.cluster, "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let stream = TcpStream::connect(listener.local_addr()).await.unwrap();
+        let key = NoiseKey::generate().unwrap();
+        let mut secured = noise::initiate(stream, &key, TcpKind::Link).await.unwrap();
+        assert_eq!(secured.remote, fixture.cluster.public_key());
+
+        let welcome = protocol::greet(&mut secured.stream, Role::Client, &Version::current())
+            .await
+            .unwrap();
+
+        assert_eq!(welcome.server_name, "here");
+        let closed = tokio::time::timeout(PATIENCE, protocol::read_frame(&mut secured.stream))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(closed, None);
     }
 
     #[tokio::test]

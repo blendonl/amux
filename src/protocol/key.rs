@@ -42,18 +42,13 @@ impl FromStr for PublicKey {
     type Err = anyhow::Error;
 
     fn from_str(text: &str) -> Result<Self> {
-        if text.len() != PUBLIC_KEY_LEN * 2 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            bail!(
+        match from_hex(text) {
+            Some(key) => Ok(Self(key)),
+            None => bail!(
                 "{text:?} is not a {} digit hex public key",
                 PUBLIC_KEY_LEN * 2
-            );
+            ),
         }
-        let mut key = [0; PUBLIC_KEY_LEN];
-        for (byte, pair) in key.iter_mut().zip(text.as_bytes().chunks(2)) {
-            let pair = std::str::from_utf8(pair)?;
-            *byte = u8::from_str_radix(pair, 16)?;
-        }
-        Ok(Self(key))
     }
 }
 
@@ -78,7 +73,19 @@ impl<'de> Deserialize<'de> for PublicKey {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn from_hex(text: &str) -> Option<[u8; PUBLIC_KEY_LEN]> {
+    if text.len() != PUBLIC_KEY_LEN * 2 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut key = [0; PUBLIC_KEY_LEN];
+    for (byte, pair) in key.iter_mut().zip(text.as_bytes().chunks(2)) {
+        let pair = std::str::from_utf8(pair).ok()?;
+        *byte = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(key)
+}
+
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes
         .iter()
         .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
