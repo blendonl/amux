@@ -9,6 +9,7 @@ use super::mouse::MouseEvent;
 use super::pane::Pane;
 use super::render::{self, Frame, InputModes, Screens};
 use crate::protocol::{Direction, Size, Split, WindowSummary};
+use crate::settings::Settings;
 
 pub struct Window {
     index: usize,
@@ -100,8 +101,8 @@ impl Window {
         }
     }
 
-    pub fn compose(&self, size: Size) -> Frame {
-        let mut frame = render::compose(&self.layout, size, self.active, self);
+    pub fn compose(&self, size: Size, settings: &Settings) -> Frame {
+        let mut frame = render::compose(&self.layout, size, self.active, self, settings);
         report_clicks(&mut frame.modes, self.panes.len() > 1);
         frame
     }

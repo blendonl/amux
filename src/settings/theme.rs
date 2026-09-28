@@ -18,6 +18,8 @@ pub struct Theme {
     pub tree_cursor: StyleSpec,
     pub overlay_text: StyleSpec,
     pub overlay_border: StyleSpec,
+    pub pane_border: StyleSpec,
+    pub pane_border_active: StyleSpec,
 }
 
 impl Default for Theme {
@@ -36,6 +38,11 @@ impl Default for Theme {
             tree_cursor: StyleSpec::REVERSE,
             overlay_text: StyleSpec::BOLD,
             overlay_border: StyleSpec::EMPTY,
+            pane_border: StyleSpec::EMPTY,
+            pane_border_active: StyleSpec {
+                fg: Some(Color::GREEN),
+                ..StyleSpec::EMPTY
+            },
         }
     }
 }
@@ -63,7 +70,7 @@ mod tests {
                 ..Theme::default()
             }
         );
-        assert!(toml::from_str::<Theme>("[pane_border]\nfg = \"red\"").is_err());
+        assert!(toml::from_str::<Theme>("[pane_bordr]\nfg = \"red\"").is_err());
         assert!(toml::from_str::<Theme>("[status]\nblink = true").is_err());
     }
 

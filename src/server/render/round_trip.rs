@@ -6,6 +6,7 @@ use super::grid::Cell;
 use super::{compose, Frame, GridDiffer, InputModes};
 use crate::protocol::Size;
 use crate::server::layout::{Layout, PaneId, Rect, SplitDirection};
+use crate::settings::Settings;
 
 const A: PaneId = PaneId(0);
 const B: PaneId = PaneId(1);
@@ -53,7 +54,13 @@ impl Window {
     }
 
     fn frame(&self) -> Frame {
-        compose(&self.layout, WINDOW, self.active, &self.panes)
+        compose(
+            &self.layout,
+            WINDOW,
+            self.active,
+            &self.panes,
+            &Settings::default(),
+        )
     }
 
     fn fill(&mut self) {
@@ -249,13 +256,13 @@ fn only_the_changed_cells_are_sent() {
     let mut panes = BTreeMap::from([(A, vt100::Parser::new(WINDOW.rows, WINDOW.cols, 0))]);
     panes.get_mut(&A).unwrap().process(b"hello world");
     let mut client = Client::new(WINDOW);
-    client.show(&compose(&layout, WINDOW, A, &panes));
+    client.show(&compose(&layout, WINDOW, A, &panes, &Settings::default()));
 
     panes
         .get_mut(&A)
         .unwrap()
         .process(b"\x1b[1;1HH\x1b[1;7HW\x1b[1;12H");
-    let frame = compose(&layout, WINDOW, A, &panes);
+    let frame = compose(&layout, WINDOW, A, &panes, &Settings::default());
     assert_eq!(
         client.show(&frame),
         b"\x1b[?25l\x1b[1HH\x1b[5CW\x1b[4C\x1b[?25h"
@@ -263,7 +270,7 @@ fn only_the_changed_cells_are_sent() {
     client.assert_shows(&frame);
 
     panes.get_mut(&A).unwrap().process(b"\x1b[1;7H\x1b[31;1mw");
-    let frame = compose(&layout, WINDOW, A, &panes);
+    let frame = compose(&layout, WINDOW, A, &panes, &Settings::default());
     assert_eq!(
         client.show(&frame),
         b"\x1b[?25l\x1b[1;7H\x1b[1;31mw\x1b[0m\x1b[?25h"

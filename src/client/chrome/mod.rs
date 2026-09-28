@@ -3,7 +3,6 @@ mod overlay;
 mod panel;
 mod prompt;
 mod status;
-mod template;
 #[cfg(test)]
 pub mod testing;
 

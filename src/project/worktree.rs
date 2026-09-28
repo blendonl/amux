@@ -11,7 +11,6 @@ use super::{canonical, git};
 
 const ORIGIN: &str = "origin";
 const ORIGIN_HEAD: &str = "refs/remotes/origin/HEAD";
-const WORKTREES_DIR_SUFFIX: &str = "-worktrees";
 
 pub(super) struct Worktree {
     pub(super) path: PathBuf,
@@ -52,11 +51,11 @@ pub fn default_branch(checkout: &Path) -> Result<String> {
     })
 }
 
-pub fn default_worktrees_dir(checkout: &Path, project_name: &str) -> PathBuf {
+pub fn default_worktrees_dir(checkout: &Path, project_name: &str, suffix: &str) -> PathBuf {
     checkout
         .parent()
         .unwrap_or(checkout)
-        .join(format!("{project_name}{WORKTREES_DIR_SUFFIX}"))
+        .join(format!("{project_name}{suffix}"))
 }
 
 pub fn ensure_worktree(checkout: &Path, branch: &str, worktrees_dir: &Path) -> Result<PathBuf> {
@@ -213,6 +212,7 @@ mod tests {
     use super::super::detect::detect;
     use super::super::testing::{commit, git, head, path_str, Fixture, LOCAL_ONLY, REMOTE_ONLY};
     use super::*;
+    use crate::settings::WorktreeSettings;
 
     struct Setup {
         fixture: Fixture,
@@ -225,7 +225,7 @@ mod tests {
         let fixture = Fixture::new();
         let origin = fixture.origin();
         let checkout = fixture.clone_of(&origin, "amux");
-        let worktrees = default_worktrees_dir(&checkout, "amux");
+        let worktrees = default_worktrees_dir(&checkout, "amux", &default_suffix());
         Setup {
             fixture,
             origin,
@@ -246,11 +246,31 @@ mod tests {
         .ok()
     }
 
+    fn default_suffix() -> String {
+        WorktreeSettings::default().suffix
+    }
+
     #[test]
     fn worktrees_default_to_a_sibling_directory() {
         assert_eq!(
-            default_worktrees_dir(Path::new("/home/tester/projects/amux"), "amux"),
+            default_worktrees_dir(
+                Path::new("/home/tester/projects/amux"),
+                "amux",
+                &default_suffix()
+            ),
             PathBuf::from("/home/tester/projects/amux-worktrees")
+        );
+    }
+
+    #[test]
+    fn the_worktrees_directory_takes_the_configured_suffix() {
+        assert_eq!(
+            default_worktrees_dir(Path::new("/home/tester/projects/amux"), "amux", ".trees"),
+            PathBuf::from("/home/tester/projects/amux.trees")
+        );
+        assert_eq!(
+            default_worktrees_dir(Path::new("/amux"), "amux", "-wt"),
+            PathBuf::from("/amux-wt")
         );
     }
 

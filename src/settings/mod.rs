@@ -1,7 +1,9 @@
 mod callback;
 mod client;
+mod host;
 mod keymap;
 mod style;
+pub mod template;
 mod theme;
 
 use std::time::Duration;
@@ -10,6 +12,9 @@ use serde::{Deserialize, Serialize};
 
 pub use callback::CallbackId;
 pub use client::{StatusSettings, TreeSettings};
+pub use host::{
+    BorderSettings, MouseSettings, PaneSettings, SessionSettings, WindowSettings, WorktreeSettings,
+};
 pub use keymap::{
     Binding, Keymap, PromptAction, Table, TreeAction, PREFIX_TABLE, PROMPT_TABLE, ROOT_TABLE,
     TREE_TABLE,
@@ -28,6 +33,12 @@ pub struct Settings {
     pub status: StatusSettings,
     pub theme: Theme,
     pub tree: TreeSettings,
+    pub pane: PaneSettings,
+    pub window: WindowSettings,
+    pub session: SessionSettings,
+    pub borders: BorderSettings,
+    pub mouse: MouseSettings,
+    pub worktrees: WorktreeSettings,
 }
 
 impl Settings {
@@ -49,6 +60,12 @@ impl Default for Settings {
             status: StatusSettings::default(),
             theme: Theme::default(),
             tree: TreeSettings::default(),
+            pane: PaneSettings::default(),
+            window: WindowSettings::default(),
+            session: SessionSettings::default(),
+            borders: BorderSettings::default(),
+            mouse: MouseSettings::default(),
+            worktrees: WorktreeSettings::default(),
         }
     }
 }
@@ -103,5 +120,47 @@ mod tests {
         assert!(toml::from_str::<Settings>("[tree]\nbogus = 1").is_err());
         assert!(toml::from_str::<Settings>("[theme]\nbogus = {}").is_err());
         assert!(toml::from_str::<Settings>("[theme.status]\nbogus = 1").is_err());
+    }
+
+    #[test]
+    fn host_settings_are_read_from_their_own_tables() {
+        let settings: Settings = toml::from_str(
+            "[pane]\nterm = \"tmux-256color\"\n\n\
+             [window]\nbase_index = 1\n\n\
+             [session]\nclash_format = \"{base}.{n}\"\n\n\
+             [borders]\nvertical = \"|\"\n\n\
+             [mouse]\nescape_time_ms = 40\n\n\
+             [worktrees]\nsuffix = \".trees\"\n\n\
+             [theme.pane_border_active]\nfg = \"bright-blue\"",
+        )
+        .unwrap();
+        assert_eq!(settings.pane.term, "tmux-256color");
+        assert_eq!(settings.pane.scrollback, 10_000);
+        assert_eq!(settings.window.base_index, 1);
+        assert_eq!(settings.session.clash_format, "{base}.{n}");
+        assert_eq!(settings.session.clash_start, 2);
+        assert_eq!(settings.borders.vertical, '|');
+        assert_eq!(settings.borders.horizontal, '─');
+        assert_eq!(settings.mouse.escape_time_ms, 40);
+        assert_eq!(settings.worktrees.suffix, ".trees");
+        assert_eq!(settings.worktrees.fetch_timeout_ms, 30_000);
+        assert_eq!(
+            settings.theme.pane_border_active.fg,
+            Some(Color::Indexed(12))
+        );
+        assert_eq!(settings.theme.pane_border, StyleSpec::EMPTY);
+    }
+
+    #[test]
+    fn the_default_settings_round_trip() {
+        let written = toml::to_string(&Settings::default()).unwrap();
+        assert_eq!(
+            toml::from_str::<Settings>(&written).unwrap(),
+            Settings::default()
+        );
+        assert!(written.contains("term = \"screen-256color\""), "{written}");
+        assert!(written.contains("strip_env = [\"SSH_\"]"), "{written}");
+        assert!(written.contains("cross = \"┼\""), "{written}");
+        assert!(!written.contains("shell"), "{written}");
     }
 }

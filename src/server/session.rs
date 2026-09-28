@@ -16,8 +16,7 @@ use crate::project::ProjectId;
 use crate::protocol::{
     SessionCommand, SessionId, SessionInfo, SessionState, Size, Split, WindowSummary,
 };
-
-const FALLBACK_WINDOW_NAME: &str = "shell";
+use crate::settings::Settings;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
@@ -43,6 +42,7 @@ pub struct Session {
     cwd: PathBuf,
     env: Vec<(String, String)>,
     binding: Option<Binding>,
+    settings: Arc<Settings>,
     windows: Mutex<Windows>,
 }
 
@@ -54,6 +54,7 @@ impl Session {
         size: Size,
         env: &[(String, String)],
         binding: Option<Binding>,
+        settings: Arc<Settings>,
     ) -> Result<Arc<Self>> {
         let session = Arc::new(Self {
             id,
@@ -61,10 +62,11 @@ impl Session {
             attached_clients: AtomicUsize::new(0),
             last_activity: Mutex::new(SystemTime::now()),
             activity: Notify::new(),
-            window_name: shell_name(),
+            window_name: settings.window.name.clone().unwrap_or_else(shell_name),
             cwd: cwd.to_owned(),
             env: env.to_vec(),
             binding,
+            settings,
             windows: Mutex::new(Windows::new(size.clamped())),
         });
         session.open_window()?;
@@ -174,7 +176,11 @@ impl Session {
     pub fn frame(&self) -> Option<Frame> {
         let windows = self.state();
         windows.signals.as_ref()?;
-        Some(windows.active_window()?.compose(windows.size))
+        Some(
+            windows
+                .active_window()?
+                .compose(windows.size, &self.settings),
+        )
     }
 
     pub fn input(&self, event: InputEvent) {
@@ -308,7 +314,7 @@ impl Session {
         if windows.signals.is_none() {
             bail!("the session has ended");
         }
-        let index = windows.free_index();
+        let index = windows.free_index(self.settings.window.base_index);
         let id = windows.next_pane_id();
         let pane = self.spawn_pane(id, windows.size)?;
         let position = windows
@@ -341,6 +347,7 @@ impl Session {
             cwd: &self.cwd,
             size,
             env: &self.env,
+            settings: &self.settings.pane,
             observer,
         })
     }
@@ -420,8 +427,8 @@ impl Windows {
         id
     }
 
-    fn free_index(&self) -> usize {
-        (0..)
+    fn free_index(&self, base: usize) -> usize {
+        (base..)
             .find(|index| self.list.iter().all(|window| window.index() != *index))
             .expect("a free window index always exists")
     }
@@ -529,9 +536,73 @@ fn shell_name() -> String {
         .map(Path::new)
         .and_then(Path::file_name)
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| FALLBACK_WINDOW_NAME.to_owned())
+        .unwrap_or_else(|| "shell".to_owned())
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::{PaneSettings, WindowSettings};
+
+    fn spawn(window: WindowSettings) -> Arc<Session> {
+        let settings = Settings {
+            window,
+            pane: PaneSettings {
+                shell: Some(vec!["/bin/sh".into()]),
+                ..PaneSettings::default()
+            },
+            ..Settings::default()
+        };
+        Session::spawn(
+            SessionId(1),
+            "work".into(),
+            &env::temp_dir(),
+            Size { rows: 24, cols: 80 },
+            &[],
+            None,
+            Arc::new(settings),
+        )
+        .unwrap()
+    }
+
+    fn listed(session: &Session) -> Vec<(usize, String)> {
+        session
+            .windows()
+            .into_iter()
+            .map(|window| (window.index, window.name))
+            .collect()
+    }
+
+    #[test]
+    fn windows_are_numbered_from_zero_and_named_after_the_shell() {
+        let session = spawn(WindowSettings::default());
+        session.run(SessionCommand::NewWindow).unwrap();
+
+        assert_eq!(listed(&session), [(0, shell_name()), (1, shell_name())]);
+        session.kill();
+    }
+
+    #[test]
+    fn windows_are_numbered_from_the_base_index_with_the_configured_name() {
+        let session = spawn(WindowSettings {
+            base_index: 1,
+            name: Some("editor".into()),
+        });
+        session.run(SessionCommand::NewWindow).unwrap();
+        session.run(SessionCommand::NewWindow).unwrap();
+        session.kill_window(2).unwrap();
+        session.run(SessionCommand::NewWindow).unwrap();
+
+        let editor = || "editor".to_owned();
+        assert_eq!(
+            listed(&session),
+            [(1, editor()), (2, editor()), (3, editor())]
+        );
+        assert_eq!(session.status().active, 2);
+        session.kill();
+    }
 }

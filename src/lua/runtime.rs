@@ -200,6 +200,45 @@ mod tests {
     }
 
     #[test]
+    fn host_options_are_set_through_amux_opt() {
+        let loaded = loaded(
+            "local opt = amux.opt\n\
+             opt.pane.shell = { '/usr/bin/fish', '-l' }\n\
+             opt.pane.term = 'tmux-256color'\n\
+             opt.pane.env.EDITOR = 'vi'\n\
+             opt.window.base_index = 1\n\
+             opt.borders.vertical = '|'\n\
+             opt.theme.pane_border_active = { fg = 'bright-blue' }\n\
+             assert(opt.borders.cross == '┼')",
+        );
+        let settings = loaded.settings;
+        assert_eq!(
+            settings.pane.shell,
+            Some(vec!["/usr/bin/fish".into(), "-l".into()])
+        );
+        assert_eq!(settings.pane.term, "tmux-256color");
+        assert_eq!(
+            settings.pane.env.get("EDITOR").map(String::as_str),
+            Some("vi")
+        );
+        assert_eq!(settings.window.base_index, 1);
+        assert_eq!(settings.borders.vertical, '|');
+        assert_eq!(
+            settings.theme.pane_border_active,
+            StyleSpec {
+                fg: Some(Color::Indexed(12)),
+                ..StyleSpec::EMPTY
+            }
+        );
+
+        let error = failure("amux.opt.borders.vertical = '||'");
+        assert!(
+            error.contains("init.lua:1: amux.opt.borders.vertical: invalid value"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn an_unknown_option_reports_the_init_line() {
         let error = failure("amux.opt.prefix = 'C-a'\n\namux.opt.bogus = true");
         assert!(
@@ -207,7 +246,10 @@ mod tests {
             "{error}"
         );
         assert!(
-            error.contains("escape_time_ms, notice_ms, prefix, status, theme, tree"),
+            error.contains(
+                "borders, escape_time_ms, mouse, notice_ms, pane, prefix, session, status, \
+                 theme, tree, window, worktrees"
+            ),
             "{error}"
         );
 

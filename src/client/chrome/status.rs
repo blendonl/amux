@@ -1,9 +1,8 @@
 use std::time::Duration;
 
 use super::draw::{self, Span, Style};
-use super::template;
 use crate::protocol::WindowSummary;
-use crate::settings::{StatusSettings, Theme};
+use crate::settings::{template, StatusSettings, Theme};
 
 const MIN_SESSION_COLUMNS: usize = 4;
 const GAP: usize = 1;

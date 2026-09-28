@@ -4,22 +4,9 @@ use vt100::Color;
 
 use crate::protocol::Size;
 use crate::server::layout::{Border, BorderLine, Rect};
+use crate::settings::{self, BorderSettings, Settings, StyleSpec};
 
 const TEXT_CAPACITY: usize = 22;
-
-const BORDER_STYLE: Style = Style {
-    fg: Color::Default,
-    bg: Color::Default,
-    bold: false,
-    dim: false,
-    italic: false,
-    underline: false,
-    inverse: false,
-};
-const ACTIVE_BORDER_STYLE: Style = Style {
-    fg: Color::Idx(2),
-    ..BORDER_STYLE
-};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Style {
@@ -30,6 +17,45 @@ pub struct Style {
     pub italic: bool,
     pub underline: bool,
     pub inverse: bool,
+}
+
+impl From<StyleSpec> for Style {
+    fn from(spec: StyleSpec) -> Self {
+        Self {
+            fg: spec.fg.map_or(Color::Default, vt100_color),
+            bg: spec.bg.map_or(Color::Default, vt100_color),
+            bold: spec.bold.unwrap_or_default(),
+            dim: spec.dim.unwrap_or_default(),
+            italic: spec.italic.unwrap_or_default(),
+            underline: spec.underline.unwrap_or_default(),
+            inverse: spec.reverse.unwrap_or_default(),
+        }
+    }
+}
+
+fn vt100_color(color: settings::Color) -> Color {
+    match color {
+        settings::Color::Default => Color::Default,
+        settings::Color::Indexed(index) => Color::Idx(index),
+        settings::Color::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BorderLook {
+    glyphs: BorderSettings,
+    style: Style,
+    active_style: Style,
+}
+
+impl BorderLook {
+    pub fn new(settings: &Settings) -> Self {
+        Self {
+            glyphs: settings.borders,
+            style: settings.theme.pane_border.into(),
+            active_style: settings.theme.pane_border_active.into(),
+        }
+    }
 }
 
 impl Style {
@@ -157,7 +183,7 @@ impl Grid {
         }
     }
 
-    pub fn draw_borders(&mut self, borders: &[Border], active: Option<Rect>) {
+    pub fn draw_borders(&mut self, borders: &[Border], active: Option<Rect>, look: &BorderLook) {
         let mut lines = vec![None; self.cells.len()];
         for border in borders {
             let area = self.clip(border.rect);
@@ -189,11 +215,15 @@ impl Grid {
                     right: is_border(Some(row), col.checked_add(1)),
                 };
                 let style = if active.is_some_and(|rect| touches(rect, row, col)) {
-                    ACTIVE_BORDER_STYLE
+                    look.active_style
                 } else {
-                    BORDER_STYLE
+                    look.style
                 };
-                glyphs.push((row, col, Cell::glyph(joins.glyph(line), style)));
+                glyphs.push((
+                    row,
+                    col,
+                    Cell::glyph(joins.glyph(line, &look.glyphs), style),
+                ));
             }
         }
         for (row, col, cell) in glyphs {
@@ -253,22 +283,22 @@ struct Joins {
 }
 
 impl Joins {
-    fn glyph(&self, line: BorderLine) -> char {
+    fn glyph(&self, line: BorderLine, glyphs: &BorderSettings) -> char {
         match (self.up, self.down, self.left, self.right) {
-            (true, true, true, true) => '┼',
-            (true, true, true, false) => '┤',
-            (true, true, false, true) => '├',
-            (true, false, true, true) => '┴',
-            (false, true, true, true) => '┬',
-            (false, true, false, true) => '┌',
-            (false, true, true, false) => '┐',
-            (true, false, false, true) => '└',
-            (true, false, true, false) => '┘',
-            (true, true, false, false) => '│',
-            (false, false, true, true) => '─',
+            (true, true, true, true) => glyphs.cross,
+            (true, true, true, false) => glyphs.right_tee,
+            (true, true, false, true) => glyphs.left_tee,
+            (true, false, true, true) => glyphs.bottom_tee,
+            (false, true, true, true) => glyphs.top_tee,
+            (false, true, false, true) => glyphs.top_left,
+            (false, true, true, false) => glyphs.top_right,
+            (true, false, false, true) => glyphs.bottom_left,
+            (true, false, true, false) => glyphs.bottom_right,
+            (true, true, false, false) => glyphs.vertical,
+            (false, false, true, true) => glyphs.horizontal,
             _ => match line {
-                BorderLine::Vertical => '│',
-                BorderLine::Horizontal => '─',
+                BorderLine::Vertical => glyphs.vertical,
+                BorderLine::Horizontal => glyphs.horizontal,
             },
         }
     }
@@ -295,6 +325,10 @@ mod tests {
             rows,
             cols,
         }
+    }
+
+    fn default_look() -> BorderLook {
+        BorderLook::new(&Settings::default())
     }
 
     fn screen(cols: u16, rows: u16, input: &str) -> vt100::Parser {
@@ -391,7 +425,7 @@ mod tests {
             .unwrap();
 
         let mut grid = Grid::new(window);
-        grid.draw_borders(&layout.borders(window), None);
+        grid.draw_borders(&layout.borders(window), None, &default_look());
         assert_eq!(row_text(&grid, 0), "...│...");
         assert_eq!(row_text(&grid, 1), "...│...");
         assert_eq!(row_text(&grid, 2), "───┼───");
@@ -405,7 +439,7 @@ mod tests {
             .split(PaneId(1), PaneId(2), SplitDirection::TopBottom, window)
             .unwrap();
         let mut grid = Grid::new(window);
-        grid.draw_borders(&layout.borders(window), None);
+        grid.draw_borders(&layout.borders(window), None, &default_look());
         assert_eq!(row_text(&grid, 1), "...│...");
         assert_eq!(row_text(&grid, 2), "...├───");
     }
@@ -418,7 +452,7 @@ mod tests {
             .split(PaneId(0), PaneId(1), SplitDirection::LeftRight, window)
             .unwrap();
         let mut grid = Grid::new(window);
-        grid.draw_borders(&layout.borders(window), None);
+        grid.draw_borders(&layout.borders(window), None, &default_look());
         assert_eq!(row_text(&grid, 0), ".│.");
     }
 
@@ -435,11 +469,11 @@ mod tests {
         let rects = layout.rects(window);
         let highlighted = |active: Rect| {
             let mut grid = Grid::new(window);
-            grid.draw_borders(&layout.borders(window), Some(active));
+            grid.draw_borders(&layout.borders(window), Some(active), &default_look());
             let mut cells = Vec::new();
             for row in 0..window.rows {
                 for col in 0..window.cols {
-                    if grid.cell(row, col).unwrap().style() == ACTIVE_BORDER_STYLE {
+                    if grid.cell(row, col).unwrap().style() == default_look().active_style {
                         cells.push((row, col));
                     }
                 }
@@ -459,6 +493,87 @@ mod tests {
             highlighted(rects[2].1),
             vec![(2, 3), (2, 4), (2, 5), (2, 6), (3, 3), (4, 3)]
         );
+    }
+
+    #[test]
+    fn the_default_look_is_plain_with_a_green_active_border() {
+        let look = default_look();
+        assert_eq!(look.style, Style::default());
+        assert_eq!(
+            look.active_style,
+            Style {
+                fg: Color::Idx(2),
+                ..Style::default()
+            }
+        );
+        assert_eq!(look.glyphs, BorderSettings::default());
+    }
+
+    #[test]
+    fn a_style_spec_sets_only_what_it_names() {
+        assert_eq!(Style::from(StyleSpec::EMPTY), Style::default());
+        let spec = StyleSpec {
+            fg: Some(settings::Color::Rgb(1, 2, 3)),
+            bg: Some(settings::Color::Indexed(236)),
+            bold: Some(true),
+            dim: Some(false),
+            italic: Some(true),
+            underline: Some(true),
+            reverse: Some(true),
+        };
+        assert_eq!(
+            Style::from(spec),
+            Style {
+                fg: Color::Rgb(1, 2, 3),
+                bg: Color::Idx(236),
+                bold: true,
+                dim: false,
+                italic: true,
+                underline: true,
+                inverse: true,
+            }
+        );
+        assert_eq!(
+            Style::from(StyleSpec::colors(
+                settings::Color::Default,
+                settings::Color::GREEN
+            ))
+            .bg,
+            Color::Idx(2)
+        );
+    }
+
+    #[test]
+    fn borders_use_the_configured_glyphs() {
+        let look = BorderLook::new(&Settings {
+            borders: BorderSettings {
+                horizontal: 'h',
+                vertical: 'v',
+                left_tee: 'l',
+                cross: 'x',
+                ..BorderSettings::default()
+            },
+            ..Settings::default()
+        });
+        let window = size(7, 5);
+        let mut layout = Layout::new(PaneId(0));
+        layout
+            .split(PaneId(0), PaneId(1), SplitDirection::LeftRight, window)
+            .unwrap();
+        layout
+            .split(PaneId(1), PaneId(2), SplitDirection::TopBottom, window)
+            .unwrap();
+        let mut grid = Grid::new(window);
+        grid.draw_borders(&layout.borders(window), None, &look);
+        assert_eq!(row_text(&grid, 0), "...v...");
+        assert_eq!(row_text(&grid, 2), "...lhhh");
+
+        layout
+            .split(PaneId(0), PaneId(3), SplitDirection::TopBottom, window)
+            .unwrap();
+        let mut grid = Grid::new(window);
+        grid.draw_borders(&layout.borders(window), None, &look);
+        assert_eq!(row_text(&grid, 2), "hhhxhhh");
     }
 
     #[test]

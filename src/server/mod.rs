@@ -15,7 +15,7 @@ use std::io::{self, IsTerminal};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::net::{UnixListener, UnixStream};
@@ -33,6 +33,7 @@ use crate::protocol::{
     Role, ServerMessage, ServerState, ServerStatus, ServerView, SessionId, SessionInfo, Size,
     Snapshot, StateEvent, Version, WindowSummary,
 };
+use crate::settings::{SessionSettings, Settings};
 use crate::target::{self, Candidate, Target};
 use connection::Origin;
 use forward::{Host, RemoteSession};
@@ -41,7 +42,6 @@ use session::{Binding, Session};
 
 const LOG_FILTER_ENV: &str = "AMUX_LOG";
 const EVENT_CAPACITY: usize = 256;
-const ACTIVITY_INTERVAL: Duration = Duration::from_secs(5);
 
 pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
     init_logging();
@@ -82,7 +82,7 @@ pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
         state_dir: Some(state_dir),
         servers: config.servers.clone(),
     };
-    let server = Server::new(identity, config, registry, options);
+    let server = Server::new(identity, config, Settings::default(), registry, options);
     server.cluster.start();
     info!(socket = %socket.display(), version = %Version::current(), "server started");
 
@@ -133,6 +133,7 @@ enum Resolved {
 pub struct Server {
     identity: ServerIdentity,
     config: Config,
+    settings: Arc<Settings>,
     state: Mutex<LocalState>,
     events: broadcast::Sender<Event>,
     cluster: Arc<Cluster>,
@@ -167,6 +168,7 @@ impl Server {
     fn new(
         identity: ServerIdentity,
         config: Config,
+        settings: Settings,
         registry: Registry,
         options: ClusterOptions,
     ) -> Arc<Self> {
@@ -179,6 +181,7 @@ impl Server {
             Self {
                 identity,
                 config,
+                settings: Arc::new(settings),
                 state: Mutex::new(state),
                 events: broadcast::channel(EVENT_CAPACITY).0,
                 cluster: Cluster::new(options, source),
@@ -237,8 +240,10 @@ impl Server {
                 bail!("duplicate session: {name}")
             }
             SessionName::Given(name) => name,
-            SessionName::Derived(base) => free_name_like(&state.sessions, base),
-            SessionName::Numbered => next_free_name(&state.sessions),
+            SessionName::Derived(base) => {
+                free_name_like(&state.sessions, base, &self.settings.session)?
+            }
+            SessionName::Numbered => next_free_name(&state.sessions, &self.settings.session),
         };
         state.last_session_id += 1;
         let id = SessionId(state.last_session_id);
@@ -249,6 +254,7 @@ impl Server {
             spec.size,
             spec.env,
             spec.binding,
+            Arc::clone(&self.settings),
         )?;
         state.sessions.insert(name.clone(), Arc::clone(&session));
         self.publish(&mut state, StateEvent::SessionCreated(session.info()));
@@ -264,7 +270,8 @@ impl Server {
         let mut published = Instant::now();
         let mut pending = false;
         loop {
-            let flush = tokio::time::sleep_until((published + ACTIVITY_INTERVAL).into());
+            let interval = self.settings.session.activity_interval();
+            let flush = tokio::time::sleep_until((published + interval).into());
             tokio::select! {
                 changed = windows.changed() => {
                     if changed.is_err() {
@@ -613,19 +620,29 @@ fn millis(time: SystemTime) -> u64 {
         })
 }
 
-fn free_name_like(sessions: &BTreeMap<String, Arc<Session>>, base: String) -> String {
+fn free_name_like(
+    sessions: &BTreeMap<String, Arc<Session>>,
+    base: String,
+    settings: &SessionSettings,
+) -> Result<String> {
     if !sessions.contains_key(&base) {
-        return base;
+        return Ok(base);
     }
-    (2..)
-        .map(|suffix: usize| format!("{base}-{suffix}"))
+    let name = settings
+        .clash_names(&base)
+        .take(sessions.len() + 1)
         .find(|name| !sessions.contains_key(name))
-        .expect("an unused suffix always exists")
+        .ok_or_else(|| {
+            let format = &settings.clash_format;
+            anyhow!("session.clash_format {format:?} gives no unused name for {base}")
+        })?;
+    target::validate_session_name(&name)?;
+    Ok(name)
 }
 
-fn next_free_name(sessions: &BTreeMap<String, Arc<Session>>) -> String {
-    (0..)
-        .map(|index: usize| index.to_string())
+fn next_free_name(sessions: &BTreeMap<String, Arc<Session>>, settings: &SessionSettings) -> String {
+    settings
+        .numbered_names()
         .find(|name| !sessions.contains_key(name))
         .expect("an unused session index always exists")
 }

@@ -19,8 +19,6 @@ use crate::target::{validate_session_name, Target};
 
 pub type ClientConnection = Duplex<ClientMessage, ServerMessage>;
 
-const ESCAPE_TIME: Duration = Duration::from_millis(25);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     Local,
@@ -355,7 +353,8 @@ async fn attach(
                         session.input(event);
                     }
                     if mouse.has_pending() {
-                        escape.as_mut().reset(Instant::now() + ESCAPE_TIME);
+                        let escape_time = server.settings.mouse.escape_time();
+                        escape.as_mut().reset(Instant::now() + escape_time);
                     }
                 }
                 Some(ClientMessage::Resize(new_size)) => {

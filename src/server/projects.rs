@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -14,7 +13,6 @@ use crate::protocol::{NewSession, ProjectCheckout, ProjectRef, StateEvent};
 use crate::target;
 
 pub const REGISTRY_FILE: &str = "projects.toml";
-const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 type WorktreeKey = (ProjectId, String);
 
@@ -110,8 +108,8 @@ impl Server {
         }
         if request.branch.is_some() {
             let (path, wanted) = (checkout.path.clone(), branch.clone());
-            if let Err(err) =
-                blocking(move || project::fetch_branch(&path, &wanted, FETCH_TIMEOUT)).await
+            let timeout = self.settings.worktrees.fetch_timeout();
+            if let Err(err) = blocking(move || project::fetch_branch(&path, &wanted, timeout)).await
             {
                 debug!(%branch, "fetching the branch from origin failed: {err:#}");
             }
@@ -258,7 +256,13 @@ impl Server {
         [&project.name, &checkout.name]
             .into_iter()
             .find_map(|name| self.config.projects.get(name)?.worktrees_dir.clone())
-            .unwrap_or_else(|| project::default_worktrees_dir(&checkout.path, &checkout.name))
+            .unwrap_or_else(|| {
+                project::default_worktrees_dir(
+                    &checkout.path,
+                    &checkout.name,
+                    &self.settings.worktrees.suffix,
+                )
+            })
     }
 
     fn session_for_worktree(&self, project: &ProjectId, branch: &str) -> Option<Arc<Session>> {

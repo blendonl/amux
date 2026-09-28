@@ -5,12 +5,13 @@ mod grid;
 mod round_trip;
 
 pub use differ::GridDiffer;
-use grid::Grid;
+use grid::{BorderLook, Grid};
 
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 use crate::protocol::Size;
 use crate::server::layout::{Layout, PaneId, Rect};
+use crate::settings::Settings;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct InputModes {
@@ -46,7 +47,13 @@ pub trait Screens {
     fn with_screen<R>(&self, pane: PaneId, read: impl FnOnce(&vt100::Screen) -> R) -> Option<R>;
 }
 
-pub fn compose(layout: &Layout, size: Size, active: PaneId, screens: &impl Screens) -> Frame {
+pub fn compose(
+    layout: &Layout,
+    size: Size,
+    active: PaneId,
+    screens: &impl Screens,
+    settings: &Settings,
+) -> Frame {
     let size = layout.fit(size);
     let mut grid = Grid::new(size);
     let mut cursor = None;
@@ -66,7 +73,11 @@ pub fn compose(layout: &Layout, size: Size, active: PaneId, screens: &impl Scree
             }
         }
     }
-    grid.draw_borders(&layout.borders(size), active_rect);
+    grid.draw_borders(
+        &layout.borders(size),
+        active_rect,
+        &BorderLook::new(settings),
+    );
 
     Frame {
         grid,
@@ -97,6 +108,7 @@ mod tests {
     use super::grid::Style;
     use super::*;
     use crate::server::layout::SplitDirection;
+    use crate::settings::{Color, StyleSpec};
 
     const LEFT: PaneId = PaneId(0);
     const RIGHT: PaneId = PaneId(1);
@@ -125,7 +137,7 @@ mod tests {
         panes.get_mut(&LEFT).unwrap().process(b"left");
         panes.get_mut(&RIGHT).unwrap().process(b"righ");
 
-        let frame = compose(&layout, window, RIGHT, &panes);
+        let frame = compose(&layout, window, RIGHT, &panes, &Settings::default());
         let row: String = (0..9)
             .map(|col| frame.grid.cell(0, col).unwrap().text().to_owned())
             .collect();
@@ -135,6 +147,48 @@ mod tests {
             frame.grid.cell(2, 4).unwrap().style(),
             Style {
                 fg: vt100::Color::Idx(2),
+                ..Style::default()
+            }
+        );
+    }
+
+    #[test]
+    fn composing_draws_borders_with_the_configured_glyphs_and_colors() {
+        let window = size(9, 3);
+        let (mut layout, mut panes) = side_by_side(window);
+        let mut settings = Settings::default();
+        settings.borders.vertical = '|';
+        settings.theme.pane_border = StyleSpec {
+            fg: Some(Color::Indexed(8)),
+            ..StyleSpec::EMPTY
+        };
+        settings.theme.pane_border_active = StyleSpec {
+            fg: Some(Color::Rgb(0x8e, 0xc0, 0x7c)),
+            bold: Some(true),
+            ..StyleSpec::EMPTY
+        };
+
+        let active = compose(&layout, window, RIGHT, &panes, &settings);
+        assert_eq!(active.grid.cell(1, 4).unwrap().text(), "|");
+        assert_eq!(
+            active.grid.cell(1, 4).unwrap().style(),
+            Style {
+                fg: vt100::Color::Rgb(0x8e, 0xc0, 0x7c),
+                bold: true,
+                ..Style::default()
+            }
+        );
+
+        layout
+            .split(RIGHT, PaneId(2), SplitDirection::TopBottom, window)
+            .unwrap();
+        panes.insert(PaneId(2), vt100::Parser::new(1, 4, 0));
+        let frame = compose(&layout, window, PaneId(2), &panes, &settings);
+        assert_eq!(frame.grid.cell(0, 4).unwrap().text(), "|");
+        assert_eq!(
+            frame.grid.cell(0, 4).unwrap().style(),
+            Style {
+                fg: vt100::Color::Idx(8),
                 ..Style::default()
             }
         );
@@ -153,7 +207,7 @@ mod tests {
             .unwrap()
             .process(b"\x1b=\x1b[?1000h\x1b[?1006h\x1b[?25l\r\nab");
 
-        let left = compose(&layout, window, LEFT, &panes);
+        let left = compose(&layout, window, LEFT, &panes, &Settings::default());
         assert_eq!(left.cursor, Some((1, 2)));
         assert_eq!(
             left.modes,
@@ -164,7 +218,7 @@ mod tests {
             }
         );
 
-        let right = compose(&layout, window, RIGHT, &panes);
+        let right = compose(&layout, window, RIGHT, &panes, &Settings::default());
         assert_eq!(right.cursor, Some((1, 7)));
         assert_eq!(
             right.modes,
@@ -185,7 +239,7 @@ mod tests {
         panes.get_mut(&LEFT).unwrap().process(b"abcd");
         assert_eq!(panes[&LEFT].screen().cursor_position(), (0, 4));
 
-        let frame = compose(&layout, window, LEFT, &panes);
+        let frame = compose(&layout, window, LEFT, &panes, &Settings::default());
         assert_eq!(frame.cursor, Some((0, 3)));
     }
 
@@ -195,7 +249,7 @@ mod tests {
         let (layout, mut panes) = side_by_side(window);
         panes.remove(&RIGHT);
 
-        let frame = compose(&layout, window, RIGHT, &panes);
+        let frame = compose(&layout, window, RIGHT, &panes, &Settings::default());
         assert_eq!(frame.cursor, None);
         assert_eq!(frame.modes, InputModes::default());
         assert!(frame.grid.cell(0, 5).unwrap().is_erased());
@@ -204,7 +258,7 @@ mod tests {
     #[test]
     fn a_window_too_small_for_the_layout_is_composed_at_its_minimum() {
         let (layout, panes) = side_by_side(size(9, 3));
-        let frame = compose(&layout, size(1, 1), LEFT, &panes);
+        let frame = compose(&layout, size(1, 1), LEFT, &panes, &Settings::default());
         assert_eq!(frame.grid.size(), size(3, 1));
     }
 }
