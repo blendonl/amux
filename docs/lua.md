@@ -2,7 +2,7 @@
 
 amux runs `init.lua` in two places, and each machine uses its own copy (see [Config](../README.md#config) for where it is found):
 
-- **The client** runs it when it attaches: `amux`, `amux new` and `amux attach`. It uses the prefix, the key bindings, the status bar, the theme and the tree, which is everything the client draws. A config error stops the client with `init.lua:N` before it takes over the terminal.
+- **The client** runs it when it attaches: `amux`, `amux new` and `amux attach`. It uses the prefix, the key bindings, the status bar, the theme, the tree and the search, which is everything the client draws. A config error stops the client with `init.lua:N` before it takes over the terminal.
 - **The server** runs it when it starts. It uses everything the host does: panes, windows, sessions, borders, the cluster and the hooks.
 
 Both run it again in a new Lua state on a reload: `reload_config()` (`Ctrl-b r`) reloads the client and the server on its machine, and `amux config reload` or `SIGHUP` the server. Nothing carries over from the old state, so a module loaded with `require` is loaded again and every binding and hook is replaced. When the new config fails, the old state keeps running and the error shows with its `init.lua:N`. The [README](../README.md#reloading) lists what a reload changes and what still needs a restart.
@@ -29,9 +29,9 @@ A key is written like tmux writes it: `C-b` (Ctrl), `M-h` (Alt), `S-Left` (Shift
 
 | Function                              | Does                                                                   |
 | ------------------------------------- | ---------------------------------------------------------------------- |
-| `amux.keymap.set(table, key, binding, opts)` | Binds `key` in `table`, replacing what it was bound to. `opts` is optional, and `opts.desc` describes the key in the which-key popup |
-| `amux.keymap.del(table, key)`          | Unbinds `key`. It is an error when `key` is not bound there            |
-| `amux.keymap.get(table, key)`          | The action or function bound to `key`, or `nil`                        |
+| `amux.keymap.set(table, keys, binding, opts)` | Binds `keys` in `table`, replacing what they were bound to. `keys` is one key or a [sequence](#submaps). `opts` is optional, and `opts.desc` describes the key in the which-key popup |
+| `amux.keymap.del(table, keys)`         | Unbinds `keys`. It is an error when `keys` is not bound there          |
+| `amux.keymap.get(table, keys)`         | The action or function bound to `keys`, or `nil`                       |
 | `amux.keymap.clear(table)`             | Unbinds every key in `table`, and removes a custom table               |
 
 The tables are:
@@ -39,10 +39,12 @@ The tables are:
 - `root`: keys that act as soon as they are typed, without the prefix. Empty by default. Everything else reaches the pane byte for byte, and only a lone `Escape` is ever held back, when a root binding starts with it (`M-h` does).
 - `prefix`: the key after the prefix. The defaults are the keys in the [README](../README.md#windows-and-panes). A key it doesn't bind is dropped, and the prefix itself, when it isn't bound here, sends a literal prefix.
 - `prompt`: the rename and `amux.prompt` prompts. It binds prompt actions by name: `submit`, `cancel`, `delete_backward`, `delete_forward`, `delete_line`, `cursor_left`, `cursor_right`, `cursor_start` and `cursor_end`.
-- `tree`: the `Ctrl-b s` tree. It binds tree actions by name: `down`, `up`, `top`, `bottom`, `collapse`, `expand`, `pick` and `cancel`.
+- `tree`: the `Ctrl-b s s` tree. It binds tree actions by name: `down`, `up`, `top`, `bottom`, `collapse`, `expand`, `pick` and `cancel`.
+- `picker`: the `Ctrl-b s p` and `Ctrl-b s w` lists (see [Search](#search)). It binds picker actions by name: `down`, `up`, `pick`, `cancel`, `delete_backward`, `delete_word` and `delete_line`, and a key it doesn't bind types into the query.
+- `search`: the submap behind `Ctrl-b s`, a custom table amux starts with. It binds `p` to `search_projects`, `w` to `search_worktrees` and `s` to `cluster_tree`.
 - Any other name is a custom table, created by its first `set`. `switch_table(name)` reads the next key from it, then goes back to `root`. `Backspace`, when the table doesn't bind it, goes back to the table whose key switched here, or to `root` from the first one.
 
-In the `prompt` and `tree` tables, a modified key that isn't bound acts like the plain key, so `C-Left` moves like `Left`. Text pasted with bracketed paste (`ESC[200~ … ESC[201~`) always goes to the pane whole: root and prefix bindings don't fire inside a paste, and a paste right after the prefix cancels the prefix.
+In the `prompt`, `tree` and `picker` tables, a modified key that isn't bound acts like the plain key, so `C-Left` moves like `Left`. Text pasted with bracketed paste (`ESC[200~ … ESC[201~`) always goes to the pane whole: root and prefix bindings don't fire inside a paste, and a paste right after the prefix cancels the prefix.
 
 ```lua
 amux.opt.prefix = "C-a"
@@ -56,7 +58,25 @@ amux.keymap.set("root", "M-r", amux.action.switch_table("resize"), { desc = "res
 amux.keymap.set("resize", "h", amux.action.select_pane("left"), { desc = "left pane" })
 amux.keymap.set("prompt", "C-w", "delete_line")
 amux.keymap.set("tree", "Space", "pick")
+amux.keymap.set("picker", "C-k", "up")
 ```
+
+### Submaps
+
+A submap is a table that a key switches to, like `Ctrl-b s` switches to `search`: the key after it is read from the submap, and then keys go back to `root`. `switch_table(name)` binds one by hand, and a key sequence binds through them:
+
+```lua
+amux.keymap.set("prefix", "g", amux.action.switch_table("git"), { desc = "git" })
+amux.keymap.set("prefix", "g s", function() amux.send_keys("git status\r") end, { desc = "status" })
+amux.keymap.set("prefix", "g l L", function() amux.send_keys("git log\r") end)
+amux.keymap.set("prefix", "s f", amux.action.search_projects())
+```
+
+- The keys of a sequence are separated by spaces, and `Space` names the space bar. Every key but the last has to be a submap. The last is bound in the submap they lead to, so `"g s"` binds `s` in `git`.
+- `set` makes a key that isn't bound yet into a new submap named after its table and key, so `"g l L"` above creates `git l` and binds `l` in `git` to it. Bind the key to `switch_table` yourself first, as with `git`, for a name and a description of your own.
+- A sequence through a key that is bound to anything else is an error, such as `d in the prefix table is bound to detach, not to a submap`. `get` returns `nil` for it and `del` fails.
+- `root`, `prefix` and custom tables take sequences. The `prompt`, `tree` and `picker` tables bind single keys.
+- The which-key popup shows a submap as a group, and `Backspace` goes back to the table before it.
 
 ## amux.action
 
@@ -78,6 +98,8 @@ amux.keymap.set("tree", "Space", "pick")
 | `rename_window()`           | Opens the rename window prompt                         |
 | `rename_session()`          | Opens the rename session prompt                        |
 | `cluster_tree()`            | Opens the cluster tree                                 |
+| `search_projects()`         | Opens the list of git repositories in the project directories |
+| `search_worktrees()`        | Opens the list of worktrees of the attached session's project |
 | `switch_table(name)`        | Reads the next key from table `name`                   |
 | `reload_config()`           | Reloads the config here and on this machine's server   |
 | `which_key(name)`           | Shows the keys of table `name` at once, then reads the next key from it, `Ctrl-b ?` shows the prefix table |
@@ -154,6 +176,22 @@ amux.keymap.set("resize", "h", amux.action.select_pane("left"), { desc = "go lef
 amux.keymap.set("resize", "?", amux.action.which_key("resize"))
 ```
 
+## Search
+
+`search_projects()` (`Ctrl-b s p`) lists the git repositories it finds in the project directories, and `search_worktrees()` (`Ctrl-b s w`) the worktrees of the attached session's project. The client runs both on its own machine, and picking an entry opens its session the way `amux new` would in that directory. The [README](../README.md#search) describes the lists.
+
+| Option          | Default                      | Is                                                                         |
+| --------------- | ---------------------------- | -------------------------------------------------------------------------- |
+| `project_dirs`  | `{ "~/projects", "~/Projects" }` | The directories to look for repositories in. A leading `~` is your home directory, and a directory that doesn't exist is skipped |
+| `project_depth` | `1`                          | How many levels below each directory to look. `1` finds `~/projects/amux`, `2` also `~/projects/work/api` |
+
+Both live under `amux.opt.search`, and a directory with a `.git` directory in it is a repository, which the search doesn't look inside.
+
+```lua
+amux.opt.search.project_dirs = { "~/projects", "~/work", "/srv/git" }
+amux.opt.search.project_depth = 2
+```
+
 ## The status bar
 
 | Option                | Default                  | Is                                                                 |
@@ -197,6 +235,11 @@ Each slot under `amux.opt.theme` is a style: `fg`, `bg`, `bold`, `dim`, `italic`
 | `tree_server`          | Server rows, over `tree`                               | bold                 |
 | `tree_stale`           | Sessions of offline servers, over `tree`               | dim                  |
 | `tree_cursor`          | The selected row                                       | reverse              |
+| `picker`               | The search lists, and the base of the other `picker_` slots | plain           |
+| `picker_label`         | The label before the query, such as `project>`         | bold                 |
+| `picker_cursor`        | The selected row                                       | reverse              |
+| `picker_match`         | The letters that match the query                       | bold yellow          |
+| `picker_detail`        | The path after each entry, the count and messages      | dim                  |
 | `which_key`            | The which-key popup, and the base of the other `which_key_` slots | plain     |
 | `which_key_border`     | The rule at the top of the popup, and the page         | dim                  |
 | `which_key_title`      | The keys typed so far, on the rule                     | bold                 |

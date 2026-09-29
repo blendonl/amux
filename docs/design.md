@@ -211,7 +211,7 @@ home-server              offline, last seen 3h ago
   infra/main             2 windows   stale
 ```
 
-Inside a session, `Ctrl-b s` opens a tree of servers, projects, sessions and windows. Picking a session on another server works the same way as picking a local one.
+Inside a session, `Ctrl-b s s` opens a tree of servers, projects, sessions and windows. Picking a session on another server works the same way as picking a local one.
 
 ## Config
 
@@ -301,7 +301,7 @@ Each phase ends with something that works.
    - The pane compositor on the host
 6. **Chrome**
    - A status bar with cluster information
-   - The `Ctrl-b s` cluster tree
+   - The cluster tree
 7. **Discovery and pairing**
    - The TCP and Noise transport, and a trust store shared across the cluster
    - Linking on the same tailnet, vouched for by `tailscale whois`
