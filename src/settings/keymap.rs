@@ -10,6 +10,7 @@ pub const ROOT_TABLE: &str = "root";
 pub const PREFIX_TABLE: &str = "prefix";
 pub const PROMPT_TABLE: &str = "prompt";
 pub const TREE_TABLE: &str = "tree";
+const PANEL_TABLES: [&str; 2] = [PROMPT_TABLE, TREE_TABLE];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -221,6 +222,49 @@ impl Keymap {
         }
     }
 
+    pub fn table_mut(&mut self, name: &str) -> Option<&mut Table<Binding>> {
+        match name {
+            ROOT_TABLE => Some(&mut self.root),
+            PREFIX_TABLE => Some(&mut self.prefix),
+            _ => self.custom.get_mut(name),
+        }
+    }
+
+    pub fn table_entry(&mut self, name: &str) -> &mut Table<Binding> {
+        match name {
+            ROOT_TABLE => &mut self.root,
+            PREFIX_TABLE => &mut self.prefix,
+            _ => self.custom.entry(name.to_owned()).or_default(),
+        }
+    }
+
+    pub fn submap<'a>(&'a self, table: &'a str, keys: &[Key]) -> Option<&'a str> {
+        keys.iter()
+            .try_fold(table, |name, key| submap_name(self.table(name)?.get(key)?))
+    }
+
+    pub fn open_submap(&mut self, table: &str, keys: &[Key]) -> Result<String, String> {
+        let mut name = table.to_owned();
+        for key in keys {
+            let bindings = self.table_entry(&name);
+            name = match bindings.get(key) {
+                None => {
+                    let created = format!("{name} {key}");
+                    bindings.insert(*key, Binding::SwitchTable(created.clone()));
+                    created
+                }
+                Some(binding) => submap_name(binding).map(str::to_owned).ok_or_else(|| {
+                    format!(
+                        "{key} in the {name} table is bound to {}, not to a submap",
+                        binding.description()
+                    )
+                })?,
+            };
+        }
+        self.table_entry(&name);
+        Ok(name)
+    }
+
     pub fn hint_for(&self, binding: &Binding, prefix: &Key) -> Option<String> {
         self.root.key_for(binding).map(Key::label).or_else(|| {
             self.prefix
@@ -228,6 +272,17 @@ impl Keymap {
                 .map(|key| format!("{} {}", prefix.label(), key.label()))
         })
     }
+}
+
+fn submap_name(binding: &Binding) -> Option<&str> {
+    match binding {
+        Binding::SwitchTable(name) if !is_panel_table(name) && name != ROOT_TABLE => Some(name),
+        _ => None,
+    }
+}
+
+pub fn is_panel_table(name: &str) -> bool {
+    PANEL_TABLES.contains(&name)
 }
 
 impl Default for Keymap {
@@ -367,6 +422,64 @@ mod tests {
         assert_eq!(prefix.iter().count(), 28);
         assert_eq!(prefix.get(&key("C-b")), None);
         assert_eq!(Keymap::default().root, Table::default());
+    }
+
+    #[test]
+    fn a_sequence_walks_submaps_and_creates_the_missing_ones() {
+        let mut keymap = Keymap::default();
+        keymap
+            .prefix
+            .insert(key("g"), Binding::SwitchTable("git".into()));
+
+        assert_eq!(keymap.open_submap(PREFIX_TABLE, &[]).unwrap(), "prefix");
+        assert_eq!(
+            keymap.open_submap(PREFIX_TABLE, &[key("g")]).unwrap(),
+            "git"
+        );
+        assert_eq!(
+            keymap
+                .open_submap(PREFIX_TABLE, &[key("g"), key("l")])
+                .unwrap(),
+            "git l"
+        );
+        assert_eq!(
+            keymap.custom["git"].get(&key("l")),
+            Some(&Binding::SwitchTable("git l".into()))
+        );
+        assert_eq!(keymap.custom["git l"], Table::default());
+        assert_eq!(
+            keymap.open_submap(ROOT_TABLE, &[key("M-s")]).unwrap(),
+            "root M-s"
+        );
+
+        assert_eq!(
+            keymap.submap(PREFIX_TABLE, &[key("g"), key("l")]),
+            Some("git l")
+        );
+        assert_eq!(keymap.submap(PREFIX_TABLE, &[key("z")]), None);
+        assert_eq!(keymap.submap("nowhere", &[key("g")]), None);
+        assert_eq!(keymap.submap("nowhere", &[]), Some("nowhere"));
+    }
+
+    #[test]
+    fn a_sequence_never_walks_through_a_key_bound_to_something_else() {
+        let mut keymap = Keymap::default();
+        keymap
+            .prefix
+            .insert(key("t"), Binding::SwitchTable(TREE_TABLE.into()));
+        keymap
+            .prefix
+            .insert(key("R"), Binding::SwitchTable(ROOT_TABLE.into()));
+
+        assert_eq!(
+            keymap.open_submap(PREFIX_TABLE, &[key("d"), key("x")]),
+            Err("d in the prefix table is bound to detach, not to a submap".into())
+        );
+        assert!(keymap.open_submap(PREFIX_TABLE, &[key("t")]).is_err());
+        assert!(keymap.open_submap(PREFIX_TABLE, &[key("R")]).is_err());
+        assert_eq!(keymap.submap(PREFIX_TABLE, &[key("d")]), None);
+        assert_eq!(keymap.submap(PREFIX_TABLE, &[key("t")]), None);
+        assert_eq!(keymap.prefix.get(&key("d")), Some(&Binding::Detach));
     }
 
     #[test]
