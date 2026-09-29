@@ -21,8 +21,8 @@ pub use host::{
     WorktreeSettings,
 };
 pub use keymap::{
-    Binding, Keymap, PromptAction, Table, TreeAction, PREFIX_TABLE, PROMPT_TABLE, ROOT_TABLE,
-    TREE_TABLE,
+    Binding, Keymap, PickerAction, PromptAction, Table, TreeAction, PICKER_TABLE, PREFIX_TABLE,
+    PROMPT_TABLE, ROOT_TABLE, SEARCH_TABLE, TREE_TABLE,
 };
 pub use style::{Color, StyleSpec};
 pub use theme::Theme;

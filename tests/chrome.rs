@@ -1,8 +1,10 @@
 mod common;
 
+use std::fs;
 use std::future::Future;
 
 use amux::protocol::{ClientMessage, ServerMessage, SessionCommand, SessionState, WindowSummary};
+use common::git::{self, path_str};
 use common::{
     settled_pair, window_summary, Listing, TerminalClient, TestClient, TestServer, DETACH, SIZE,
 };
@@ -48,7 +50,7 @@ fn the_tree_switches_one_client_between_local_and_remote_sessions() {
         line.starts_with("[here@a] 0:sh")
     });
 
-    terminal.type_text("\x02s");
+    terminal.type_text("\x02ss");
     terminal.wait_for_text("(this server)");
     terminal.wait_for_text("+ there  1 window");
     terminal.type_text("G\r");
@@ -58,7 +60,7 @@ fn the_tree_switches_one_client_between_local_and_remote_sessions() {
     terminal.type_text("echo \"home=$HOME\"\r");
     terminal.wait_for_text(&format!("home={}", b.home().display()));
 
-    terminal.type_text("\x02s");
+    terminal.type_text("\x02ss");
     terminal.wait_for_text("(this server)");
     terminal.type_text("kkk\r");
     terminal.wait_for_status("the local session again", |line| {
@@ -160,7 +162,7 @@ fn a_failed_switch_keeps_the_client_attached_and_shows_the_error() {
     terminal.type_text("echo marker-$((6*7))\r");
     terminal.wait_for_text("marker-42");
 
-    terminal.type_text("\x02s");
+    terminal.type_text("\x02ss");
     terminal.wait_for_text("+ gone  1 window");
     server.run_ok(&["kill", "-t", "gone"]);
     terminal.type_text("k\r");
@@ -175,6 +177,64 @@ fn a_failed_switch_keeps_the_client_attached_and_shows_the_error() {
         line.starts_with("[here@solo] 0:sh")
     });
     detach(&mut terminal, "here");
+}
+
+#[test]
+fn the_search_keys_open_a_project_from_the_projects_dir_and_then_its_worktrees() {
+    let server = TestServer::builder().name("solo").start();
+    let notes = server.home().join("projects/notes");
+    fs::create_dir_all(&notes).unwrap();
+    git::git(&notes, &["init", "--quiet"]);
+    git::commit(&notes, "initial");
+    let notes = fs::canonicalize(&notes).unwrap();
+    let feature = notes.with_file_name("notes-worktrees").join("feature-x");
+    git::git(
+        &notes,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "feature-x",
+            path_str(&feature),
+        ],
+    );
+    fs::create_dir_all(server.home().join("Projects/other/.git")).unwrap();
+    server.create_session("here");
+    let mut terminal = server.terminal(&["attach", "-t", "here"]);
+    terminal.wait_for_status("the session", |line| line.starts_with("[here@solo]"));
+
+    terminal.type_text("\x02sp");
+    terminal.wait_for_text("> notes  ~/projects/notes");
+    terminal.wait_for_text("  other  ~/Projects/other");
+    terminal.type_text("nts\r");
+    terminal.wait_for_status("the project session", |line| {
+        line.starts_with("[notes/main@solo] 0:")
+    });
+    terminal.type_text("echo \"at=$PWD\"\r");
+    terminal.wait_for_text(&format!("at={}", notes.display()));
+
+    terminal.type_text("\x02sw");
+    terminal.wait_for_text("notes worktree>");
+    terminal.wait_for_text("feature-x  ~/projects/notes-worktrees/feature-x");
+    terminal.type_text("feat\r");
+    terminal.wait_for_status("the worktree session", |line| {
+        line.starts_with("[notes/feature-x@solo] 0:")
+    });
+    terminal.type_text("echo \"at=$PWD\"\r");
+    terminal.wait_for_text(&format!("at={}", feature.display()));
+
+    terminal.type_text("\x02sp");
+    terminal.wait_for_text("> notes  ~/projects/notes");
+    terminal.type_text("notes\r");
+    terminal.wait_for_status("the project session again", |line| {
+        line.starts_with("[notes/main@solo] 0:")
+    });
+    assert_eq!(
+        Listing::parse(&server.run_ok(&["ls"])).sessions("solo"),
+        ["here", "notes/feature-x", "notes/main"]
+    );
+    detach(&mut terminal, "notes/main");
 }
 
 fn named_window(index: usize, name: &str) -> WindowSummary {

@@ -11,8 +11,8 @@ use super::runtime::Process;
 use super::{client, from_lua, function, server};
 use crate::keys::{parse_sequence, spell_sequence, Key};
 use crate::settings::{
-    Binding, CallbackId, Keymap, PromptAction, Table as Bindings, TreeAction, PREFIX_TABLE,
-    PROMPT_TABLE, ROOT_TABLE, TREE_TABLE,
+    Binding, CallbackId, Keymap, PickerAction, PromptAction, Table as Bindings, TreeAction,
+    PICKER_TABLE, PREFIX_TABLE, PROMPT_TABLE, ROOT_TABLE, TREE_TABLE,
 };
 
 const SET_OPTIONS: [&str; 1] = ["desc"];
@@ -158,6 +158,11 @@ fn keymap(lua: &Lua, constructors: Table) -> mlua::Result<Table> {
                         let action = panel_action::<TreeAction>(&table, value)?;
                         bind(&mut registry(lua)?.keymap.tree, key, action, description);
                     }
+                    PICKER_TABLE => {
+                        let key = single_key(&table, &keys)?;
+                        let action = panel_action::<PickerAction>(&table, value)?;
+                        bind(&mut registry(lua)?.keymap.picker, key, action, description);
+                    }
                     "" => return Err(mlua::Error::runtime("a keymap table needs a name")),
                     name => {
                         let bound = bound(lua, &constructors, value)?;
@@ -194,6 +199,7 @@ fn keymap(lua: &Lua, constructors: Table) -> mlua::Result<Table> {
             let removed = match table.as_str() {
                 PROMPT_TABLE => keymap.prompt.remove(&single_key(&table, &keys)?).is_some(),
                 TREE_TABLE => keymap.tree.remove(&single_key(&table, &keys)?).is_some(),
+                PICKER_TABLE => keymap.picker.remove(&single_key(&table, &keys)?).is_some(),
                 name => {
                     let (key, path) = split_sequence(&keys);
                     let removed = keymap
@@ -221,6 +227,7 @@ fn keymap(lua: &Lua, constructors: Table) -> mlua::Result<Table> {
             match table.as_str() {
                 PROMPT_TABLE => to_lua(lua, keymap.prompt.get(&single_key(&table, &keys)?)),
                 TREE_TABLE => to_lua(lua, keymap.tree.get(&single_key(&table, &keys)?)),
+                PICKER_TABLE => to_lua(lua, keymap.picker.get(&single_key(&table, &keys)?)),
                 name => {
                     let (key, path) = split_sequence(&keys);
                     let bound = keymap
@@ -244,6 +251,7 @@ fn keymap(lua: &Lua, constructors: Table) -> mlua::Result<Table> {
             match table.as_str() {
                 PROMPT_TABLE => keymap.prompt.clear(),
                 TREE_TABLE => keymap.tree.clear(),
+                PICKER_TABLE => keymap.picker.clear(),
                 ROOT_TABLE => clear_bindings(callbacks, &mut keymap.root),
                 PREFIX_TABLE => clear_bindings(callbacks, &mut keymap.prefix),
                 name => {
@@ -500,9 +508,14 @@ mod tests {
              amux.keymap.set('prefix', 'r', amux.action.switch_table('resize'))\n\
              amux.keymap.set('resize', 'h', amux.action.select_pane('left'))\n\
              amux.keymap.set('prompt', 'C-w', 'delete_line')\n\
-             amux.keymap.set('tree', 'x', 'cancel')",
+             amux.keymap.set('tree', 'x', 'cancel')\n\
+             amux.keymap.set('picker', 'C-j', 'down')\n\
+             amux.keymap.del('picker', 'C-u')\n\
+             assert(amux.keymap.get('picker', 'Enter') == 'pick')",
         )
         .keymap;
+        assert_eq!(keymap.picker.get(&key("C-j")), Some(&PickerAction::Down));
+        assert_eq!(keymap.picker.get(&key("C-u")), None);
         for (notation, binding) in [
             ("|", Binding::SplitPane(Split::LeftRight)),
             ("D", Binding::Detach),
@@ -727,7 +740,8 @@ mod tests {
                 "init.lua:1: unknown action zoom, expected one of detach, send_prefix, \
                  new_window, next_window, previous_window, select_window, split_pane, \
                  next_pane, select_pane, kill_pane, kill_window, rename_window, \
-                 rename_session, cluster_tree, switch_table, reload_config, which_key"
+                 rename_session, cluster_tree, search_projects, search_worktrees, switch_table, \
+                 reload_config, which_key"
             ),
             "{error}"
         );
@@ -824,7 +838,7 @@ mod tests {
     #[test]
     fn every_action_constructor_is_exposed() {
         let names = variants::<Binding>();
-        assert_eq!(names.len(), 17);
+        assert_eq!(names.len(), 19);
         assert!(names.contains(&"switch_table"));
         assert!(!names.contains(&"callback"));
         let loaded = loaded("");

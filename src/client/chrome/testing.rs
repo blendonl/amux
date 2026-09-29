@@ -1,4 +1,7 @@
+use std::path::PathBuf;
+
 use super::PanelEvent;
+use crate::client::search::Job;
 use crate::protocol::ClientMessage;
 use crate::settings::CallbackId;
 
@@ -26,6 +29,8 @@ pub enum Event {
     Done(ClientMessage),
     Callback(CallbackId, String),
     Replace(Vec<u8>),
+    Load(Job),
+    Open(PathBuf),
 }
 
 impl From<PanelEvent> for Event {
@@ -37,6 +42,8 @@ impl From<PanelEvent> for Event {
             PanelEvent::Done(message) => Self::Done(message),
             PanelEvent::Callback(id, text) => Self::Callback(id, text),
             PanelEvent::Replace(_, input) => Self::Replace(input),
+            PanelEvent::Load(job) => Self::Load(job),
+            PanelEvent::Open(path) => Self::Open(path),
         }
     }
 }

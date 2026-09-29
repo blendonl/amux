@@ -7,7 +7,8 @@ use anyhow::Result;
 use super::projects;
 use crate::paths;
 use crate::project;
-use crate::protocol::ProjectRef;
+use crate::protocol::{ProjectRef, ServerStatus, ServerView};
+use crate::target::Target;
 
 const GIT_DIR: &str = ".git";
 
@@ -17,6 +18,9 @@ pub struct Candidate {
     pub detail: String,
     pub path: PathBuf,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobId(pub u64);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Job {
@@ -142,11 +146,56 @@ fn open(path: &Path) -> Result<Opening> {
     })
 }
 
+pub fn nothing_found(dirs: &[PathBuf]) -> String {
+    if dirs.is_empty() {
+        return "amux.opt.search.project_dirs names no directories".into();
+    }
+    let dirs: Vec<String> = dirs.iter().map(|dir| dir.display().to_string()).collect();
+    format!("no git repositories in {}", dirs.join(", "))
+}
+
 fn shown(path: &Path, home: Option<&Path>) -> String {
     match home {
         Some(home) => paths::abbreviate_home(path, home),
         None => path.display().to_string(),
     }
+}
+
+pub fn attached_checkout(
+    servers: &[ServerView],
+    attached: &Target,
+) -> Result<(String, PathBuf), String> {
+    let session = attached.session.as_deref().unwrap_or_default();
+    let info = servers
+        .iter()
+        .filter(|view| {
+            attached
+                .server
+                .as_deref()
+                .is_none_or(|server| view.name == server)
+        })
+        .flat_map(|view| &view.sessions)
+        .find(|info| info.name == session)
+        .ok_or_else(|| format!("can't find session {session}"))?;
+    let project = info
+        .project
+        .as_ref()
+        .ok_or_else(|| format!("{session} is not in a project"))?;
+    let checkouts = || {
+        servers
+            .iter()
+            .flat_map(|view| view.projects.iter().map(move |checkout| (view, checkout)))
+            .filter(|(_, checkout)| checkout.id == *project)
+    };
+    let local = checkouts().find(|(view, _)| view.status == ServerStatus::Local);
+    if let Some((_, checkout)) = local {
+        return Ok((checkout.name.clone(), checkout.path.clone()));
+    }
+    let name = checkouts().next().map_or_else(
+        || project.as_str().to_owned(),
+        |(_, checkout)| checkout.name.clone(),
+    );
+    Err(format!("this machine has no checkout of {name}"))
 }
 
 #[cfg(test)]
@@ -155,6 +204,112 @@ mod tests {
 
     use super::*;
     use crate::project::testing::{git, path_str, Fixture};
+    use crate::protocol::{ProjectCheckout, SessionId, SessionInfo};
+
+    const AMUX: &str = "github.com/blendonl/amux";
+
+    fn server(
+        name: &str,
+        status: ServerStatus,
+        sessions: &[(&str, Option<&str>)],
+        checkouts: &[&str],
+    ) -> ServerView {
+        ServerView {
+            id: None,
+            name: name.into(),
+            address: None,
+            version: None,
+            status,
+            sessions: sessions
+                .iter()
+                .map(|&(session, project)| SessionInfo {
+                    id: SessionId(1),
+                    name: session.into(),
+                    windows: Vec::new(),
+                    attached_clients: 1,
+                    last_activity: std::time::SystemTime::UNIX_EPOCH,
+                    project: project.map(Into::into),
+                    branch: None,
+                })
+                .collect(),
+            projects: checkouts
+                .iter()
+                .map(|&path| ProjectCheckout {
+                    id: AMUX.into(),
+                    name: "amux".into(),
+                    path: path.into(),
+                    origin: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn online() -> ServerStatus {
+        ServerStatus::Online { latency: None }
+    }
+
+    #[test]
+    fn an_empty_search_names_the_dirs_it_looked_in() {
+        assert_eq!(
+            nothing_found(&["~/projects".into(), "~/Projects".into()]),
+            "no git repositories in ~/projects, ~/Projects"
+        );
+        assert_eq!(
+            nothing_found(&[]),
+            "amux.opt.search.project_dirs names no directories"
+        );
+    }
+
+    #[test]
+    fn the_attached_sessions_project_is_found_in_this_machines_checkouts() {
+        let servers = [
+            server(
+                "desk",
+                ServerStatus::Local,
+                &[("amux/main", Some(AMUX)), ("scratch", None)],
+                &["/src/amux"],
+            ),
+            server(
+                "laptop",
+                online(),
+                &[("amux/fix", Some(AMUX))],
+                &["/l/amux"],
+            ),
+        ];
+        let on = |target: &str| attached_checkout(&servers, &target.parse().unwrap());
+
+        assert_eq!(
+            on("amux/main@desk"),
+            Ok(("amux".into(), "/src/amux".into()))
+        );
+        assert_eq!(
+            on("amux/fix@laptop"),
+            Ok(("amux".into(), "/src/amux".into()))
+        );
+        assert_eq!(
+            on("scratch@desk"),
+            Err("scratch is not in a project".into())
+        );
+        assert_eq!(on("gone@desk"), Err("can't find session gone".into()));
+        assert_eq!(
+            on("amux/main@laptop"),
+            Err("can't find session amux/main".into())
+        );
+
+        let elsewhere = [
+            server("desk", ServerStatus::Local, &[], &[]),
+            server(
+                "laptop",
+                online(),
+                &[("amux/fix", Some(AMUX))],
+                &["/l/amux"],
+            ),
+        ];
+        assert_eq!(
+            attached_checkout(&elsewhere, &"amux/fix@laptop".parse().unwrap()),
+            Err("this machine has no checkout of amux".into())
+        );
+    }
 
     fn labels(found: &[Candidate]) -> Vec<&str> {
         found

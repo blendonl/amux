@@ -10,16 +10,19 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Instant};
 
 use super::chrome::{
-    detach_hint, draw_row, render_reconnecting, Panel, PanelEvent, Placement, Prompt,
+    detach_hint, draw_row, render_reconnecting, Panel, PanelEvent, Picker, Placement, Prompt,
     PromptPurpose, Rect, StatusLine, StatusSides, Style, WhichKey, WindowTab,
 };
 use super::router::{self, Action, KeyRouter, Level};
 use super::scripting::{ClientContext, Effect, Scripting, StatusContext};
+use super::search::{self, Found, Job, JobId, Opening};
 use super::terminal;
 use super::tree::Loading;
 use super::{ClientConfig, Endpoint};
+use crate::paths;
 use crate::protocol::{
-    AttachedSession, ClientMessage, ClusterStatus, ServerMessage, ServerView, SessionState, Size,
+    AttachedSession, ClientMessage, ClusterStatus, NewSession, ServerMessage, ServerView,
+    SessionState, Size,
 };
 use crate::settings::{CallbackId, Keymap, Settings};
 use crate::target::Target;
@@ -73,6 +76,9 @@ pub struct Relay {
     reloading: Option<Result<(), String>>,
     output: Vec<u8>,
     messages: Vec<ClientMessage>,
+    jobs: Vec<(JobId, Job)>,
+    next_job: u64,
+    panel_job: Option<JobId>,
     chrome_dirty: bool,
     end: Option<Result<Outcome, String>>,
 }
@@ -114,6 +120,9 @@ impl Relay {
             reloading: None,
             output: Vec::new(),
             messages: Vec::new(),
+            jobs: Vec::new(),
+            next_job: 0,
+            panel_job: None,
             chrome_dirty: true,
             end: None,
         }
@@ -254,6 +263,22 @@ impl Relay {
 
     pub fn take_messages(&mut self) -> Vec<ClientMessage> {
         mem::take(&mut self.messages)
+    }
+
+    pub fn take_jobs(&mut self) -> Vec<(JobId, Job)> {
+        mem::take(&mut self.jobs)
+    }
+
+    pub fn job_done(&mut self, id: JobId, found: Found) {
+        match found {
+            Found::Candidates(candidates) if self.panel_job == Some(id) => {
+                self.panel_job = None;
+                self.drive_panel(|panel, _| panel.found(candidates));
+            }
+            Found::Candidates(_) => {}
+            Found::Opened(Ok(opening)) => self.open_session(opening),
+            Found::Opened(Err(error)) => self.notify(error),
+        }
     }
 
     pub fn has_ended(&self) -> bool {
@@ -468,7 +493,42 @@ impl Relay {
                     Arc::clone(&self.settings),
                 )));
             }
+            router::Panel::SearchProjects => {
+                let dirs = self.settings.search.project_dirs.clone();
+                let depth = self.settings.search.project_depth;
+                self.show(Box::new(Picker::projects(
+                    search::nothing_found(&dirs),
+                    self.keymap.picker.clone(),
+                    &self.settings.theme,
+                )));
+                self.panel_job = Some(self.start_job(Job::Projects { dirs, depth }));
+            }
+            router::Panel::SearchWorktrees => {
+                self.messages.push(ClientMessage::ListCluster);
+                self.show(Box::new(Picker::worktrees(
+                    self.keymap.picker.clone(),
+                    &self.settings.theme,
+                )));
+            }
         }
+    }
+
+    fn start_job(&mut self, job: Job) -> JobId {
+        let id = JobId(self.next_job);
+        self.next_job += 1;
+        self.jobs.push((id, job));
+        id
+    }
+
+    fn open_session(&mut self, opening: Opening) {
+        let size = terminal::session_area(self.size, &self.settings.status);
+        self.messages.push(ClientMessage::NewSession(NewSession {
+            cwd: Some(opening.cwd),
+            env: super::locale(),
+            project: opening.project,
+            branch: opening.branch,
+            ..NewSession::new(None, size)
+        }));
     }
 
     fn open_prompt(&mut self, purpose: PromptPurpose, label: impl Into<String>, initial: &str) {
@@ -489,6 +549,7 @@ impl Relay {
 
     fn show(&mut self, panel: Box<dyn Panel>) {
         self.release_prompt_callback();
+        self.panel_job = None;
         self.panel = Some(panel);
         self.chrome_dirty = true;
     }
@@ -541,12 +602,21 @@ impl Relay {
                 self.show(panel);
                 self.panel_input(&input);
             }
+            PanelEvent::Load(job) => {
+                self.panel_job = Some(self.start_job(job));
+                self.chrome_dirty = true;
+            }
+            PanelEvent::Open(path) => {
+                self.close_panel();
+                self.start_job(Job::Open(path));
+            }
         }
     }
 
     fn close_panel(&mut self) {
         self.release_prompt_callback();
         self.panel = None;
+        self.panel_job = None;
         self.escape_at = None;
         self.messages.push(ClientMessage::Redraw);
         if self.reconnecting.is_some() {
@@ -814,6 +884,7 @@ pub async fn run(
     let mut resizes = signal(SignalKind::window_change())?;
     let mut stdin_open = true;
     let (reloaded, mut reloads) = mpsc::channel(1);
+    let (finished, mut finished_jobs) = mpsc::channel(8);
 
     loop {
         let output = relay.take_output();
@@ -835,6 +906,18 @@ pub async fn run(
         }
         for message in relay.take_messages() {
             super::send(&outgoing, message).await?;
+        }
+        for (id, job) in relay.take_jobs() {
+            let finished = finished.clone();
+            tokio::spawn(async move {
+                let run = tokio::task::spawn_blocking(move || {
+                    let home = paths::home_dir().ok();
+                    job.run(home.as_deref())
+                });
+                if let Ok(found) = run.await {
+                    let _ = finished.send((id, found)).await;
+                }
+            });
         }
 
         let escape = relay.escape_deadline();
@@ -863,6 +946,7 @@ pub async fn run(
             },
             _ = resizes.recv() => relay.resize(terminal::size()?),
             Some(reply) = reloads.recv() => relay.server_reloaded(reply),
+            Some((id, found)) = finished_jobs.recv() => relay.job_done(id, found),
             () = sleep_until(escape.unwrap_or_else(Instant::now)), if escape.is_some() => {
                 relay.escape_timeout();
             }
@@ -882,6 +966,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::path::PathBuf;
     use std::rc::Rc;
     use std::time::{Duration, SystemTime};
 
@@ -890,7 +975,8 @@ mod tests {
     use crate::client::scripting::StatusSpan;
     use crate::identity::Incarnation;
     use crate::protocol::{
-        Direction, ServerStatus, SessionCommand, SessionId, SessionInfo, WindowSummary,
+        Direction, ProjectCheckout, ProjectRef, ServerStatus, SessionCommand, SessionId,
+        SessionInfo, WindowSummary,
     };
     use crate::settings::{Binding, Color, StyleSpec, PREFIX_TABLE};
 
@@ -1115,7 +1201,7 @@ mod tests {
     #[test]
     fn the_cluster_tree_hides_the_session_and_switches_to_the_pick() {
         let (mut relay, mut parser) = relay_on("laptop");
-        relay.input(b"\x02sG");
+        relay.input(b"\x02ssG");
         assert_eq!(relay.take_messages(), vec![ClientMessage::ListCluster]);
 
         relay.server_message(Some(ServerMessage::Output(b"hidden".to_vec())));
@@ -1146,10 +1232,156 @@ mod tests {
         assert!(relay.take_output().starts_with(b"shown"));
     }
 
+    fn candidate(label: &str) -> search::Candidate {
+        search::Candidate {
+            label: label.into(),
+            detail: format!("~/projects/{label}"),
+            path: PathBuf::from("/home/me/projects").join(label),
+        }
+    }
+
+    #[test]
+    fn searching_projects_scans_the_dirs_and_opens_the_pick_like_amux_new() {
+        let (mut relay, mut parser) = relay_on("laptop");
+        relay.input(b"\x02sp");
+        assert_eq!(relay.take_messages(), vec![]);
+        assert_eq!(
+            relay.take_jobs(),
+            vec![(
+                JobId(0),
+                Job::Projects {
+                    dirs: vec!["~/projects".into(), "~/Projects".into()],
+                    depth: 1,
+                }
+            )]
+        );
+
+        relay.input(b"no");
+        relay.job_done(
+            JobId(0),
+            Found::Candidates(Ok(vec![candidate("amux"), candidate("notes")])),
+        );
+        draw(&mut relay, &mut parser);
+        let screen = screen_text(&parser);
+        assert!(screen[0].starts_with("project> no "), "{screen:?}");
+        assert!(screen[0].ends_with(" 1/2"), "{screen:?}");
+        assert_eq!(screen[1], "> notes  ~/projects/notes");
+        assert_eq!(screen[usize::from(BOTTOM)], "[work@laptop]");
+
+        relay.input(b"\r");
+        assert_eq!(relay.take_messages(), vec![ClientMessage::Redraw]);
+        let notes = candidate("notes").path;
+        assert_eq!(
+            relay.take_jobs(),
+            vec![(JobId(1), Job::Open(notes.clone()))]
+        );
+
+        let project = ProjectRef {
+            id: "github.com/me/notes".into(),
+            name: "notes".into(),
+            origin: None,
+        };
+        relay.job_done(
+            JobId(1),
+            Found::Opened(Ok(Opening {
+                cwd: notes.clone(),
+                project: Some(project.clone()),
+                branch: Some("main".into()),
+            })),
+        );
+        assert_eq!(
+            relay.take_messages(),
+            vec![ClientMessage::NewSession(NewSession {
+                cwd: Some(notes),
+                env: super::super::locale(),
+                project: Some(project),
+                branch: Some("main".into()),
+                ..NewSession::new(
+                    None,
+                    Size {
+                        rows: SIZE.rows - 1,
+                        cols: SIZE.cols,
+                    }
+                )
+            })]
+        );
+    }
+
+    #[test]
+    fn a_scan_that_finishes_after_its_picker_closed_is_dropped() {
+        let (mut relay, mut parser) = relay_on("laptop");
+        relay.input(b"\x02sp\x03");
+        assert_eq!(relay.take_messages(), vec![ClientMessage::Redraw]);
+        relay.input(b"\x02sp");
+        let started: Vec<JobId> = relay.take_jobs().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(started, [JobId(0), JobId(1)]);
+
+        relay.job_done(JobId(0), Found::Candidates(Ok(vec![candidate("stale")])));
+        relay.job_done(JobId(1), Found::Candidates(Ok(vec![candidate("fresh")])));
+
+        draw(&mut relay, &mut parser);
+        let screen = screen_text(&parser);
+        assert_eq!(screen[1], "> fresh  ~/projects/fresh");
+        assert!(!screen.concat().contains("stale"), "{screen:?}");
+    }
+
+    #[test]
+    fn searching_worktrees_looks_up_the_attached_sessions_project_first() {
+        let (mut relay, mut parser) = relay_on("laptop");
+        relay.input(b"\x02sw");
+        assert_eq!(relay.take_messages(), vec![ClientMessage::ListCluster]);
+        assert_eq!(relay.take_jobs(), vec![]);
+
+        let mut laptop = server_view("laptop", ServerStatus::Local, "work");
+        laptop.sessions[0].project = Some("github.com/me/amux".into());
+        laptop.projects.push(ProjectCheckout {
+            id: "github.com/me/amux".into(),
+            name: "amux".into(),
+            path: "/home/me/amux".into(),
+            origin: None,
+        });
+        relay.server_message(Some(ServerMessage::Cluster(vec![laptop])));
+        assert_eq!(
+            relay.take_jobs(),
+            vec![(
+                JobId(0),
+                Job::Worktrees {
+                    checkout: "/home/me/amux".into()
+                }
+            )]
+        );
+
+        let feature = search::Candidate {
+            label: "feature-x".into(),
+            detail: "~/amux-worktrees/feature-x".into(),
+            path: "/home/me/amux-worktrees/feature-x".into(),
+        };
+        relay.job_done(JobId(0), Found::Candidates(Ok(vec![feature.clone()])));
+        draw(&mut relay, &mut parser);
+        let screen = screen_text(&parser);
+        assert!(screen[0].starts_with("amux worktree> "), "{screen:?}");
+        assert_eq!(screen[1], "> feature-x  ~/amux-worktrees/feature-x");
+
+        relay.input(b"\r");
+        assert_eq!(relay.take_jobs(), vec![(JobId(1), Job::Open(feature.path))]);
+    }
+
+    #[test]
+    fn a_pick_that_cannot_be_opened_shows_why() {
+        let (mut relay, mut parser) = relay_on("laptop");
+        relay.job_done(JobId(3), Found::Opened(Err("not a git repository".into())));
+        assert_eq!(relay.take_messages(), vec![]);
+        assert!(
+            bottom(&mut relay, &mut parser).contains("not a git repository"),
+            "{}",
+            row_text(&parser, BOTTOM)
+        );
+    }
+
     #[test]
     fn a_lone_escape_closes_a_panel_once_the_timeout_expires() {
         let (mut relay, _) = relay_on("laptop");
-        relay.input(b"\x02s");
+        relay.input(b"\x02ss");
         relay.server_message(Some(cluster()));
         relay.take_messages();
         assert_eq!(relay.escape_deadline(), None);
@@ -1242,7 +1474,7 @@ mod tests {
             .contents()
             .contains("reconnecting to desktop…"));
 
-        relay.input(b"\x02s");
+        relay.input(b"\x02ss");
         relay.server_message(Some(cluster()));
         relay.input(b"q");
         draw(&mut relay, &mut parser);
@@ -1799,7 +2031,7 @@ mod tests {
         assert!(!parser.screen().cell(BOTTOM, 15).unwrap().underline());
         relay.input(b"\x03");
 
-        relay.input(b"\x02s");
+        relay.input(b"\x02ss");
         relay.server_message(Some(cluster()));
         draw(&mut relay, &mut parser);
         let screen = screen_text(&parser);

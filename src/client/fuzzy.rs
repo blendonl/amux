@@ -48,11 +48,6 @@ pub fn rank<'a>(query: &str, candidates: impl IntoIterator<Item = &'a str>) -> V
         .collect()
 }
 
-pub fn find(query: &str, candidate: &str) -> Option<Match> {
-    let terms: Vec<&str> = query.split_whitespace().collect();
-    match_terms(&terms, candidate)
-}
-
 fn match_terms(terms: &[&str], candidate: &str) -> Option<Match> {
     let text: Vec<char> = candidate.chars().collect();
     let mut total = Match {
@@ -152,7 +147,8 @@ mod tests {
     use super::*;
 
     fn positions(query: &str, candidate: &str) -> Option<Vec<usize>> {
-        find(query, candidate).map(|found| found.positions)
+        let terms: Vec<&str> = query.split_whitespace().collect();
+        match_terms(&terms, candidate).map(|found| found.positions)
     }
 
     fn ranked<'a>(query: &str, candidates: &[&'a str]) -> Vec<&'a str> {
