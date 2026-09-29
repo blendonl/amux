@@ -3,7 +3,8 @@ mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use amux::protocol::{AttachedSession, ClientMessage, NewSession};
+use amux::project::ProjectId;
+use amux::protocol::{AttachedSession, ClientMessage, NewSession, ProjectRef, ServerMessage};
 use common::git::{self, path_str, Repos, PROJECT};
 use common::{settled_pair, Listing, TestServer, DETACH};
 
@@ -81,6 +82,79 @@ fn new_with_a_project_and_branch_runs_in_its_worktree_and_new_again_attaches_to_
     again.wait_for_text("[detached (from session amux/feature-x)]");
     assert!(again.wait_for_exit().success());
     assert_eq!(sessions_on(&server, server.name()), ["amux/feature-x"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attached_client_opens_sessions_and_stays_put_when_one_fails() {
+    let repos = Repos::new();
+    let server = TestServer::start();
+    let checkout = repos.clone_to(&repos.path("work/amux"));
+    let mut client = server.client().await;
+    let first = client.new_session(Some("first")).await;
+    let open_amux = NewSession {
+        cwd: Some(checkout.clone()),
+        ..project_session(&repos, Some("main"))
+    };
+
+    client
+        .send(ClientMessage::NewSession(open_amux.clone()))
+        .await;
+    let opened = match client.next_non_output().await {
+        Some(ServerMessage::Attached(attached)) => attached,
+        other => panic!("expected to open amux/main, got {other:?}"),
+    };
+    assert_eq!(opened.session, "amux/main");
+    client.reset_screen();
+    client.type_text("echo \"at=$PWD\"\r").await;
+    client
+        .wait_for_text(&format!("at={}", canonical(&checkout).display()))
+        .await;
+
+    client.send(ClientMessage::NewSession(open_amux)).await;
+    match client.next_non_output().await {
+        Some(ServerMessage::Attached(attached)) => assert_eq!(attached.id, opened.id),
+        other => panic!("expected to reuse amux/main, got {other:?}"),
+    }
+
+    let plain = repos.path("plain");
+    fs::create_dir_all(&plain).unwrap();
+    client
+        .send(ClientMessage::NewSession(NewSession {
+            cwd: Some(plain.clone()),
+            ..NewSession::new(None, common::SIZE)
+        }))
+        .await;
+    let numbered = match client.next_non_output().await {
+        Some(ServerMessage::Attached(attached)) => attached,
+        other => panic!("expected a plain session, got {other:?}"),
+    };
+    assert_ne!(numbered.session, first);
+    assert_ne!(numbered.id, opened.id);
+
+    client
+        .send(ClientMessage::NewSession(NewSession {
+            project: Some(ProjectRef {
+                id: ProjectId::from_remote_url("https://example.com/nobody/gone.git"),
+                name: "gone".into(),
+                origin: None,
+            }),
+            ..NewSession::new(None, common::SIZE)
+        }))
+        .await;
+    let refused = match client.next_non_output().await {
+        Some(ServerMessage::Error(message)) => message,
+        other => panic!("expected the open to be refused, got {other:?}"),
+    };
+    assert!(
+        refused.contains("has no checkout of project gone"),
+        "{refused}"
+    );
+    client.reset_screen();
+    client.type_text("echo \"still=$PWD\"\r").await;
+    client
+        .wait_for_text(&format!("still={}", canonical(&plain).display()))
+        .await;
+    client.detach().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

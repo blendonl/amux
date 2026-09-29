@@ -227,6 +227,47 @@ async fn kill_server_on_the_host_exits_the_client_attached_through_a_peer() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_client_attached_through_a_peer_opens_sessions_from_its_own_server() {
+    let [a, b] = pair();
+    session_on(&b, "there").await;
+    blocking(|| a.wait_for_ls("there on b", |ls| sessions_on(ls, "b") == ["there"]));
+    let mut client = a.client().await;
+    client.attach_to("there@b").await;
+    client.wait_for_text("$").await;
+    let back = || ClientMessage::NewSession(NewSession::new(Some("back".into()), SIZE));
+
+    client.send(back()).await;
+    match client.next_non_output().await {
+        Some(ServerMessage::Attached(attached)) => assert_eq!(
+            (attached.server.as_str(), attached.session.as_str()),
+            ("a", "back")
+        ),
+        other => panic!("expected to open back on a, got {other:?}"),
+    }
+    client.reset_screen();
+    client.type_text("echo \"home=$HOME\"\r").await;
+    client
+        .wait_for_text(&format!("home={}", a.home().display()))
+        .await;
+
+    client
+        .send(ClientMessage::Switch("there@b".parse().unwrap()))
+        .await;
+    assert_eq!(client.expect_attached().await.server, "b");
+    client.send(back()).await;
+    match client.next_non_output().await {
+        Some(ServerMessage::Error(message)) => assert_eq!(message, "duplicate session: back"),
+        other => panic!("expected the open to be refused, got {other:?}"),
+    }
+    client.reset_screen();
+    client.type_text("echo \"home=$HOME\"\r").await;
+    client
+        .wait_for_text(&format!("home={}", b.home().display()))
+        .await;
+    client.detach().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_attached_client_lists_the_cluster_and_switches_between_servers() {
     let [a, b] = pair();
     session_on(&a, "here").await;
