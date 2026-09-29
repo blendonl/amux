@@ -1,0 +1,53 @@
+{
+  "width": { "left": 25, "right": 25 },
+  "layers": {
+    "base": {
+      "left": [
+        ["esc", "1", "2", "3", "4", "5"],
+        ["tab", "q", "w", "e", "r", "t"],
+        ["ctrl", "a", "s", "d", "f", "g"],
+        ["shift", "z", "x", "c", "v", "b"],
+        ["prefix", "alt", "layer:nav", "layer:sym", { "key": "space", "width": 2 }]
+      ],
+      "right": [
+        ["6", "7", "8", "9", "0", "bksp"],
+        ["y", "u", "i", "o", "p", "'"],
+        ["h", "j", "k", "l", ";", "enter"],
+        ["n", "m", ",", ".", "/", "shift"],
+        [{ "key": "space", "width": 2 }, "layer:sym", "layer:nav", "ctrl", "alt"]
+      ]
+    },
+    "sym": {
+      "left": [
+        [null, "!", "@", "#", "$", "%"],
+        [null, "`", "~", "\\", "|", "&"],
+        [null, "-", "_", "=", "+", "*"],
+        [null, "<", ">", "(", ")", "\""],
+        null
+      ],
+      "right": [
+        ["^", "&", "*", "(", ")", null],
+        ["[", "]", "{", "}", "|", null],
+        ["-", "=", "_", "+", ":", null],
+        ["<", ">", "~", "`", "?", null],
+        null
+      ]
+    },
+    "nav": {
+      "left": [
+        [null, "f1", "f2", "f3", "f4", "f5"],
+        [null, "f6", "f7", "f8", "f9", "f10"],
+        [null, "f11", "f12", "ins", "del", "paste"],
+        [null, "", "", "", "", "hide"],
+        null
+      ],
+      "right": [
+        ["", "", "", "", "", null],
+        ["home", "pgdn", "pgup", "end", "", null],
+        ["left", "down", "up", "right", "del", null],
+        ["paste", "hide", "", "", "", null],
+        null
+      ]
+    }
+  }
+}

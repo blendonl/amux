@@ -68,4 +68,5 @@ dependencies {
     implementation(libs.termux.terminal.emulator)
     implementation(libs.termux.terminal.view)
     testImplementation(libs.junit)
+    testImplementation(libs.json)
 }

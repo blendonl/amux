@@ -3,11 +3,13 @@ agp = "8.13.2"
 kotlin = "2.4.20"
 termux = "v0.118.3"
 junit = "4.13.2"
+json = "20260814"
 
 [libraries]
 termux-terminal-emulator = { module = "com.github.termux.termux-app:terminal-emulator", version.ref = "termux" }
 termux-terminal-view = { module = "com.github.termux.termux-app:terminal-view", version.ref = "termux" }
 junit = { module = "junit:junit", version.ref = "junit" }
+json = { module = "org.json:json", version.ref = "json" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
