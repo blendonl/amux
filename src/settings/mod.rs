@@ -14,7 +14,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 pub use callback::{CallbackId, CALLBACK_SLOT};
-pub use client::{StatusSettings, TreeSettings, WhichKeySettings};
+pub use client::{SearchSettings, StatusSettings, TreeSettings, WhichKeySettings};
 pub use cluster::{ClusterSettings, DiscoverySettings, LanSettings, ServerConfig, SshSettings};
 pub use host::{
     BorderSettings, MouseSettings, PaneSettings, ProjectConfig, SessionSettings, WindowSettings,
@@ -46,6 +46,7 @@ pub struct Settings {
     pub theme: Theme,
     pub tree: TreeSettings,
     pub which_key: WhichKeySettings,
+    pub search: SearchSettings,
     pub pane: PaneSettings,
     pub window: WindowSettings,
     pub session: SessionSettings,
@@ -68,6 +69,12 @@ impl Settings {
 
     pub fn expand_home(mut self, home: &Path) -> Self {
         self.projects_dir = paths::expand_home(self.projects_dir, home);
+        self.search.project_dirs = self
+            .search
+            .project_dirs
+            .into_iter()
+            .map(|dir| paths::expand_home(dir, home))
+            .collect();
         for project in self.projects.values_mut() {
             project.worktrees_dir = project
                 .worktrees_dir
@@ -106,6 +113,7 @@ impl Settings {
                 "worktrees.fetch_timeout_ms",
                 self.worktrees.fetch_timeout_ms,
             ),
+            ("search.project_depth", u64::from(self.search.project_depth)),
         ];
         if let Some((option, _)) = positive.iter().find(|(_, value)| *value == 0) {
             return Err(format!("amux.opt.{option} must be a positive number"));
@@ -141,6 +149,7 @@ impl Default for Settings {
             theme: Theme::default(),
             tree: TreeSettings::default(),
             which_key: WhichKeySettings::default(),
+            search: SearchSettings::default(),
             pane: PaneSettings::default(),
             window: WindowSettings::default(),
             session: SessionSettings::default(),
@@ -243,6 +252,13 @@ mod tests {
             Settings::default().projects_dir,
             PathBuf::from("~/projects")
         );
+        assert_eq!(
+            Settings::default().search,
+            SearchSettings {
+                project_dirs: vec!["~/projects".into(), "~/Projects".into()],
+                project_depth: 1,
+            }
+        );
     }
 
     #[test]
@@ -285,6 +301,10 @@ mod tests {
             rejected(|settings| settings.worktrees.suffix.clear()),
             "amux.opt.worktrees.suffix must not be empty"
         );
+        assert_eq!(
+            rejected(|settings| settings.search.project_depth = 0),
+            "amux.opt.search.project_depth must be a positive number"
+        );
 
         let named = Settings {
             name: Some("desk".into()),
@@ -313,9 +333,22 @@ mod tests {
                     },
                 ),
             ]),
+            search: SearchSettings {
+                project_dirs: vec!["~/projects".into(), "~".into(), "/src".into()],
+                project_depth: 1,
+            },
             ..Settings::default()
         }
         .expand_home(Path::new("/home/tester"));
+
+        assert_eq!(
+            settings.search.project_dirs,
+            [
+                PathBuf::from("/home/tester/projects"),
+                PathBuf::from("/home/tester"),
+                PathBuf::from("/src"),
+            ]
+        );
 
         assert_eq!(
             settings.projects_dir,

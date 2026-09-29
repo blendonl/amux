@@ -3,7 +3,7 @@ pub mod git;
 mod id;
 mod registry;
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 mod worktree;
 
 use std::fs;
@@ -15,8 +15,8 @@ pub use detect::{detect, Detected};
 pub use id::ProjectId;
 pub use registry::{Project, Registry};
 pub use worktree::{
-    check_removable, clone, default_branch, default_worktrees_dir, ensure_worktree, fetch_branch,
-    remove_worktree,
+    branch_worktrees, check_removable, clone, default_branch, default_worktrees_dir,
+    ensure_worktree, fetch_branch, remove_worktree, BranchWorktree,
 };
 
 fn canonical(path: &Path) -> Result<PathBuf> {
