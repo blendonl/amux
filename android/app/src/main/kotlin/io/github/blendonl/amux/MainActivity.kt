@@ -17,7 +17,6 @@ import com.termux.terminal.TerminalSession
 import com.termux.view.TerminalView
 
 class MainActivity : Activity() {
-    private lateinit var amux: AmuxEnvironment
     private lateinit var terminalView: TerminalView
     private lateinit var extraKeys: ExtraKeys
     private lateinit var status: StatusPanel
@@ -26,12 +25,15 @@ class MainActivity : Activity() {
     private var service: AmuxService? = null
     private var bound = false
     private var attachWhenReady = true
+    private var userlandFailureShown = false
 
     private val serverObserver: (ServerState) -> Unit = { onServerState(it) }
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
-            service = (binder as AmuxService.LocalBinder).service.also { it.observe(serverObserver) }
+            val connected = (binder as AmuxService.LocalBinder).service
+            service = connected
+            connected.observe(serverObserver)
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
@@ -48,7 +50,6 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
         fitContentToInsets(findViewById(R.id.root))
-        amux = amuxEnvironment()
         terminalView = findViewById(R.id.terminal)
         extraKeys = ExtraKeys(findViewById(R.id.extra_keys), terminalView)
         val fontSize = FontSize(this)
@@ -83,7 +84,9 @@ class MainActivity : Activity() {
     private fun onServerState(state: ServerState) {
         if (!attachWhenReady) return
         when (state) {
-            ServerState.Ready -> attach()
+            ServerState.Ready -> attachOrWarn()
+            is ServerState.Installing ->
+                showProgress(getString(R.string.status_installing), getString(R.string.status_installing_progress, state.percent))
             ServerState.Starting -> showProgress(getString(R.string.status_starting), null)
             is ServerState.Restarting -> showProgress(getString(R.string.status_starting), state.describe(this))
             ServerState.Stopping -> showProgress(getString(R.string.status_stopping), null)
@@ -92,7 +95,23 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun attach() {
+    private fun attachOrWarn() {
+        val connected = service ?: return
+        val failure = connected.userlandFailure
+        if (failure != null && !userlandFailureShown) {
+            userlandFailureShown = true
+            attachWhenReady = false
+            showDetached(
+                getString(R.string.status_userland_failed),
+                getString(R.string.userland_fallback, failure),
+                getString(R.string.action_continue),
+            )
+            return
+        }
+        connected.environment?.let(::attach)
+    }
+
+    private fun attach(amux: AmuxEnvironment) {
         attachWhenReady = false
         val client = TerminalSession(
             amux.binary.path,
@@ -119,7 +138,7 @@ class MainActivity : Activity() {
         attachWhenReady = true
         showProgress(getString(R.string.status_starting), null)
         AmuxService.start(this)
-        if (service?.state == ServerState.Ready) attach()
+        if (service?.state == ServerState.Ready) attachOrWarn()
     }
 
     private fun stopAmux() {
@@ -138,13 +157,13 @@ class MainActivity : Activity() {
 
     private fun showProgress(title: String, detail: String?) {
         hideTerminal()
-        status.show(title, detail, withActions = false)
+        status.show(title, detail)
     }
 
-    private fun showDetached(title: String, detail: String?) {
+    private fun showDetached(title: String, detail: String?, reattachLabel: String = getString(R.string.action_reattach)) {
         hideTerminal()
         hideKeyboard()
-        status.show(title, detail, withActions = true)
+        status.show(title, detail, reattachLabel)
     }
 
     private fun hideTerminal() {

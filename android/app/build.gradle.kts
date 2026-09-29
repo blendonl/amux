@@ -49,6 +49,7 @@ android {
 
     packaging {
         jniLibs.useLegacyPackaging = true
+        jniLibs.keepDebugSymbols += "**/libu_*.so"
     }
 
     lint {

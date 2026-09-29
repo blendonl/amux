@@ -3,6 +3,8 @@ package io.github.blendonl.amux
 import kotlin.time.Duration
 
 sealed interface ServerState {
+    data class Installing(val percent: Int) : ServerState
+
     data object Starting : ServerState
 
     data object Ready : ServerState

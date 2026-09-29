@@ -10,6 +10,8 @@ readonly image=amux-android-build
 readonly image_label=io.github.blendonl.amux.dockerfile
 readonly smoke_image=termux/termux-docker:x86_64
 readonly jni_libs=android/app/src/main/jniLibs
+readonly assets=android/app/src/main/assets
+readonly smoke_lib=/smoke/lib
 readonly apk=app/build/outputs/apk/debug/app-debug.apk
 readonly min_sdk=29
 readonly abis=(arm64-v8a x86_64)
@@ -25,7 +27,7 @@ readonly forbidden_libs='^lib(db|krb5|k5crypto|krb5support|gssapi|gssapi_krb5|co
 readonly android_libs=(libc.so libdl.so libm.so liblog.so libandroid.so)
 
 usage() {
-    echo "usage: $0 image|binary|smoke|apk|all|userland|userland-check" >&2
+    echo "usage: $0 image|binary|userland|package|smoke|apk|all|userland-check" >&2
     exit 2
 }
 
@@ -64,8 +66,8 @@ run_in_image() {
         --env ANDROID_USER_HOME=/cache/android \
         "$image" \
         bash -c "set -euo pipefail
-            $(declare -p jni_libs apk min_sdk abis)
-            $(declare -f rust_target "$task")
+            $(declare -p jni_libs assets smoke_lib apk min_sdk abis userland_arches)
+            $(declare -f rust_target userland_abi "$task")
             $task"
 }
 
@@ -96,6 +98,34 @@ build_binary() {
     run_in_image cross_compile
 }
 
+userland_abi() {
+    case "$1" in
+        aarch64) echo arm64-v8a ;;
+        x86_64) echo x86_64 ;;
+        *) echo "no abi for userland arch $1" >&2 && return 1 ;;
+    esac
+}
+
+package_prefixes() {
+    local arch
+    for arch in "${userland_arches[@]}"; do
+        python3 -B android/userland/package.py \
+            --prefix "/cache/userland/$arch/prefix" \
+            --abi "$(userland_abi "$arch")" \
+            --jnilibs "$jni_libs" \
+            --assets "$assets"
+    done
+}
+
+package_userland() {
+    local arch
+    for arch in "${userland_arches[@]}"; do
+        [[ -x "$userland_out/$arch/prefix/bin/zsh" ]] || die "$userland_out/$arch/prefix is missing, run $0 userland first"
+    done
+    run_in_image package_prefixes
+    du -sh "$repo_dir/$assets"/userland/*.zip
+}
+
 require_binaries() {
     local abi
     for abi in "${abis[@]}"; do
@@ -103,28 +133,54 @@ require_binaries() {
     done
 }
 
+require_userland() {
+    local abi executables
+    for abi in "${abis[@]}"; do
+        [[ -f "$repo_dir/$assets/userland/$abi.zip" ]] || die "$assets/userland/$abi.zip is missing, run $0 package first"
+        executables=("$repo_dir/$jni_libs/$abi"/libu_*.so)
+        [[ -f "${executables[0]}" ]] || die "$jni_libs/$abi has no libu_*.so, run $0 package first"
+    done
+}
+
 build_apk() {
     cd android
     ./gradlew --no-daemon assembleDebug testDebugUnitTest lintDebug
 
-    printf '\n$ ls -l %s\n' "$apk"
-    ls -l "$apk"
-    printf '\n$ unzip -l %s lib/*\n' "$apk"
-    unzip -l "$apk" 'lib/*'
+    local abi
+    printf '\n$ ls -lh %s\n' "$apk"
+    ls -lh "$apk"
+    printf '\n$ unzip -l %s lib/*/libamux.so assets/userland/*\n' "$apk"
+    unzip -l "$apk" 'lib/*/libamux.so' 'assets/userland/*'
+    for abi in "${abis[@]}"; do
+        printf '\n$ unzip -Z1 %s lib/%s/libu_*.so | wc -l\n' "$apk" "$abi"
+        unzip -Z1 "$apk" "lib/$abi/libu_*.so" | wc -l
+    done
     printf '\n$ aapt2 dump badging %s\n' "$apk"
     aapt2 dump badging "$apk" | grep -E "^(package|minSdkVersion|targetSdkVersion|uses-permission|application-label|native-code)"
 }
 
+prepare_smoke_files() {
+    rm -rf /cache/smoke
+    python3 -B -c 'import sys
+from pathlib import Path
+sys.path.insert(0, "android/userland")
+import package
+package.install_into(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))' \
+        /cache/smoke/files/usr "$assets/userland/x86_64.zip" "$smoke_lib"
+    mkdir -p /cache/smoke/files/home
+    sed 's/{{host}}/smoke-phone/' "$assets/dotfiles/zshrc" > /cache/smoke/files/home/.zshrc
+}
+
 smoke_script() {
+    printf 'app=%s\nlib=%s\nsdk=%s\n' "$app_data_dir" "$smoke_lib" "$min_sdk"
     cat <<'SMOKE'
 set -eu
-app=$HOME/io.github.blendonl.amux
 files=$app/files
 cache=$app/cache
-mkdir -p "$files/home" "$files/config" "$files/state" "$files/bin" "$cache"
-ln -s /smoke/lib/libamux.so "$files/bin/amux"
+prefix=$files/usr
+log=$app/server.log
 
-in_app() {
+in_fallback() {
     env -i \
         HOME="$files/home" \
         XDG_CONFIG_HOME="$files/config" \
@@ -133,57 +189,153 @@ in_app() {
         SHELL=/system/bin/sh \
         PATH="$files/bin:/system/bin" \
         LANG=C.UTF-8 \
+        ANDROID_DATA="$ANDROID_DATA" \
+        ANDROID_ROOT="$ANDROID_ROOT" \
+        "$@"
+}
+
+in_app() {
+    env -i \
+        HOME="$files/home" \
+        XDG_CONFIG_HOME="$files/config" \
+        XDG_STATE_HOME="$files/state" \
+        PREFIX="$prefix" \
+        TERMUX__PREFIX="$prefix" \
+        TERMUX_APP__DATA_DIR="$app" \
+        TERMUX_APP__LEGACY_DATA_DIR="$app" \
+        LD_PRELOAD="$prefix/lib/libtermux-exec-direct-ld-preload.so" \
+        TERMUX_EXEC__SYSTEM_LINKER_EXEC__MODE=disable \
+        ANDROID__BUILD_VERSION_SDK="$sdk" \
+        TMPDIR="$prefix/tmp" \
+        PATH="$prefix/bin:/system/bin" \
+        SHELL="$prefix/bin/zsh" \
+        LANG=en_US.UTF-8 \
+        ANDROID_DATA="$ANDROID_DATA" \
+        ANDROID_ROOT="$ANDROID_ROOT" \
         "$@"
 }
 
 step() {
+    runner=$1
+    shift
     printf '\n$ %s\n' "$*"
-    in_app "$@"
+    "$runner" "$@"
 }
 
 server_failed() {
     echo "amux server $1, its log:" >&2
-    cat "$app/server.log" >&2
+    cat "$log" >&2
     exit 1
 }
 
-step amux --version
-step amux config check
+start_server() {
+    printf '\n$ amux server &\n'
+    "$1" amux server > "$log" 2>&1 &
+    server=$!
+    tries=0
+    until "$1" amux ls > /dev/null 2>&1; do
+        kill -0 "$server" 2> /dev/null || server_failed "exited before it answered"
+        tries=$((tries + 1))
+        [ "$tries" -lt 100 ] || server_failed "did not answer within 10 seconds"
+        sleep 0.1
+    done
+    step "$1" amux ls
+}
 
-printf '\n$ amux server &\n'
-in_app amux server > "$app/server.log" 2>&1 &
-server=$!
+stop_server() {
+    step "$1" amux kill-server
+    status=0
+    wait "$server" || status=$?
+    [ "$status" -eq 0 ] || server_failed "exited with status $status"
+    printf '\n$ cat server.log\n'
+    cat "$log"
+}
 
-tries=0
-until in_app amux ls > /dev/null 2>&1; do
-    kill -0 "$server" 2> /dev/null || server_failed "exited before it answered"
-    tries=$((tries + 1))
-    [ "$tries" -lt 100 ] || server_failed "did not answer within 10 seconds"
-    sleep 0.1
-done
+check_pane_shell() {
+    printf '\n$ amux new -s smoke, in a pty; in its pane: print the shell, then exit\n'
+    in_app zsh -c '
+        zmodload zsh/zpty
+        zpty client "stty rows 24 cols 80; TERM=xterm-256color COLORTERM=truecolor exec amux new -s smoke"
+        screen=
+        deadline=$((SECONDS + 10))
+        while [[ $screen != *smoke-phone* ]] && ((SECONDS < deadline)); do
+            zpty -r -t client chunk && screen+=$chunk || sleep 0.1
+        done
+        [[ $screen == *smoke-phone* ]] || { print -r -- "the pane showed no zsh prompt: ${(q+)screen}" >&2; exit 1 }
+        zpty -w client "print -r -- \"\$0 \$ZSH_VERSION in \$(readlink /proc/\$\$/exe), SHELL=\$SHELL TERM=\$TERM\" > \$TMPDIR/pane; exit"
+        while [[ ! -s $TMPDIR/pane ]] && ((SECONDS < deadline + 10)); do
+            sleep 0.1
+        done
+        zpty -d client
+        [[ -s $TMPDIR/pane ]] || { print -r -- "the pane did not run the command" >&2; exit 1 }
+        cat $TMPDIR/pane
+    '
+}
 
-step amux ls
-step amux kill-server
+printf '\n# the /system/bin/sh fallback, with no userland\n'
+mkdir -p "$files/config" "$files/state" "$files/bin" "$cache"
+ln -s "$lib/libamux.so" "$files/bin/amux"
+cd "$files/home"
+step in_fallback amux --version
+step in_fallback amux config check
+start_server in_fallback
+stop_server in_fallback
 
-status=0
-wait "$server" || status=$?
-[ "$status" -eq 0 ] || server_failed "exited with status $status"
-printf '\n$ cat server.log\n'
-cat "$app/server.log"
+printf '\n# the userland, laid out as the app installs it\n'
+rm -r "$files/bin"
+mkdir -m 700 "$prefix/tmp"
+ln -s ../../applib/libamux.so "$prefix/bin/amux"
+cat > "$prefix/tmp/usr-bin-env" <<'SCRIPT'
+#!/usr/bin/env sh
+echo "$0 runs in $(readlink /proc/$$/exe)"
+SCRIPT
+cat > "$prefix/tmp/prefix-sh" <<SCRIPT
+#!$prefix/bin/sh
+echo "\$0 runs in \$(readlink /proc/\$\$/exe)"
+SCRIPT
+chmod 700 "$prefix/tmp/usr-bin-env" "$prefix/tmp/prefix-sh"
+
+step in_app ls -l "$files/applib" "$prefix/bin/zsh" "$prefix/bin/amux"
+step in_app zsh -c 'echo $ZSH_VERSION'
+step in_app zsh -c '"$TMPDIR/usr-bin-env"'
+step in_app zsh -c '"$TMPDIR/prefix-sh"'
+printf '\n$ env -u LD_PRELOAD zsh -c "$TMPDIR/usr-bin-env", which must fail without termux-exec\n'
+if in_app env -u LD_PRELOAD zsh -c '"$TMPDIR/usr-bin-env"'; then
+    echo "the /usr/bin/env shebang ran without termux-exec, so the check above proves nothing" >&2
+    exit 1
+fi
+step in_app zsh -c 'cd "$TMPDIR" && git init -q repo && cd repo && echo hello > README &&
+    git add README && git -c user.name=amux -c user.email=amux@localhost commit -q -m first && git log --stat'
+step in_app ssh -V
+step in_app curl -V
+step in_app amux --version
+start_server in_app
+check_pane_shell
+stop_server in_app
+
+printf '\nnote: Docker has no SELinux, so this does not prove that W^X lets panes exec through applib; check that on a phone\n'
 SMOKE
 }
 
 smoke() {
     local lib_dir=$repo_dir/$jni_libs/x86_64
     [[ -f "$lib_dir/libamux.so" ]] || die "$lib_dir/libamux.so is missing, run $0 binary first"
+    require_userland
+    run_in_image prepare_smoke_files
     docker run --rm \
         --user 0 \
         --entrypoint /system/bin/sh \
-        --volume "$lib_dir:/smoke/lib:ro" \
+        --volume "$lib_dir:$smoke_lib:ro" \
+        --volume "$cache_dir/smoke/files:/smoke/files:ro" \
         "$smoke_image" \
-        -c 'ln -s /system/bin /bin && exec /entrypoint.sh "$@"' sh \
+        -c "ln -s /system/bin /bin
+            mkdir -p $app_data_dir
+            cp -a /smoke/files $app_data_dir/files
+            chown -R system:system $app_data_dir
+            exec /entrypoint.sh \"\$@\"" sh \
         /system/bin/sh -c "$(smoke_script)" \
         || die "smoke test failed"
+    rm -rf "$cache_dir/smoke"
     printf '\nsmoke test passed\n'
 }
 
@@ -576,21 +728,29 @@ main() {
             build_binary
             ;;
         smoke)
+            build_image
             smoke
+            ;;
+        userland)
+            build_userland
+            ;;
+        package)
+            build_image
+            package_userland
             ;;
         apk)
             build_image
             require_binaries
+            require_userland
             run_in_image build_apk
             ;;
         all)
             build_image
             build_binary
+            build_userland
+            package_userland
             smoke
             run_in_image build_apk
-            ;;
-        userland)
-            build_userland
             ;;
         userland-check)
             check_userland

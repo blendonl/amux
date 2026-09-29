@@ -46,6 +46,7 @@ class ServerNotification(private val context: Context) {
 
     private fun describe(state: ServerState, keepingAwake: Boolean): String =
         when (state) {
+            is ServerState.Installing -> context.getString(R.string.notification_installing)
             ServerState.Starting -> context.getString(R.string.notification_starting)
             ServerState.Ready ->
                 context.getString(if (keepingAwake) R.string.notification_running_awake else R.string.notification_running)
