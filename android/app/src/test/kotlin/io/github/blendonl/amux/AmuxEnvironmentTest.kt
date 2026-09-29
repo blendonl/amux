@@ -162,6 +162,17 @@ class AmuxEnvironmentTest {
     }
 
     @Test
+    fun `keeps the keyboard layout next to init lua and leaves it to the user`() {
+        val env = environment(withUserland = true)
+
+        env.prepare("pixel-8-pro", zshrcTemplate)
+
+        assertEquals(File(filesDir, "config/amux/keyboard.json"), env.keyboardFile)
+        assertEquals(env.initFile.parentFile, env.keyboardFile.parentFile)
+        assertFalse(env.keyboardFile.exists())
+    }
+
+    @Test
     fun `keeps an existing init lua`() {
         val env = environment(withUserland = true)
         Files.createDirectories(env.initFile.toPath().parent)
