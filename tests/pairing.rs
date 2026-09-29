@@ -256,9 +256,8 @@ fn pairing_links_two_servers_over_noise_and_trusts_each_directly() {
     assert!(warning.contains("full access"), "{warning}");
     let port = a.wait_for_lan_port();
     pairing.wait_for_line("the fallback", |line| {
-        line.ends_with(&format!(
-            "amux pair {code} --host <this machine's address>:{port}"
-        ))
+        line.starts_with(&format!("  amux pair {code} --host "))
+            && line.ends_with(&format!(":{port}"))
     });
     let address_of_a = format!("lan://{}", id_of(&a));
     b.wait_for_output(

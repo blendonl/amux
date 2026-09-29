@@ -344,14 +344,14 @@ pairing code k7-4821-9930, valid for 5 minutes and one use
 run this on the other machine:
   amux pair k7-4821-9930
 or, where multicast does not reach it:
-  amux pair k7-4821-9930 --host <this machine's address>:40123
+  amux pair k7-4821-9930 --host 192.168.1.23:40123
 waiting for the other machine...
 paired with laptop (5be0c7a1f29d4e8b93a6d10c7e42f851), key fingerprint 3f9a:1c07:88d2:e4b1
 ```
 
 The first part of the code, `k7`, names the pairing window, which the server advertises over mDNS while it is open. The eight digits are the secret. `amux pair k7-4821-9930` on the other machine finds the server that advertises `k7`, pairs with it, and prints the same warning and a `paired with` line naming the first machine.
 
-- Where multicast doesn't get through, as on many guest and office networks, add `--host <ip[:port]>` with the first machine's IP address and the port `amux pair` printed. It takes an IP address, not a host name. Without a port, amux uses the port that mDNS saw for that address, or this machine's own `amux.opt.lan.port` if it is set. The joining machine doesn't need LAN discovery for this.
+- Where multicast doesn't get through, as on many guest and office networks, run the `--host` line instead. `amux pair` prints one for each of the first machine's LAN addresses, every IPv4 address or, without one, every IPv6 address, so pick the one on the network the two machines share. That also works on Android, where `ip addr` can't read the addresses. `--host <ip[:port]>` takes an IP address, not a host name. Without a port, amux uses the port that mDNS saw for that address, or this machine's own `amux.opt.lan.port` if it is set. The joining machine doesn't need LAN discovery for this.
 - After pairing through `--host`, the joining machine saves the first machine as a server at `tcp://<ip>:<port>`, just like `amux servers add`, and prints `saved <name> as a server at …`. That is how it links again after the link drops when mDNS can't reach the first machine, for example from inside WSL2. The saved address keeps working only while the first machine keeps that port, so set `amux.opt.lan.port` there. If the name is already configured, amux says so and keeps the existing entry.
 - `amux pair --verbose` prints each step, with the time since it started, on either machine. The joining machine shows the address it dials and the local address it dials from, the connection, the Noise handshake and each step of the code exchange. The waiting machine shows its port, its LAN addresses and every connection that arrives. When the joining machine times out and the waiting one never prints `accepted a tcp connection`, the connection never reached amux there.
 - `connecting to … timed out` means nothing answered at all: something on the way drops the connection, most often a firewall on either machine, or the address belongs to another machine. By default the LAN listener takes a new free port each time it opens, so where a firewall is in the way, set `amux.opt.lan.port` to a fixed port on that machine and allow it, for example `sudo ufw allow 7448/tcp`. Keep the rule, since linked machines dial that port again later.
