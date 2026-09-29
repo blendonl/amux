@@ -1,0 +1,3 @@
+repo=https://github.com/termux/termux-packages
+commit=34aaf085b1931dcf3e4f461deba6721623b76edf
+image=ghcr.io/termux/package-builder@sha256:191d41075f60f79c287735433777c94d38a869d652690fef3db7eae20a20c6d2

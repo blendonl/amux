@@ -14,8 +14,18 @@ readonly apk=app/build/outputs/apk/debug/app-debug.apk
 readonly min_sdk=29
 readonly abis=(arm64-v8a x86_64)
 
+readonly userland_dir=$android_dir/userland
+readonly userland_out=$cache_dir/userland
+readonly termux_packages=$cache_dir/termux-packages
+readonly builder=amux-userland-builder
+readonly userland_arches=(aarch64 x86_64)
+readonly app_data_dir=/data/data/io.github.blendonl.amux
+readonly userland_prune=(include 'lib/*.a' lib/pkgconfig lib/cmake share/aclocal libexec/installed-tests var/service)
+readonly forbidden_libs='^lib(db|krb5|k5crypto|krb5support|gssapi|gssapi_krb5|com_err)[-.]'
+readonly android_libs=(libc.so libdl.so libm.so liblog.so libandroid.so)
+
 usage() {
-    echo "usage: $0 image|binary|smoke|apk|all" >&2
+    echo "usage: $0 image|binary|smoke|apk|all|userland|userland-check" >&2
     exit 2
 }
 
@@ -177,6 +187,384 @@ smoke() {
     printf '\nsmoke test passed\n'
 }
 
+pinned() {
+    sed -n "s/^$1=//p" "$userland_dir/termux-packages.txt"
+}
+
+userland_build_inputs() {
+    cat "$userland_dir/termux-packages.txt" "$userland_dir/packages.txt" "$userland_dir"/overlay/*.patch \
+        | sha256sum | cut -d ' ' -f 1
+}
+
+userland_inputs() {
+    {
+        userland_build_inputs
+        declare -p userland_prune
+        declare -f assemble_prefix deb_field deb_depends link_alternatives prune_prefix
+    } | sha256sum | cut -d ' ' -f 1
+}
+
+userland_is_current() {
+    local arch
+    [[ -f "$userland_out/INPUTS" && "$(< "$userland_out/INPUTS")" == "$1" ]] || return 1
+    [[ -f "$userland_out/sources/termux-packages.txt" ]] || return 1
+    for arch in "${userland_arches[@]}"; do
+        [[ -x "$userland_out/$arch/prefix/bin/zsh" ]] || return 1
+    done
+}
+
+checkout_termux_packages() {
+    local commit
+    commit=$(pinned commit)
+    [[ -d "$termux_packages/.git" ]] || git init -q "$termux_packages"
+    if ! git -C "$termux_packages" cat-file -e "$commit^{commit}" 2> /dev/null; then
+        git -C "$termux_packages" fetch -q --depth 1 "$(pinned repo)" "$commit"
+    fi
+    git -C "$termux_packages" checkout -q --force --detach "$commit"
+    git -C "$termux_packages" clean -q -fd
+    git -C "$termux_packages" apply "$userland_dir"/overlay/*.patch
+    echo "termux-packages is at $commit with $(ls "$userland_dir/overlay" | wc -l) overlay patches"
+}
+
+create_builder() {
+    local uid gid
+    uid=$(id -u)
+    gid=$(id -g)
+    mkdir -p "$userland_out"
+    docker run --detach --init --tty \
+        --name "$builder" \
+        --volume "$termux_packages:/home/builder/termux-packages" \
+        --volume "$userland_out:/userland" \
+        --security-opt "seccomp=$termux_packages/scripts/profile.json" \
+        "$(pinned image)" > /dev/null
+    [[ "$uid:$gid" != 1001:1001 ]] || return 0
+    echo "giving the builder user uid $uid and gid $gid, this copies its home and takes a few minutes"
+    docker exec "$builder" sudo chown -R "$uid:$gid" /home/builder /data
+    docker exec "$builder" sudo usermod -u "$uid" builder
+    docker exec "$builder" sudo groupmod -g "$gid" builder
+}
+
+start_builder() {
+    local running
+    running=$(docker container inspect --format '{{ .Config.Image }}' "$builder" 2> /dev/null || true)
+    if [[ -n "$running" && "$running" != "$(pinned image)" ]]; then
+        echo "the builder runs $running, recreating it from $(pinned image)"
+        docker rm -f "$builder" > /dev/null
+    fi
+    case "$(docker container inspect --format '{{ .State.Running }}' "$builder" 2> /dev/null || true)" in
+        true) ;;
+        false) docker start "$builder" > /dev/null ;;
+        *) create_builder ;;
+    esac
+}
+
+in_builder() {
+    CONTAINER_NAME=$builder TERMUX_BUILDER_IMAGE_NAME=$(pinned image) \
+        "$termux_packages/scripts/run-docker.sh" "$@"
+}
+
+in_builder_run() {
+    local task=$1
+    shift
+    in_builder bash -c "set -euo pipefail
+        $(declare -p app_data_dir userland_prune forbidden_libs android_libs)
+        $(declare -f assemble_prefix deb_field deb_depends link_alternatives prune_prefix copy_upstream_sources \
+            inspect_prefix check_needed report_prefix)
+        $task \"\$@\"" "$task" "$@"
+}
+
+package_dirs() {
+    local name subpackages
+    while read -r name; do
+        if [[ -f "$termux_packages/packages/$name/build.sh" ]]; then
+            echo "$name"
+            continue
+        fi
+        subpackages=("$termux_packages"/packages/*/"$name".subpackage.sh)
+        [[ -f "${subpackages[0]}" ]] || die "$name in packages.txt is not a termux package or subpackage"
+        basename "$(dirname "${subpackages[0]}")"
+    done < "$userland_dir/packages.txt" | sort -u
+}
+
+build_packages() {
+    local wanted stamp=$termux_packages/output/.inputs dirs arch
+    wanted=$(userland_build_inputs)
+    if [[ ! -f "$stamp" || "$(< "$stamp")" != "$wanted" ]]; then
+        echo "userland inputs changed, cleaning the builder"
+        in_builder ./clean.sh
+        rm -rf "$termux_packages/output"
+        mkdir -p "$termux_packages/output"
+        echo "$wanted" > "$stamp"
+    fi
+    dirs=$(package_dirs)
+    for arch in "${userland_arches[@]}"; do
+        echo "building for $arch:" $dirs
+        in_builder ./build-package.sh -a "$arch" $dirs
+    done
+}
+
+deb_field() {
+    dpkg-deb --info "$1" control | sed -n "s/^$2: //p"
+}
+
+deb_depends() {
+    local deb=$1 field alternatives alternative
+    for field in Pre-Depends Depends; do
+        deb_field "$deb" "$field"
+    done | tr ',' '\n' | sed -E 's/\([^)]*\)//g; s/[[:space:]]//g; /^$/d' |
+        while IFS='|' read -ra alternatives; do
+            for alternative in "${alternatives[@]}"; do
+                if [[ -n "${deb_of[$alternative]:-}" ]]; then
+                    echo "$alternative"
+                    continue 2
+                fi
+            done
+            echo "${alternatives[0]}"
+        done
+}
+
+link_alternatives() {
+    local prefix=$1 name priority group link path
+    shift
+    for name in "$@"; do
+        dpkg-deb --info "${deb_of[$name]}" postinst 2> /dev/null || true
+    done | sed -nE 's|.*--install "([^"]+)" "([^"]+)" "([^"]+)" ([0-9]+).*|\4 \2 \1 \3|p' |
+        sort -k1,1nr -k2,2 | awk '!seen[$2]++' |
+        while read -r priority group link path; do
+            link=$prefix/${link#"$app_data_dir"/files/usr/}
+            path=$prefix/${path#"$app_data_dir"/files/usr/}
+            ln -sfn "$(realpath -m --relative-to="$(dirname "$link")" "$path")" "$link"
+            echo "alternative $group: ${link#"$prefix"/} -> ${path#"$prefix"/} (priority $priority)"
+        done
+}
+
+prune_prefix() {
+    local prefix=$1 path
+    for path in "${userland_prune[@]}"; do
+        rm -rf "${prefix:?}"/$path
+    done
+}
+
+assemble_prefix() {
+    local arch=$1 deb name stray
+    local out=/userland/$arch
+    local staging=$out/staging
+    local usr=$staging$app_data_dir/files/usr
+    local -A deb_of=() seen=()
+    local -a queue=("${@:2}") closure=()
+    rm -rf "$out"
+    mkdir -p "$staging"
+    for deb in output/*_"$arch".deb output/*_all.deb; do
+        if [[ -f "$deb" ]]; then
+            deb_of[$(deb_field "$deb" Package)]=$deb
+        fi
+    done
+    while (( ${#queue[@]} )); do
+        name=${queue[0]}
+        queue=("${queue[@]:1}")
+        [[ -z "${seen[$name]:-}" ]] || continue
+        seen[$name]=1
+        deb=${deb_of[$name]:-}
+        if [[ -z "$deb" ]]; then
+            echo "no $arch package named $name in output/" >&2
+            return 1
+        fi
+        closure+=("$name")
+        mapfile -t -O "${#queue[@]}" queue < <(deb_depends "$deb")
+    done
+    for name in "${closure[@]}"; do
+        dpkg-deb --fsys-tarfile "${deb_of[$name]}" | tar -x --preserve-permissions -C "$staging"
+        echo "$name $(deb_field "${deb_of[$name]}" Version)"
+    done | sort > "$out/packages.txt"
+    stray=$(find "$staging" -path "$usr" -prune -o ! -type d -print)
+    if [[ -n "$stray" ]]; then
+        echo "$arch packages install files outside the prefix:" "$stray" >&2
+        return 1
+    fi
+    mv "$usr" "$out/prefix"
+    rm -rf "$staging"
+    link_alternatives "$out/prefix" "${closure[@]}"
+    prune_prefix "$out/prefix"
+    echo "$arch prefix holds ${#closure[@]} packages:" "${closure[@]}"
+}
+
+copy_upstream_sources() {
+    local cache pkg
+    for cache in "$HOME"/.termux-build/*/cache; do
+        pkg=$(basename "$(dirname "$cache")")
+        [[ "$pkg" != _* ]] || continue
+        mkdir -p "/userland/sources/upstream/$pkg"
+        cp -a "$cache"/. "/userland/sources/upstream/$pkg/"
+    done
+}
+
+collect_sources() {
+    rm -rf "$userland_out/sources"
+    in_builder_run copy_upstream_sources
+    cp "$userland_dir/termux-packages.txt" "$userland_dir/packages.txt" "$android_dir/build.sh" "$userland_out/sources/"
+    cp -R "$userland_dir/overlay" "$userland_out/sources/"
+    echo "sources: $(du -sh "$userland_out/sources" | cut -f 1) in $userland_out/sources"
+}
+
+inspect_prefix() {
+    local prefix=/userland/$1/prefix file kind needed
+    printf '\177ELF' > /tmp/elf-magic
+    find "$prefix" -type f -printf '%P\n' | LC_ALL=C sort | while IFS= read -r file; do
+        cmp -s -n 4 "$prefix/$file" /tmp/elf-magic || continue
+        needed=$(readelf -dW "$prefix/$file" | sed -nE 's/.*\(NEEDED\).*\[(.*)\]$/\1/p' | paste -sd , -)
+        if readelf -lW "$prefix/$file" | grep -q 'Requesting program interpreter'; then
+            kind=exec
+        elif [[ -z "$needed" ]]; then
+            kind=static
+        else
+            kind=lib
+        fi
+        echo "$kind $file ${needed:--}"
+    done > "/userland/$1/elf.txt"
+}
+
+check_needed() {
+    local arch=$1 prefix=/userland/$1/prefix kind file needed lib status=0
+    while read -r kind file needed; do
+        for lib in ${needed//,/ }; do
+            if [[ "$lib" =~ $forbidden_libs ]]; then
+                echo "$arch: $file needs $lib" >&2
+                status=1
+            elif [[ "$lib" != - && ! -e "$prefix/lib/$lib" && " ${android_libs[*]} " != *" $lib "* ]]; then
+                echo "$arch: $file needs $lib, which is neither in the prefix nor in Android" >&2
+                status=1
+            fi
+        done
+    done < "/userland/$arch/elf.txt"
+    [[ $status -eq 0 ]] || return 1
+    echo "$arch: $(wc -l < "/userland/$arch/elf.txt") ELF files, none needs libdb, libkrb5, libgssapi or libcom_err, every NEEDED library resolves"
+}
+
+report_prefix() {
+    local arch=$1 prefix=/userland/$1/prefix
+    printf '\n%s prefix: %s MiB, %s files, %s symlinks, %s directories\n' "$arch" \
+        "$(du -sb "$prefix" | awk '{ printf "%.1f", $1 / 1048576 }')" \
+        "$(find "$prefix" -type f | wc -l)" "$(find "$prefix" -type l | wc -l)" "$(find "$prefix" -type d | wc -l)"
+    awk '{ kinds[$1]++ } END { printf "ELF files: %d executables, %d shared libraries, %d with no NEEDED (static)\n", kinds["exec"], kinds["lib"], kinds["static"] }' \
+        "/userland/$arch/elf.txt"
+    echo "largest files:"
+    find "$prefix" -type f -printf '%s %P\n' | sort -rn | awk 'NR <= 10 { printf "  %7.1f KiB  %s\n", $1 / 1024, $2 }'
+}
+
+report_userland() {
+    local arch
+    for arch in "${userland_arches[@]}"; do
+        in_builder_run inspect_prefix "$arch"
+        in_builder_run report_prefix "$arch"
+    done
+}
+
+build_userland() {
+    local wanted arch
+    wanted=$(userland_inputs)
+    if userland_is_current "$wanted"; then
+        echo "userland is up to date ($wanted), skipping the build"
+        return
+    fi
+    rm -f "$userland_out/INPUTS"
+    checkout_termux_packages
+    start_builder
+    build_packages
+    for arch in "${userland_arches[@]}"; do
+        in_builder_run assemble_prefix "$arch" $(< "$userland_dir/packages.txt")
+    done
+    collect_sources
+    report_userland
+    echo "$wanted" > "$userland_out/INPUTS"
+}
+
+userland_check_script() {
+    cat <<'CHECK'
+set -eu
+files=/data/data/io.github.blendonl.amux/files
+prefix=$files/usr
+mkdir -p "$files/home" "$prefix/tmp"
+
+in_pane() {
+    env -i \
+        HOME="$files/home" \
+        PREFIX="$prefix" \
+        TMPDIR="$prefix/tmp" \
+        PATH="$prefix/bin:/system/bin" \
+        LANG=en_US.UTF-8 \
+        "$@"
+}
+
+step() {
+    printf '\n$ %s\n' "$*"
+    in_pane "$@"
+}
+
+cat > "$prefix/tmp/shebang" <<SCRIPT
+#!$prefix/bin/sh
+echo "\$0 runs in \$(readlink /proc/\$\$/exe)"
+SCRIPT
+cat > "$prefix/tmp/usr-bin-env" <<'SCRIPT'
+#!/usr/bin/env sh
+echo "$0 runs in $(readlink /proc/$$/exe)"
+SCRIPT
+chmod 700 "$prefix/tmp/shebang" "$prefix/tmp/usr-bin-env"
+
+step id
+step zsh -c 'echo ok'
+step zsh -l -c 'echo ok from a login shell'
+step bash --version
+step git --version
+step zsh -c 'cd "$TMPDIR" && git init -q repo && cd repo && echo hello > README &&
+    git add README && git -c user.name=amux -c user.email=amux@localhost commit -q -m first && git log --stat'
+step ssh -V
+step ssh-keygen -t ed25519 -N '' -C amux -f "$prefix/tmp/id_ed25519"
+step curl -V
+step nano --version
+step less --version
+step "$prefix/bin/ls" -l "$prefix/bin/zsh" "$prefix/bin/sh"
+step "$prefix/bin/grep" --version
+step "$prefix/bin/sed" --version
+step zsh -c 'command -v ls grep sed && echo amux | grep -o mu | sed s/mu/MU/'
+step "$prefix/tmp/shebang"
+step env \
+    LD_PRELOAD="$prefix/lib/libtermux-exec-direct-ld-preload.so" \
+    TERMUX_EXEC__SYSTEM_LINKER_EXEC__MODE=disable \
+    TERMUX__PREFIX="$prefix" \
+    TERMUX_APP__DATA_DIR=/data/data/io.github.blendonl.amux \
+    sh -c "$prefix/tmp/usr-bin-env"
+CHECK
+}
+
+check_userland_runs() {
+    docker run --rm \
+        --user 0 \
+        --entrypoint /system/bin/sh \
+        --volume "$userland_out/x86_64/prefix:/userland/prefix:ro" \
+        "$smoke_image" \
+        -c 'ln -s /system/bin /bin
+            mkdir -p /data/data/io.github.blendonl.amux/files
+            cp -a /userland/prefix /data/data/io.github.blendonl.amux/files/usr
+            chown -R system:system /data/data/io.github.blendonl.amux
+            exec /entrypoint.sh "$@"' sh \
+        /system/bin/sh -c "$(userland_check_script)" \
+        || die "the x86_64 userland does not run in $smoke_image"
+}
+
+check_userland() {
+    local arch
+    for arch in "${userland_arches[@]}"; do
+        [[ -x "$userland_out/$arch/prefix/bin/zsh" ]] || die "$userland_out/$arch/prefix is missing, run $0 userland first"
+    done
+    start_builder
+    for arch in "${userland_arches[@]}"; do
+        in_builder_run inspect_prefix "$arch"
+        in_builder_run check_needed "$arch" || die "$arch has ELF files with unwanted or missing libraries"
+    done
+    check_userland_runs
+    printf '\nuserland check passed\n'
+}
+
 main() {
     [[ $# -eq 1 ]] || usage
     case "$1" in
@@ -200,6 +588,12 @@ main() {
             build_binary
             smoke
             run_in_image build_apk
+            ;;
+        userland)
+            build_userland
+            ;;
+        userland-check)
+            check_userland
             ;;
         *)
             usage
