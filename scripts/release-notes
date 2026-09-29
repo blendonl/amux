@@ -38,4 +38,6 @@ curl -fsSL https://github.com/blendonl/amux/releases/latest/download/install.sh 
 ```
 
 An existing install updates with `amux update`.
+
+On Android, install `amux-android.apk` from the assets below. It installs over an earlier release and keeps the app's data. `amux-android-sources.tar.gz` holds the source of the zsh, git and ssh it carries.
 EOF

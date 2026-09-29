@@ -90,8 +90,87 @@ jobs:
           path: dist/amux-${{ matrix.target }}.tar.gz*
           if-no-files-found: error
 
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the signing key
+        env:
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -z "$ANDROID_KEYSTORE" ] || [ -z "$ANDROID_KEYSTORE_PASSWORD" ]; then
+            echo "::error::the ANDROID_KEYSTORE and ANDROID_KEYSTORE_PASSWORD secrets are not set, see Releasing in README.md"
+            exit 1
+          fi
+
+      - name: Free disk space for the userland build
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
+          df -h /
+
+      - name: Hash the userland's inputs
+        id: userland-inputs
+        run: echo "hash=$(android/build.sh userland-inputs)" >>"$GITHUB_OUTPUT"
+
+      - name: Restore the userland
+        id: userland
+        uses: actions/cache/restore@v4
+        with:
+          path: android/.cache/userland
+          key: android-userland-${{ steps.userland-inputs.outputs.hash }}
+
+      - run: android/build.sh binary
+
+      - run: android/build.sh userland
+
+      - name: Check the userland
+        if: steps.userland.outputs.cache-hit != 'true'
+        run: android/build.sh userland-check
+
+      - name: Save the userland
+        if: steps.userland.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: android/.cache/userland
+          key: ${{ steps.userland.outputs.cache-primary-key }}
+
+      - run: android/build.sh package
+
+      - run: android/build.sh smoke
+
+      - name: Build the signed APK
+        env:
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+          AMUX_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          AMUX_RELEASE_KEY_ALIAS: amux
+        run: |
+          export AMUX_RELEASE_KEYSTORE="$RUNNER_TEMP/release.keystore"
+          printf '%s' "$ANDROID_KEYSTORE" | base64 -d >"$AMUX_RELEASE_KEYSTORE"
+          android/build.sh release-apk
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp android/app/build/outputs/apk/release/app-release.apk dist/amux-android.apk
+          tar -czf dist/amux-android-sources.tar.gz -C android/.cache/userland \
+            --transform 's,^sources,amux-android-sources,' sources
+          cd dist
+          for file in amux-android.apk amux-android-sources.tar.gz; do
+            shasum -a 256 "$file" >"$file.sha256"
+          done
+          cat ./*.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: amux-android
+          path: dist/amux-android*
+          if-no-files-found: error
+
   publish:
-    needs: [test, build]
+    needs: [test, build, android]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     permissions:
