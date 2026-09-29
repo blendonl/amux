@@ -460,40 +460,58 @@ notes      4b825dc642cb6eb9a060e54bf8d69288fbee4904
 
 ### Android
 
-The Android app is a terminal that runs the real amux binary on the phone. It opens straight into `amux`, which attaches to the most recent session or creates one, and a foreground service keeps the server running while the app is in the background. The phone then joins the cluster like any other machine (see [Joining the cluster from the phone](#joining-the-cluster-from-the-phone)).
+The Android app is a terminal that runs the real amux binary on the phone, with zsh, git and ssh in its panes. It opens straight into `amux`, which attaches to the most recent session or creates one, and a foreground service keeps the server running while the app is in the background. The phone then joins the cluster like any other machine (see [Joining the cluster from the phone](#joining-the-cluster-from-the-phone)).
 
-The app needs Android 10 (API 29) or later on arm64 or x86_64. Its build, unit tests and lint run in a container and its binary runs in a Termux container, but it hasn't been tried on a real phone yet.
+The app needs Android 10 (API 29) or later on arm64 or x86_64, and its zsh, git and ssh only work for the phone's primary user (see [Limits](#limits)). Its build, unit tests and lint run in a container, and its binary and userland run in a Termux container, but it hasn't been tried on a real phone yet.
 
 #### Building and installing
 
-The Android SDK and NDK, Rust with the Android targets, and Gradle all live in a Docker image, so the build needs nothing but Docker:
+The Android SDK and NDK, Rust with the Android targets, and Gradle all live in a Docker image, and the userland is built in Termux's own build container, so the build needs nothing but Docker:
 
 ```sh
 ./android/build.sh all
 adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-The first run builds the image, which is about 4 GB and takes several minutes. The APK is debug-signed and about 12 MB. It carries amux for arm64-v8a and x86_64 as `lib/<abi>/libamux.so`, because the native library directory is the only place an app on Android 10 and later may run its own files from.
+The first run builds the image, which is about 4 GB and takes several minutes, and then the userland, which takes much longer (see below). The APK is debug-signed and about 78 MB. For arm64-v8a and x86_64 it carries amux as `lib/<abi>/libamux.so`, the userland's 60 programs as `lib/<abi>/libu_*.so`, and the rest of the userland as `assets/userland/<abi>.zip`, about 17 MB each. The programs ship as native libraries because the native library directory is the only place an app on Android 10 and later may run its own files from.
 
-| Command                     | Does                                                                                                      |
-| --------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `./android/build.sh image`  | Builds the `amux-android-build` image when it is missing or `android/docker/Dockerfile` has changed       |
-| `./android/build.sh binary` | Cross-compiles amux with the NDK and writes the stripped binaries to `android/app/src/main/jniLibs/`      |
-| `./android/build.sh smoke`  | Runs the x86_64 binary in a Termux container with the app's environment                                   |
-| `./android/build.sh apk`    | Builds the debug APK from those binaries, runs the JVM unit tests and lint, and prints what the APK holds |
-| `./android/build.sh all`    | `image`, `binary`, `smoke` and `apk`, in that order                                                       |
+| Command                             | Does                                                                                                           |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `./android/build.sh image`          | Builds the `amux-android-build` image when it is missing or `android/docker/Dockerfile` has changed            |
+| `./android/build.sh binary`         | Cross-compiles amux with the NDK and writes the stripped binaries to `android/app/src/main/jniLibs/`           |
+| `./android/build.sh userland`       | Builds the userland for aarch64 and x86_64 in `android/.cache/userland/`, unless it is up to date              |
+| `./android/build.sh userland-check` | Checks the libraries the userland's programs need, and runs the x86_64 userland in a Termux container          |
+| `./android/build.sh package`        | Splits each userland into `libu_*.so` files in `jniLibs/` and a zip in `android/app/src/main/assets/userland/` |
+| `./android/build.sh smoke`          | Runs the x86_64 binary and userland in a Termux container, laid out as the app lays them out                   |
+| `./android/build.sh apk`            | Builds the debug APK from those files, runs the JVM unit tests and lint, and prints what the APK holds         |
+| `./android/build.sh all`            | `image`, `binary`, `userland`, `package`, `smoke` and `apk`, in that order                                     |
 
-`binary` and `apk` build the image first when it is out of date. The cargo and Gradle caches live in `android/.cache`, which git ignores.
+Every step but `userland` and `userland-check` builds the image first when it is out of date. A step that needs the output of an earlier one stops when that output is missing and names the step to run, so `apk` without the zips or the `libu_*.so` files says to run `package` first. The cargo and Gradle caches, the termux-packages checkout and the userland live in `android/.cache`, which git ignores.
 
-`smoke` checks that amux runs on Android's libc, bionic, with nothing but what the app gives it. It uses `termux/termux-docker:x86_64` with `/bin` linked to `/system/bin`, as on a phone, and sets only the app's variables (see [The phone's environment](#the-phones-environment)). There it runs `amux --version` and `amux config check`, starts `amux server`, waits up to 10 seconds for `amux ls` to answer, and runs `amux kill-server`. It fails unless every step succeeds and the server exits with status 0, and it prints the server's log at the end. It doesn't run the APK, which needs a phone or an emulator.
+`userland` builds the packages in `android/userland/packages.txt`, and everything they depend on, with [termux-packages](https://github.com/termux/termux-packages). `android/userland/termux-packages.txt` pins its commit and its `ghcr.io/termux/package-builder` image. The step clones that commit into `android/.cache/termux-packages`, applies the patches in `android/userland/overlay/`, and builds every package from source for aarch64 and x86_64, with the app's package name, `io.github.blendonl.amux`, in place of Termux's. Termux's own packages can't be used, since every path in them points into Termux's data directory. The build runs in a container named `amux-userland-builder`, which stays for the next run. The step then extracts the packages into `android/.cache/userland/<arch>/prefix/`, without headers, static libraries and other build files, and collects their sources (see [Licenses and sources](#licenses-and-sources)).
+
+The first `userland` run takes about 45 minutes on a 12-thread machine, on top of pulling the builder image, and the builder's image and container take about 18 GB of disk. Later runs skip the step while `packages.txt`, `termux-packages.txt`, the overlay and the part of `build.sh` that assembles the prefix stay the same. A change to the package list, the commit or the overlay builds every package again.
+
+`userland-check` checks that no ELF file in the userland needs Berkeley DB or Kerberos, and that every library one needs is in the userland or in Android. Then it copies the x86_64 userland to `/data/data/io.github.blendonl.amux/files/usr` in `termux/termux-docker:x86_64` and, as the `system` user, runs zsh, bash, git with a commit, `ssh -V`, `ssh-keygen`, curl, nano, less, grep, sed and two shebang scripts.
+
+`package` runs `android/userland/package.py` on each userland. Every ELF program becomes `jniLibs/<abi>/libu_<path>.so`, and hardlinks and identical copies ship once. Everything else goes into `assets/userland/<abi>.zip`: the shared libraries, scripts, data and licenses, a `SYMLINKS.txt` that links each program's path to its `libu_*.so` through `$filesDir/applib`, and a `USERLAND_VERSION` hash of the contents. The same userland always gives byte-identical files.
+
+`smoke` checks that amux and the userland run on Android's libc, bionic, with nothing but what the app gives them. It uses `termux/termux-docker:x86_64` with `/bin` linked to `/system/bin`, as on a phone, installs the x86_64 zip there as the app does, with `applib` pointing at the `libu_*.so` files, and sets only the app's variables (see [The phone's environment](#the-phones-environment)).
+
+- First it runs amux without the userland, as the fallback does: `amux --version` and `amux config check`, then `amux server`, waiting up to 10 seconds for `amux ls` to answer, and `amux kill-server`.
+- Then, with the userland, it runs zsh and two shebang scripts through termux-exec, one of them `#!/usr/bin/env sh`, then `git init` and a commit, `ssh -V` and `curl -V`. It starts `amux server` again and opens a pane with `amux new` to check that the pane runs zsh.
+
+It fails unless every step succeeds and the server exits with status 0 both times, and it prints the server's log. Docker has no SELinux, so the smoke test can't show that Android lets a pane run the userland's programs through `applib`. It doesn't run the APK either, which needs a phone or an emulator.
 
 #### Using the app
 
+- On its first start, and after an update that brings a different userland, the service installs zsh, git and ssh before it starts the server, and the app shows "Installing zsh, git and ssh…" with a percentage. The service unpacks the zip for the phone's ABI into `$filesDir/usr-staging`, applies its `SYMLINKS.txt` and swaps the result in for `$filesDir/usr`. An install that is cut short is cleaned up and runs again on the next start.
+- If the install fails, the app shows the error with two buttons. Continue attaches anyway, and panes run Android's `/system/bin/sh` until the next time amux starts, which tries the install again. Stop amux stops the server and closes the app.
 - `Ctrl-b d`, or the end of the session, shows a Detached panel. Reattach attaches again, and starts the server first when it has stopped. Stop amux stops the server, which ends every session on the phone, and closes the app.
 - The service's notification has two actions. Keep awake holds a partial wake lock, which keeps the CPU running while the screen is off, and then reads Allow sleep. Stop runs `amux kill-server` and stops the service. On Android 13 and later the app asks for permission to show notifications when it opens.
 - `amux kill-server` in a pane stops the service too, because the server exits cleanly.
 - A server that fails to start or exits with an error starts again after 1 second, then 2, 4 and 8 seconds. When five starts in a row each fail within 30 seconds, the service gives up and its notification says why.
-- The server's log is `$cacheDir/amux-<uid>/default.log`. Once it passes 1 MiB, the service empties it before the next start.
+- The server's log is `$PREFIX/tmp/amux-<uid>/default.log`, or `$cacheDir/amux-<uid>/default.log` when panes fall back to `/system/bin/sh`. Once it passes 1 MiB, the service empties it before the next start.
 - The screen stays on while the terminal shows.
 - Android backups and device transfers leave out the app's data, so the server's key and trust store stay on the phone.
 
@@ -512,30 +530,61 @@ A row of keys sits above the soft keyboard:
 - Long-press to select text on the screen, then pick Copy or Paste from the menu that opens.
 - A tap on the terminal brings the keyboard back. In a window with several panes amux turns on mouse reporting (see [Windows and panes](#windows-and-panes)), so the tap also reaches amux as a click and makes the pane under it active.
 
+#### zsh, git and ssh
+
+The APK carries its own userland, built from Termux's package recipes. Panes run zsh, and these are on their `PATH`:
+
+- zsh, bash, and dash as `sh`
+- git, without gitk, git gui and git svn
+- openssh's client tools: `ssh`, `scp`, `sftp`, `ssh-keygen`, `ssh-agent`, `ssh-add`, `ssh-keyscan` and `ssh-copy-id`, but no `sshd`
+- curl, with the CA certificates it needs for HTTPS
+- coreutils, grep, sed, findutils, diffutils, tar and gzip
+- less, nano, and ncurses-utils, such as `clear`, `reset` and `tput`
+
+`android/userland/packages.txt` lists these packages, plus termux-exec for scripts, and the libraries they need come with them.
+
+- `$PREFIX` is `$filesDir/usr`, the userland's root, with the programs in `$PREFIX/bin` and their libraries in `$PREFIX/lib`, as in Termux.
+- On its first start the app writes a `~/.zshrc`: `compinit` for completion, a `%n@<server name> %~ %# ` prompt, 10000 lines of history in `~/.zsh_history`, and Emacs keys with `bindkey -e`. It writes the file only when it is missing, so your changes stay.
+- Scripts work through termux-exec, which every pane preloads. It runs a script as `<interpreter> <script>`, so the script is only read, and turns `/bin/…` and `/usr/bin/…` in a shebang into `$PREFIX/bin/…`, so `#!/bin/sh` and `#!/usr/bin/env bash` work.
+- There is no `pkg`, `apt` or `dpkg`. Termux's packages wouldn't work anyway, since their paths point into Termux's data directory. To add a program, add its Termux package to `packages.txt` and build the APK again.
+- Android doesn't let an app that targets API 29 or later run files from its own storage, and amux targets API 35. The userland's programs run because `$PREFIX/bin` links them through `$filesDir/applib` to the APK's `libu_*.so` native libraries, and the service points `applib` at the app's native library directory every time it starts. A program you download or copy onto the phone can't run that way. Run such an ELF file through Android's dynamic linker instead: `/system/bin/linker64 ./program`.
+
+With git and ssh, the phone does what the other machines in the cluster do:
+
+- `amux new` in a repo, and `-p`, `-b` and `--clone`, give project sessions and worktrees on the phone (see [Projects and worktrees](#projects-and-worktrees)).
+- The phone's server links over `ssh://` addresses, such as `amux servers add laptop ssh://laptop` (see [Over SSH, configured by hand](#over-ssh-configured-by-hand)). The link runs ssh with `BatchMode=yes`, so the phone needs a key the other machine accepts: make one with `ssh-keygen`, which puts it in `~/.ssh`, and add it there with `ssh-copy-id laptop`.
+
 #### The phone's environment
 
 Everything amux keeps lives in the app's private storage. Below, `$filesDir` is the app's files directory, `/data/user/0/io.github.blendonl.amux/files` for the phone's main user, and `$cacheDir` is its cache directory. The app starts the server and the client with this environment, and every pane inherits it:
 
-| Variable          | Value                                                                          |
-| ----------------- | ------------------------------------------------------------------------------ |
-| `HOME`            | `$filesDir/home`                                                               |
-| `XDG_CONFIG_HOME` | `$filesDir/config`                                                             |
-| `XDG_STATE_HOME`  | `$filesDir/state`                                                              |
-| `TMPDIR`          | `$cacheDir`, so the socket and the server's log are in `$cacheDir/amux-<uid>/` |
-| `SHELL`           | `/system/bin/sh`                                                               |
-| `PATH`            | `$filesDir/bin:/system/bin`                                                    |
-| `LANG`            | `C.UTF-8`                                                                      |
+| Variable                                | Value                                                                                |
+| --------------------------------------- | ------------------------------------------------------------------------------------ |
+| `HOME`                                  | `$filesDir/home`                                                                     |
+| `XDG_CONFIG_HOME`                       | `$filesDir/config`                                                                   |
+| `XDG_STATE_HOME`                        | `$filesDir/state`                                                                    |
+| `PREFIX`, `TERMUX__PREFIX`              | `$filesDir/usr`                                                                      |
+| `TMPDIR`                                | `$PREFIX/tmp`, so the socket and the server's log are in `$PREFIX/tmp/amux-<uid>/`   |
+| `SHELL`                                 | `$PREFIX/bin/zsh`                                                                    |
+| `PATH`                                  | `$PREFIX/bin:/system/bin`                                                            |
+| `LANG`                                  | `en_US.UTF-8`                                                                        |
+| `LD_PRELOAD`                            | `$PREFIX/lib/libtermux-exec-direct-ld-preload.so`, which is termux-exec              |
+| `TERMUX_EXEC__SYSTEM_LINKER_EXEC__MODE` | `disable`, so termux-exec runs programs directly, not through `/system/bin/linker64` |
+| `TERMUX_APP__DATA_DIR`                  | The app's data directory, `/data/user/0/io.github.blendonl.amux` for the main user   |
+| `TERMUX_APP__LEGACY_DATA_DIR`           | `/data/data/io.github.blendonl.amux`                                                 |
+| `ANDROID__BUILD_VERSION_SDK`            | The phone's API level, such as `35`                                                  |
 
-`ANDROID_ROOT` and `ANDROID_DATA` are passed through from Android, and the client also gets `TERM=xterm-256color` and `COLORTERM=truecolor`.
+`ANDROID_ART_ROOT`, `ANDROID_ASSETS`, `ANDROID_DATA`, `ANDROID_I18N_ROOT`, `ANDROID_ROOT`, `ANDROID_RUNTIME_ROOT`, `ANDROID_STORAGE`, `ANDROID_TZDATA_ROOT`, `ASEC_MOUNTPOINT`, `BOOTCLASSPATH`, `DEX2OATBOOTCLASSPATH`, `EXTERNAL_STORAGE`, `LOOP_MOUNTPOINT` and `SYSTEMSERVERCLASSPATH` are passed through from Android when it sets them, and the client also gets `TERM=xterm-256color` and `COLORTERM=truecolor`. The userland's programs find their libraries in `$PREFIX/lib` through their RUNPATH, so there is no `LD_LIBRARY_PATH`.
 
-- Panes run Android's own shell, `/system/bin/sh` (mksh), with the tools in `/system/bin`.
-- `$filesDir/bin/amux` links to the packaged binary. The service renews the link every time it starts, since an update moves the binary. So `amux` works in any pane: `amux ls`, `amux pair`, `amux new` and the rest.
+When the userland isn't installed, because the install failed, panes fall back to Android's own shell, `/system/bin/sh` (mksh), with the tools in `/system/bin`. `TMPDIR` is then `$cacheDir`, so the socket and the log are in `$cacheDir/amux-<uid>/`, `SHELL` is `/system/bin/sh`, `PATH` is `$filesDir/bin:/system/bin` and `LANG` is `C.UTF-8`, and the `PREFIX`, `TERMUX_*`, `LD_PRELOAD` and `ANDROID__BUILD_VERSION_SDK` variables are left out.
+
+- `$PREFIX/bin/amux` links to the packaged binary through `applib`, and in the fallback `$filesDir/bin/amux` does. The service renews the link every time it starts, since an update moves the binary. So `amux` works in any pane: `amux ls`, `amux pair`, `amux new` and the rest.
 - The config is `$filesDir/config/amux/init.lua`, the path `amux config path` prints. On its first start the app writes it with one line that names the server after the phone, such as `amux.opt.name = "pixel-8-pro"`. The name is the device name from Settings, or the model when that is empty, or `android`, lowercased, with accents dropped and anything other than `a-z` and `0-9` turned into `-`. The app writes the file only when it is missing, so your changes stay.
 
-Stock Android has no text editor in `/system/bin`, so change the config from a pane with the shell. `>>` adds a line and `>` replaces the file:
+Change the config in a pane with nano:
 
 ```sh
-echo 'amux.opt.window.base_index = 1' >> "$(amux config path)"
+nano "$(amux config path)"
 amux config check
 ```
 
@@ -550,7 +599,7 @@ adb shell "run-as io.github.blendonl.amux sh -c 'cat > files/config/amux/init.lu
 
 #### Joining the cluster from the phone
 
-Pair the phone with any machine in the cluster, as on a LAN (see [On the LAN, with a pairing code](#on-the-lan-with-a-pairing-code)). Run `amux pair` on the desktop, then the command it prints in a pane on the phone:
+On a LAN, pair the phone with any machine in the cluster (see [On the LAN, with a pairing code](#on-the-lan-with-a-pairing-code)). Run `amux pair` on the desktop, then the command it prints in a pane on the phone:
 
 ```sh
 amux pair k7-4821-9930
@@ -559,12 +608,30 @@ amux pair k7-4821-9930 --host 192.168.0.24:40123
 
 The app holds a Wi-Fi multicast lock while its service runs, because Android drops multicast on Wi-Fi without one, and the phone needs multicast to find the desktop over mDNS. Where multicast doesn't get through anyway, add `--host <addr>:<port>` with the desktop's IP address and the port `amux pair` printed, as in the second line. The phone then saves the desktop as a server at that `tcp://` address.
 
+On a tailnet, link the phone by hand. Tailnet discovery never dials phones (see [On the same tailnet](#on-the-same-tailnet)), and the phone's server has no `tailscale` CLI, so it can't vouch for the desktop through `tailscale whois` and doesn't listen on the tailnet. A `tcp://` link to a key that nothing vouches for is refused, so pair once, with `--host`, the desktop's tailnet IP address and the port `amux pair` printed, then point the phone at the desktop's tailnet listener:
+
+```sh
+amux pair k7-4821-9930 --host 100.101.7.12:40123
+amux servers remove desktop
+amux servers add desktop tcp://100.101.7.12:7447
+```
+
+The pairing saves the desktop under its name, `desktop` here, at the port of its LAN listener, which changes each time that listener opens unless `amux.opt.lan.port` is set there, so that address can go stale. The tailnet listener stays at port 7447, so the phone can dial it whenever the link drops. `servers add` refuses a name that is already configured, which is why the entry the pairing saved goes first.
+
 Once paired, the phone is a member like any other. `amux ls` lists the sessions of every machine, `amux attach -t work@desktop` attaches to one, `amux new --on desktop` starts one there, and `Ctrl-b s` switches between them. The rest of the cluster learns the phone's key (see [Trust](#trust)), and now that the phone trusts a key, its server listens on the LAN like any other (see [Listening ports](#listening-ports)).
+
+#### Licenses and sources
+
+The userland is other projects' software under their own licenses, GPL, LGPL, MIT, BSD and Apache among them. amux stays MIT: the APK carries the userland next to amux, and amux only runs its programs and never links them. Each package's license is in `$PREFIX/share/doc/<package>/` on the phone.
+
+`./android/build.sh userland` collects the corresponding source in `android/.cache/userland/sources/`: the upstream source archives of the packages, `termux-packages.txt` with the termux-packages commit the recipes come from, `packages.txt`, the overlay patches and `build.sh`. Publish that directory next to any APK you distribute.
+
+git, which is GPL-2.0-only, links OpenSSL 3. openssh is built without Kerberos, and `userland-check` fails when anything in the userland needs Kerberos or Berkeley DB.
 
 #### Limits
 
-- Stock Android has no `git` and no `ssh`, so panes don't either. The phone's server can't dial `ssh://` addresses, and it can't hold project sessions or worktrees: sessions on the phone start without a project, in `$HOME`. `amux new -p amux --on desktop` still works from the phone, since git runs on the desktop.
-- Tailnet auto-linking never dials phones (see [On the same tailnet](#on-the-same-tailnet)). The phone's server has no `tailscale` CLI either, so it never vouches for a peer through `tailscale whois` and doesn't listen on the tailnet. Pair the phone instead. After pairing, a `tcp://` address on the tailnet links too, such as `amux servers add desktop tcp://100.101.7.12:7447`.
+- The userland only works for the phone's primary user. Its programs look for their libraries, and its scripts for their interpreters, under `/data/data/io.github.blendonl.amux/`, which is the primary user's data directory, so zsh, git and ssh don't work in a work profile or for a secondary user.
+- `amux update` can't replace amux on the phone: when a newer release is out, it stops with `there are no amux releases for android; build amux from source`. amux comes with the APK, so update the app instead: build a new APK and install it with `adb install -r`, which keeps the app's data.
 - Android 12 and later limit the processes that apps start, which Android calls phantom processes, and kill them when there are more than 32 across the phone or when one uses a lot of CPU in the background. The server, the client and every pane's shell are such processes, so a pane's shell can stop without warning, and a server that is killed starts again without its sessions. To lift the limit, turn on "Disable child process restrictions" in the developer options on Android 14 and later, or run `adb shell settings put global settings_enable_monitor_phantom_procs false` from a computer on Android 12L and later. Android 12.0 takes `adb shell device_config set_sync_disabled_for_tests persistent` followed by `adb shell device_config put activity_manager max_phantom_processes 2147483647`.
 - Termux's `libtermux.so` v0.118.3, which the terminal view loads, isn't aligned for 16 KB memory pages, so the terminal may fail to load on phones that use them. The amux binary itself is aligned for 16 KB pages.
 
@@ -607,68 +674,71 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 - A client's terminal size is clamped to at least 2 rows by 2 columns, on the client and on the server, because the terminal emulator can't handle anything smaller.
 - **Git** runs through the `git` CLI in blocking tasks, never while the server holds its sessions lock. Registry changes are serialized and saved before they are published as a `ProjectsChanged` event, and creates for the same project and branch wait on a per-worktree lock, so concurrent `amux new`s share one session.
 
-| Path                         | Responsibility                                                                                                     |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `src/main.rs`                | Parses the command line and dispatches                                                                             |
-| `src/lib.rs`                 | The library the binary and the tests share                                                                         |
-| `src/cli.rs`                 | Command-line interface                                                                                             |
-| `src/paths.rs`               | Runtime, config and state paths, and the `init.lua` lookup order                                                   |
-| `src/config/`                | `amux config check`, `defaults` and `path`, and the checked, atomic rewrites of `servers.lua`                      |
-| `src/identity.rs`            | Server ID, incarnation and hostname                                                                                |
-| `src/settings/`              | Every setting with its built-in default, as one `Settings` tree                                                    |
-| `src/lua/`                   | The Lua runtime: the strict `amux.opt`, the `amux` API, data files like `servers.lua` and the Lua writer           |
-| `src/target.rs`              | `session@server` targets: parsing, validation and resolution                                                       |
-| `src/project/id.rs`          | Project ids from origin URLs, local paths and root commits                                                         |
-| `src/project/detect.rs`      | Finding the project, branch and main checkout of a directory                                                       |
-| `src/project/registry.rs`    | The `projects.toml` registry of local checkouts                                                                    |
-| `src/project/worktree.rs`    | Default branch, worktrees, fetch, clone and removal                                                                |
-| `src/project/git.rs`         | Running `git` without prompts, with an optional timeout                                                            |
-| `src/protocol/mod.rs`        | Framing and the `Duplex` message channels                                                                          |
-| `src/protocol/greeting.rs`   | Greeting, version constants and the version check                                                                  |
-| `src/protocol/client.rs`     | Client and server messages                                                                                         |
-| `src/protocol/peer.rs`       | Peer messages, snapshots and state events                                                                          |
-| `src/protocol/key.rs`        | Public keys, their hex form and fingerprints                                                                       |
-| `src/cluster/mod.rs`         | Membership, dial loops, peer cache                                                                                 |
-| `src/cluster/link.rs`        | Peer handshake, link lanes, pings                                                                                  |
-| `src/cluster/channel.rs`     | Channels over a link: ids, credit, capped inbound queues                                                           |
-| `src/cluster/transport.rs`   | Addresses, how to dial each one, and how a link was authenticated                                                  |
-| `src/cluster/ssh.rs`         | The SSH and exec transport, the remote amux lookup, `amux bridge`                                                  |
-| `src/cluster/noise.rs`       | Noise keys, the TCP opening, the Noise handshake and the pump                                                      |
-| `src/cluster/listener.rs`    | The tailnet and LAN listeners and the limits before authentication                                                 |
-| `src/cluster/trust.rs`       | The `trust.toml` store and the rules for trust updates and tombstones                                              |
-| `src/cluster/cache.rs`       | The cluster cache and reading older versions of it                                                                 |
-| `src/discovery/mod.rs`       | Discovery sources, their state and the `amux discover` report                                                      |
-| `src/discovery/tailscale.rs` | Reading `tailscale status`, the tailnet listener and `tailscale whois`                                             |
-| `src/discovery/lan.rs`       | LAN candidates, the advertisement and `lan://` endpoints                                                           |
-| `src/discovery/mdns.rs`      | Advertising and browsing over mDNS                                                                                 |
-| `src/discovery/directory.rs` | A directory that stands in for mDNS in the tests                                                                   |
-| `src/pairing.rs`             | Pairing codes and windows, and SPAKE2 inside Noise                                                                 |
-| `src/server/mod.rs`          | Accept loop, session registry, state events, shutdown                                                              |
-| `src/server/connection.rs`   | Per-client requests, target routing and the attach loop                                                            |
-| `src/server/status.rs`       | The cluster status sent to attached clients                                                                        |
-| `src/server/forward.rs`      | Forwarding a client to a session on another server, reconnects                                                     |
-| `src/server/projects.rs`     | Project registry, checkouts, clones, worktree sessions and removal                                                 |
-| `src/server/session.rs`      | Session state, its windows and the commands that change them                                                       |
-| `src/server/window.rs`       | A window's layout, panes, active pane and mouse routing                                                            |
-| `src/server/layout.rs`       | The pane layout tree: splits, rectangles, borders and neighbours                                                   |
-| `src/server/render/`         | The compositor, the per-client differ and escape sequences                                                         |
-| `src/server/mouse.rs`        | Decoding and re-encoding mouse reports                                                                             |
-| `src/server/pane.rs`         | PTY, shell process, terminal emulation                                                                             |
-| `src/client/mod.rs`          | Commands, server bootstrap, attaching                                                                              |
-| `src/client/relay.rs`        | The attached client: keys, panels, chrome and switching sessions                                                   |
-| `src/client/chrome/`         | Status bar, prompt, reconnect overlay, key decoding and drawing helpers                                            |
-| `src/client/tree.rs`         | The `Ctrl-b s` cluster tree                                                                                        |
-| `src/client/listing.rs`      | `amux ls`, `amux projects`, `amux servers`, `amux discover` and `amux pair` output                                 |
-| `src/client/projects.rs`     | Resolving `-p` against the projects the cluster knows                                                              |
-| `src/client/terminal.rs`     | Raw mode, alternate screen, stdin reader                                                                           |
-| `src/client/keys.rs`         | Prefix key handling and the key bindings                                                                           |
-| `src/update.rs`              | `amux update`: finding, checking and installing a release                                                          |
-| `tests/common/mod.rs`        | `TestServer`, `TestClient`, a PTY-driven client, linked test clusters and fakes for `ssh`, `tailscale` and the LAN |
-| `tests/common/git.rs`        | Temporary repos with a local bare `origin` for the project tests                                                   |
-| `tests/common/releases.rs`   | A `file://` release mirror for the `amux update` and `install.sh` tests                                            |
-| `android/`                   | The Android app, a Gradle project: the service that runs `amux server` and the terminal that attaches to it        |
-| `android/build.sh`           | Builds the image, cross-compiles amux with the NDK, smoke-tests it in a Termux container and builds the APK        |
-| `android/docker/`            | The build image: JDK 17, the Android SDK and NDK, Rust with the Android targets, and `cargo-ndk`                   |
+| Path                          | Responsibility                                                                                                     |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `src/main.rs`                 | Parses the command line and dispatches                                                                             |
+| `src/lib.rs`                  | The library the binary and the tests share                                                                         |
+| `src/cli.rs`                  | Command-line interface                                                                                             |
+| `src/paths.rs`                | Runtime, config and state paths, and the `init.lua` lookup order                                                   |
+| `src/config/`                 | `amux config check`, `defaults` and `path`, and the checked, atomic rewrites of `servers.lua`                      |
+| `src/identity.rs`             | Server ID, incarnation and hostname                                                                                |
+| `src/settings/`               | Every setting with its built-in default, as one `Settings` tree                                                    |
+| `src/lua/`                    | The Lua runtime: the strict `amux.opt`, the `amux` API, data files like `servers.lua` and the Lua writer           |
+| `src/target.rs`               | `session@server` targets: parsing, validation and resolution                                                       |
+| `src/project/id.rs`           | Project ids from origin URLs, local paths and root commits                                                         |
+| `src/project/detect.rs`       | Finding the project, branch and main checkout of a directory                                                       |
+| `src/project/registry.rs`     | The `projects.toml` registry of local checkouts                                                                    |
+| `src/project/worktree.rs`     | Default branch, worktrees, fetch, clone and removal                                                                |
+| `src/project/git.rs`          | Running `git` without prompts, with an optional timeout                                                            |
+| `src/protocol/mod.rs`         | Framing and the `Duplex` message channels                                                                          |
+| `src/protocol/greeting.rs`    | Greeting, version constants and the version check                                                                  |
+| `src/protocol/client.rs`      | Client and server messages                                                                                         |
+| `src/protocol/peer.rs`        | Peer messages, snapshots and state events                                                                          |
+| `src/protocol/key.rs`         | Public keys, their hex form and fingerprints                                                                       |
+| `src/cluster/mod.rs`          | Membership, dial loops, peer cache                                                                                 |
+| `src/cluster/link.rs`         | Peer handshake, link lanes, pings                                                                                  |
+| `src/cluster/channel.rs`      | Channels over a link: ids, credit, capped inbound queues                                                           |
+| `src/cluster/transport.rs`    | Addresses, how to dial each one, and how a link was authenticated                                                  |
+| `src/cluster/ssh.rs`          | The SSH and exec transport, the remote amux lookup, `amux bridge`                                                  |
+| `src/cluster/noise.rs`        | Noise keys, the TCP opening, the Noise handshake and the pump                                                      |
+| `src/cluster/listener.rs`     | The tailnet and LAN listeners and the limits before authentication                                                 |
+| `src/cluster/trust.rs`        | The `trust.toml` store and the rules for trust updates and tombstones                                              |
+| `src/cluster/cache.rs`        | The cluster cache and reading older versions of it                                                                 |
+| `src/discovery/mod.rs`        | Discovery sources, their state and the `amux discover` report                                                      |
+| `src/discovery/tailscale.rs`  | Reading `tailscale status`, the tailnet listener and `tailscale whois`                                             |
+| `src/discovery/lan.rs`        | LAN candidates, the advertisement and `lan://` endpoints                                                           |
+| `src/discovery/mdns.rs`       | Advertising and browsing over mDNS                                                                                 |
+| `src/discovery/directory.rs`  | A directory that stands in for mDNS in the tests                                                                   |
+| `src/pairing.rs`              | Pairing codes and windows, and SPAKE2 inside Noise                                                                 |
+| `src/server/mod.rs`           | Accept loop, session registry, state events, shutdown                                                              |
+| `src/server/connection.rs`    | Per-client requests, target routing and the attach loop                                                            |
+| `src/server/status.rs`        | The cluster status sent to attached clients                                                                        |
+| `src/server/forward.rs`       | Forwarding a client to a session on another server, reconnects                                                     |
+| `src/server/projects.rs`      | Project registry, checkouts, clones, worktree sessions and removal                                                 |
+| `src/server/session.rs`       | Session state, its windows and the commands that change them                                                       |
+| `src/server/window.rs`        | A window's layout, panes, active pane and mouse routing                                                            |
+| `src/server/layout.rs`        | The pane layout tree: splits, rectangles, borders and neighbours                                                   |
+| `src/server/render/`          | The compositor, the per-client differ and escape sequences                                                         |
+| `src/server/mouse.rs`         | Decoding and re-encoding mouse reports                                                                             |
+| `src/server/pane.rs`          | PTY, shell process, terminal emulation                                                                             |
+| `src/client/mod.rs`           | Commands, server bootstrap, attaching                                                                              |
+| `src/client/relay.rs`         | The attached client: keys, panels, chrome and switching sessions                                                   |
+| `src/client/chrome/`          | Status bar, prompt, reconnect overlay, key decoding and drawing helpers                                            |
+| `src/client/tree.rs`          | The `Ctrl-b s` cluster tree                                                                                        |
+| `src/client/listing.rs`       | `amux ls`, `amux projects`, `amux servers`, `amux discover` and `amux pair` output                                 |
+| `src/client/projects.rs`      | Resolving `-p` against the projects the cluster knows                                                              |
+| `src/client/terminal.rs`      | Raw mode, alternate screen, stdin reader                                                                           |
+| `src/client/keys.rs`          | Prefix key handling and the key bindings                                                                           |
+| `src/update.rs`               | `amux update`: finding, checking and installing a release                                                          |
+| `tests/common/mod.rs`         | `TestServer`, `TestClient`, a PTY-driven client, linked test clusters and fakes for `ssh`, `tailscale` and the LAN |
+| `tests/common/git.rs`         | Temporary repos with a local bare `origin` for the project tests                                                   |
+| `tests/common/releases.rs`    | A `file://` release mirror for the `amux update` and `install.sh` tests                                            |
+| `android/`                    | The Android app, a Gradle project: the userland installer, the service that runs `amux server`, and the terminal   |
+| `android/build.sh`            | Builds the image, amux and the userland, packages the userland, smoke-tests both in Termux and builds the APK      |
+| `android/docker/`             | The build image: JDK 17, the Android SDK and NDK, Rust with the Android targets, and `cargo-ndk`                   |
+| `android/userland/`           | The userland's `packages.txt`, and the termux-packages commit and builder image `termux-packages.txt` pins         |
+| `android/userland/overlay/`   | Patches to termux-packages, such as the app's package name and openssh without Kerberos or sshd                    |
+| `android/userland/package.py` | Splits a userland into `libu_*.so` programs and a zip with the rest, `SYMLINKS.txt` and `USERLAND_VERSION`         |
 
 Set `AMUX_LOG=debug` before the server starts to get more verbose logs.
 
@@ -721,5 +791,5 @@ Beyond the design:
 - [x] Reloading the config without a restart: `Ctrl-b r`, `amux config reload` and `SIGHUP`
 - [x] A which-key popup that lists the keys after the prefix, with descriptions from the config
 - [x] Releases for Linux and macOS, an install script and `amux update`
-- [x] An Android app that runs amux on a phone and joins the cluster
+- [x] An Android app that runs amux on a phone and joins the cluster, with zsh, git and ssh in its panes
 - [ ] Scrollback and copy mode
