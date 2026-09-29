@@ -13,6 +13,8 @@ readonly jni_libs=android/app/src/main/jniLibs
 readonly assets=android/app/src/main/assets
 readonly smoke_lib=/smoke/lib
 readonly apk=app/build/outputs/apk/debug/app-debug.apk
+readonly release_apk=app/build/outputs/apk/release/app-release.apk
+readonly release_key_env=(AMUX_RELEASE_KEYSTORE AMUX_RELEASE_KEYSTORE_PASSWORD AMUX_RELEASE_KEY_ALIAS)
 readonly min_sdk=29
 readonly abis=(arm64-v8a x86_64)
 
@@ -27,7 +29,7 @@ readonly forbidden_libs='^lib(db|krb5|k5crypto|krb5support|gssapi|gssapi_krb5|co
 readonly android_libs=(libc.so libdl.so libm.so liblog.so libandroid.so)
 
 usage() {
-    echo "usage: $0 image|binary|userland|package|smoke|apk|all|userland-check" >&2
+    echo "usage: $0 image|binary|userland|package|smoke|apk|release-apk|all|userland-check|userland-inputs" >&2
     exit 2
 }
 
@@ -53,6 +55,7 @@ build_image() {
 
 run_in_image() {
     local task=$1
+    shift
     mkdir -p "$cache_dir/cargo" "$cache_dir/target" "$cache_dir/home" "$cache_dir/gradle" "$cache_dir/android"
     docker run --rm --init \
         --user "$(id -u):$(id -g)" \
@@ -64,10 +67,11 @@ run_in_image() {
         --env CARGO_TARGET_DIR=/cache/target \
         --env GRADLE_USER_HOME=/cache/gradle \
         --env ANDROID_USER_HOME=/cache/android \
+        "$@" \
         "$image" \
         bash -c "set -euo pipefail
-            $(declare -p jni_libs assets smoke_lib apk min_sdk abis userland_arches)
-            $(declare -f rust_target userland_abi "$task")
+            $(declare -p jni_libs assets smoke_lib apk release_apk min_sdk abis userland_arches)
+            $(declare -f rust_target userland_abi describe_apk "$task")
             $task"
 }
 
@@ -142,21 +146,48 @@ require_userland() {
     done
 }
 
+describe_apk() {
+    local file=$1 abi
+    printf '\n$ ls -lh %s\n' "$file"
+    ls -lh "$file"
+    printf '\n$ unzip -l %s lib/*/libamux.so assets/userland/*\n' "$file"
+    unzip -l "$file" 'lib/*/libamux.so' 'assets/userland/*'
+    for abi in "${abis[@]}"; do
+        printf '\n$ unzip -Z1 %s lib/%s/libu_*.so | wc -l\n' "$file" "$abi"
+        unzip -Z1 "$file" "lib/$abi/libu_*.so" | wc -l
+    done
+    printf '\n$ aapt2 dump badging %s\n' "$file"
+    aapt2 dump badging "$file" | grep -E "^(package|minSdkVersion|targetSdkVersion|uses-permission|application-label|native-code)"
+}
+
 build_apk() {
     cd android
     ./gradlew --no-daemon assembleDebug testDebugUnitTest lintDebug
+    describe_apk "$apk"
+}
 
-    local abi
-    printf '\n$ ls -lh %s\n' "$apk"
-    ls -lh "$apk"
-    printf '\n$ unzip -l %s lib/*/libamux.so assets/userland/*\n' "$apk"
-    unzip -l "$apk" 'lib/*/libamux.so' 'assets/userland/*'
-    for abi in "${abis[@]}"; do
-        printf '\n$ unzip -Z1 %s lib/%s/libu_*.so | wc -l\n' "$apk" "$abi"
-        unzip -Z1 "$apk" "lib/$abi/libu_*.so" | wc -l
+build_release_apk() {
+    cd android
+    ./gradlew --no-daemon assembleRelease testReleaseUnitTest lintRelease
+    describe_apk "$release_apk"
+    printf '\n$ apksigner verify --print-certs %s\n' "$release_apk"
+    apksigner verify --print-certs "$release_apk"
+}
+
+require_release_key() {
+    local name
+    for name in "${release_key_env[@]}"; do
+        [[ -n "${!name:-}" ]] || die "$name is not set, see Releasing in README.md"
     done
-    printf '\n$ aapt2 dump badging %s\n' "$apk"
-    aapt2 dump badging "$apk" | grep -E "^(package|minSdkVersion|targetSdkVersion|uses-permission|application-label|native-code)"
+    [[ -f "$AMUX_RELEASE_KEYSTORE" ]] || die "AMUX_RELEASE_KEYSTORE names $AMUX_RELEASE_KEYSTORE, which is not a file"
+}
+
+release_apk_in_image() {
+    run_in_image build_release_apk \
+        --volume "$(realpath "$AMUX_RELEASE_KEYSTORE"):/release.keystore:ro" \
+        --env AMUX_RELEASE_KEYSTORE=/release.keystore \
+        --env AMUX_RELEASE_KEYSTORE_PASSWORD \
+        --env AMUX_RELEASE_KEY_ALIAS
 }
 
 prepare_smoke_files() {
@@ -744,6 +775,13 @@ main() {
             require_userland
             run_in_image build_apk
             ;;
+        release-apk)
+            require_release_key
+            build_image
+            require_binaries
+            require_userland
+            release_apk_in_image
+            ;;
         all)
             build_image
             build_binary
@@ -754,6 +792,9 @@ main() {
             ;;
         userland-check)
             check_userland
+            ;;
+        userland-inputs)
+            userland_inputs
             ;;
         *)
             usage
