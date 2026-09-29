@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 pub mod git;
+pub mod releases;
 
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, Permissions};

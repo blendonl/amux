@@ -7,6 +7,7 @@ use amux::cluster::ssh;
 use amux::config;
 use amux::server;
 use amux::settings::ServerConfig;
+use amux::update;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -50,6 +51,7 @@ async fn main() -> Result<()> {
         Some(Command::Pair(args)) => client::pair(&endpoint, args).await,
         Some(Command::Config(action)) => run_config(action, &endpoint).await,
         Some(Command::KillServer) => client::kill_server(&endpoint).await,
+        Some(Command::Update(args)) => update::run(&endpoint, args).await,
         Some(Command::Server) => server::run(&endpoint.socket, endpoint.config.as_deref()).await,
         Some(Command::Bridge(args)) => ssh::bridge(&endpoint, args.no_start).await,
         Some(Command::Debug(DebugAction::Links)) => client::debug_links(&endpoint).await,

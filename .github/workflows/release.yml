@@ -1,0 +1,120 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+    branches: ["**"]
+    paths: [".github/workflows/release.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            runs_here: true
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            runs_here: true
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            runs_here: false
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            runs_here: true
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag against Cargo.toml
+        if: github.ref_type == 'tag'
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::the tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo "CC_$(echo "$TARGET" | tr - _)=musl-gcc" >>"$GITHUB_ENV"
+
+      - run: cargo build --locked --profile dist --target "$TARGET"
+
+      - name: Run the binary
+        if: matrix.runs_here
+        run: |
+          "target/$TARGET/dist/amux" --version
+          if [ "$RUNNER_OS" = Linux ]; then
+            file "target/$TARGET/dist/amux" | grep -Eq 'statically linked|static-pie linked'
+          fi
+
+      - name: Package
+        run: |
+          package="amux-$TARGET"
+          mkdir -p "dist/$package"
+          cp "target/$TARGET/dist/amux" LICENSE README.md "dist/$package/"
+          tar -czf "dist/$package.tar.gz" -C dist "$package"
+          cd dist
+          shasum -a 256 "$package.tar.gz" >"$package.tar.gz.sha256"
+          cat "$package.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: amux-${{ matrix.target }}
+          path: dist/amux-${{ matrix.target }}.tar.gz*
+          if-no-files-found: error
+
+  publish:
+    needs: [test, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --force --tags
+          cp install.sh dist/
+          scripts/release-notes "$GITHUB_REF_NAME" >notes.md
+          set -- --title "amux ${GITHUB_REF_NAME#v}" --notes-file notes.md --verify-tag
+          case $GITHUB_REF_NAME in
+            *-*) set -- "$@" --prerelease ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" "$@" dist/*

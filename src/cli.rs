@@ -4,9 +4,14 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::paths;
+use crate::protocol;
 
 #[derive(Debug, Parser)]
-#[command(name = "amux", version, about = "A terminal multiplexer")]
+#[command(
+    name = "amux",
+    version = protocol::cli_version(),
+    about = "A terminal multiplexer"
+)]
 pub struct Cli {
     #[arg(
         short = 'L',
@@ -101,6 +106,9 @@ pub enum Command {
 
     #[command(about = "Stop the server and every session it owns")]
     KillServer,
+
+    #[command(about = "Replace this amux with the latest release, or with the release given")]
+    Update(UpdateArgs),
 
     #[command(hide = true)]
     Server,
@@ -308,6 +316,22 @@ pub struct PairArgs {
         help = "Print each step of the pairing as it happens, to see where it stops"
     )]
     pub verbose: bool,
+}
+
+#[derive(Debug, Default, Args)]
+pub struct UpdateArgs {
+    #[arg(
+        value_name = "VERSION",
+        help = "Release to install, such as 0.2.0, defaults to the latest"
+    )]
+    pub release: Option<String>,
+
+    #[arg(
+        long,
+        conflicts_with = "release",
+        help = "Say whether a newer release is out, without installing it"
+    )]
+    pub check: bool,
 }
 
 #[derive(Debug, Args)]

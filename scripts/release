@@ -1,0 +1,35 @@
+#!/bin/sh
+set -eu
+
+fail() {
+  printf 'release: %s\n' "$*" >&2
+  exit 1
+}
+
+[ $# -eq 1 ] || fail "usage: scripts/release <version>, for example scripts/release 0.2.0"
+version=${1#v}
+tag=v$version
+printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' ||
+  fail "$1 is not a version like 0.2.0"
+
+cd "$(git rev-parse --show-toplevel)"
+[ "$(git branch --show-current)" = main ] || fail "release from main"
+[ -z "$(git status --porcelain)" ] || fail "commit your changes first"
+if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+  fail "$tag already exists"
+fi
+
+current=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+if [ "$current" != "$version" ]; then
+  awk -v version="$version" '
+    !done && /^version = "/ { $0 = "version = \"" version "\""; done = 1 }
+    { print }
+  ' Cargo.toml >Cargo.toml.new
+  mv Cargo.toml.new Cargo.toml
+  cargo update --workspace --offline --quiet
+  git commit --quiet -m "chore: release $tag" Cargo.toml Cargo.lock
+fi
+
+scripts/release-notes HEAD
+git tag -a "$tag" -m "amux $version"
+printf '\ntagged %s; push it to build and publish the release:\n  git push origin main %s\n' "$tag" "$tag"
