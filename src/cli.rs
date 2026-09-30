@@ -198,6 +198,11 @@ pub enum ConfigAction {
     #[command(about = "Print the path of your init.lua, whether or not it exists yet")]
     Path,
 
+    #[command(
+        about = "Print the Android app's landscape keyboard as JSON, the way the app reads it"
+    )]
+    Keyboard,
+
     #[command(about = "Make the running server load its config again, without a restart")]
     Reload,
 }

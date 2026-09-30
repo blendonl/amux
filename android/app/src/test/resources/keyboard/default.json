@@ -1,0 +1,278 @@
+{
+  "width": {
+    "left": 25.0,
+    "right": 25.0
+  },
+  "layers": {
+    "base": {
+      "left": [
+        [
+          "Escape",
+          "1",
+          "2",
+          "3",
+          "4",
+          "5"
+        ],
+        [
+          "Tab",
+          "q",
+          "w",
+          "e",
+          "r",
+          "t"
+        ],
+        [
+          "Ctrl",
+          "a",
+          "s",
+          "d",
+          "f",
+          "g"
+        ],
+        [
+          "Shift",
+          "z",
+          "x",
+          "c",
+          "v",
+          "b"
+        ],
+        [
+          "Prefix",
+          "Alt",
+          "layer:nav",
+          "layer:sym",
+          {
+            "key": "Space",
+            "width": 2.0
+          }
+        ]
+      ],
+      "right": [
+        [
+          "6",
+          "7",
+          "8",
+          "9",
+          "0",
+          "Backspace"
+        ],
+        [
+          "y",
+          "u",
+          "i",
+          "o",
+          "p",
+          "'"
+        ],
+        [
+          "h",
+          "j",
+          "k",
+          "l",
+          ";",
+          "Enter"
+        ],
+        [
+          "n",
+          "m",
+          ",",
+          ".",
+          "/",
+          "Shift"
+        ],
+        [
+          {
+            "key": "Space",
+            "width": 2.0
+          },
+          "layer:sym",
+          "layer:nav",
+          "Ctrl",
+          "Alt"
+        ]
+      ]
+    },
+    "nav": {
+      "left": [
+        [
+          "Escape",
+          "F1",
+          "F2",
+          "F3",
+          "F4",
+          "F5"
+        ],
+        [
+          "Tab",
+          "F6",
+          "F7",
+          "F8",
+          "F9",
+          "F10"
+        ],
+        [
+          "Ctrl",
+          "F11",
+          "F12",
+          "Insert",
+          "Delete",
+          "Paste"
+        ],
+        [
+          "Shift",
+          "",
+          "",
+          "",
+          "",
+          "Hide"
+        ],
+        [
+          "Prefix",
+          "Alt",
+          "layer:nav",
+          "layer:sym",
+          {
+            "key": "Space",
+            "width": 2.0
+          }
+        ]
+      ],
+      "right": [
+        [
+          "",
+          "",
+          "",
+          "",
+          "",
+          "Backspace"
+        ],
+        [
+          "Home",
+          "PageDown",
+          "PageUp",
+          "End",
+          "",
+          "'"
+        ],
+        [
+          "Left",
+          "Down",
+          "Up",
+          "Right",
+          "Delete",
+          "Enter"
+        ],
+        [
+          "Paste",
+          "Hide",
+          "",
+          "",
+          "",
+          "Shift"
+        ],
+        [
+          {
+            "key": "Space",
+            "width": 2.0
+          },
+          "layer:sym",
+          "layer:nav",
+          "Ctrl",
+          "Alt"
+        ]
+      ]
+    },
+    "sym": {
+      "left": [
+        [
+          "Escape",
+          "!",
+          "@",
+          "#",
+          "$",
+          "%"
+        ],
+        [
+          "Tab",
+          "`",
+          "~",
+          "\\",
+          "|",
+          "&"
+        ],
+        [
+          "Ctrl",
+          "-",
+          "_",
+          "=",
+          "+",
+          "*"
+        ],
+        [
+          "Shift",
+          "<",
+          ">",
+          "(",
+          ")",
+          "\""
+        ],
+        [
+          "Prefix",
+          "Alt",
+          "layer:nav",
+          "layer:sym",
+          {
+            "key": "Space",
+            "width": 2.0
+          }
+        ]
+      ],
+      "right": [
+        [
+          "^",
+          "&",
+          "*",
+          "(",
+          ")",
+          "Backspace"
+        ],
+        [
+          "[",
+          "]",
+          "{",
+          "}",
+          "|",
+          "'"
+        ],
+        [
+          "-",
+          "=",
+          "_",
+          "+",
+          ":",
+          "Enter"
+        ],
+        [
+          "<",
+          ">",
+          "~",
+          "`",
+          "?",
+          "Shift"
+        ],
+        [
+          {
+            "key": "Space",
+            "width": 2.0
+          },
+          "layer:sym",
+          "layer:nav",
+          "Ctrl",
+          "Alt"
+        ]
+      ]
+    }
+  }
+}

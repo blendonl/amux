@@ -1,3 +1,4 @@
+mod android;
 pub mod callback;
 mod client;
 mod cluster;
@@ -13,6 +14,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+pub use android::{AndroidSettings, KeyboardSettings};
 pub use callback::{CallbackId, CALLBACK_SLOT};
 pub use client::{SearchSettings, StatusSettings, TreeSettings, WhichKeySettings};
 pub use cluster::{ClusterSettings, DiscoverySettings, LanSettings, ServerConfig, SshSettings};
@@ -56,6 +58,7 @@ pub struct Settings {
     pub discovery: DiscoverySettings,
     pub lan: LanSettings,
     pub worktrees: WorktreeSettings,
+    pub android: AndroidSettings,
 }
 
 impl Settings {
@@ -131,7 +134,7 @@ impl Settings {
         if self.worktrees.suffix.is_empty() {
             return Err("amux.opt.worktrees.suffix must not be empty".into());
         }
-        Ok(())
+        self.android.keyboard.validate()
     }
 }
 
@@ -159,6 +162,7 @@ impl Default for Settings {
             discovery: DiscoverySettings::default(),
             lan: LanSettings::default(),
             worktrees: WorktreeSettings::default(),
+            android: AndroidSettings::default(),
         }
     }
 }

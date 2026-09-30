@@ -67,6 +67,7 @@ async fn run_config(action: ConfigAction, endpoint: &Endpoint) -> Result<()> {
         ConfigAction::Check => print!("{}", config::check(given)?),
         ConfigAction::Defaults => print!("{}", config::defaults()?),
         ConfigAction::Path => println!("{}", config::path(given)?.display()),
+        ConfigAction::Keyboard => println!("{}", config::keyboard(given)?),
         ConfigAction::Reload => client::reload_config(endpoint).await?,
     }
     Ok(())
