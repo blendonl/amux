@@ -1,6 +1,8 @@
 # amux
 
-A terminal multiplexer written in Rust.
+A terminal multiplexer written in Rust. It works like tmux on one machine and spans several: every machine runs an amux server, servers pair with a one-time code and link into one encrypted cluster, and inside a git repo each branch's worktree gets its own session.
+
+![An amux session split into three panes: Neovim on the Noise handshake code, the commit graph, and amux listing the cluster's servers and sessions](docs/images/amux.webp)
 
 ## Install
 
