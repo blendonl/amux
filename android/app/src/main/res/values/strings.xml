@@ -11,6 +11,7 @@
     <string name="key_up">↑</string>
     <string name="key_right">→</string>
     <string name="key_prefix">Prefix</string>
+    <string name="keyboard_config_failed">%1$s: %2$s. The landscape keyboard uses its built-in layout until the file is fixed.</string>
 
     <string name="status_installing">Installing zsh, git and ssh…</string>
     <string name="status_installing_progress">%1$d%%</string>

@@ -1,77 +1,101 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
     android:id="@+id/root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical">
 
-    <FrameLayout
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:layout_weight="1">
+        android:layout_weight="1"
+        android:orientation="horizontal"
+        tools:ignore="NestedWeights">
 
-        <com.termux.view.TerminalView
-            android:id="@+id/terminal"
-            android:layout_width="match_parent"
+        <io.github.blendonl.amux.keyboard.KeyboardHalfView
+            android:id="@+id/keyboard_left"
+            android:layout_width="0dp"
             android:layout_height="match_parent"
-            android:focusable="true"
-            android:focusableInTouchMode="true"
-            android:visibility="invisible" />
+            android:layout_weight="25"
+            android:visibility="gone" />
 
-        <LinearLayout
-            android:id="@+id/status"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_gravity="center"
-            android:gravity="center_horizontal"
-            android:orientation="vertical"
-            android:padding="24dp">
+        <FrameLayout
+            android:id="@+id/terminal_pane"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="50">
 
-            <TextView
-                android:id="@+id/status_title"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:gravity="center"
-                android:text="@string/status_starting"
-                android:textColor="@color/panel_text"
-                android:textSize="20sp" />
-
-            <TextView
-                android:id="@+id/status_detail"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:gravity="center"
-                android:textColor="@color/panel_text_dim"
-                android:textIsSelectable="true"
-                android:textSize="14sp"
-                android:visibility="gone" />
+            <com.termux.view.TerminalView
+                android:id="@+id/terminal"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:focusable="true"
+                android:focusableInTouchMode="true"
+                android:visibility="invisible" />
 
             <LinearLayout
-                android:id="@+id/status_actions"
-                style="?android:attr/buttonBarStyle"
+                android:id="@+id/status"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="16dp"
-                android:orientation="horizontal"
-                android:visibility="gone">
+                android:layout_gravity="center"
+                android:gravity="center_horizontal"
+                android:orientation="vertical"
+                android:padding="24dp">
 
-                <Button
-                    android:id="@+id/reattach"
-                    style="?android:attr/buttonBarButtonStyle"
+                <TextView
+                    android:id="@+id/status_title"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="@string/action_reattach" />
+                    android:gravity="center"
+                    android:text="@string/status_starting"
+                    android:textColor="@color/panel_text"
+                    android:textSize="20sp" />
 
-                <Button
-                    android:id="@+id/stop"
-                    style="?android:attr/buttonBarButtonStyle"
+                <TextView
+                    android:id="@+id/status_detail"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="@string/action_stop_amux" />
+                    android:layout_marginTop="8dp"
+                    android:gravity="center"
+                    android:textColor="@color/panel_text_dim"
+                    android:textIsSelectable="true"
+                    android:textSize="14sp"
+                    android:visibility="gone" />
+
+                <LinearLayout
+                    android:id="@+id/status_actions"
+                    style="?android:attr/buttonBarStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="16dp"
+                    android:orientation="horizontal"
+                    android:visibility="gone">
+
+                    <Button
+                        android:id="@+id/reattach"
+                        style="?android:attr/buttonBarButtonStyle"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="@string/action_reattach" />
+
+                    <Button
+                        android:id="@+id/stop"
+                        style="?android:attr/buttonBarButtonStyle"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="@string/action_stop_amux" />
+                </LinearLayout>
             </LinearLayout>
-        </LinearLayout>
-    </FrameLayout>
+        </FrameLayout>
+
+        <io.github.blendonl.amux.keyboard.KeyboardHalfView
+            android:id="@+id/keyboard_right"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="25"
+            android:visibility="gone" />
+    </LinearLayout>
 
     <LinearLayout
         android:id="@+id/extra_keys"

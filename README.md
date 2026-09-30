@@ -549,7 +549,9 @@ It fails unless every step succeeds and the server exits with status 0 both time
 
 #### Keys
 
-A row of keys sits above the soft keyboard:
+How you type depends on how you hold the phone. In portrait the app uses the phone's own soft keyboard, and in landscape it draws a split keyboard of its own on both sides of the terminal.
+
+In portrait, a row of keys sits above the soft keyboard:
 
 | Key             | Sends                                                                                                                        |
 | --------------- | ---------------------------------------------------------------------------------------------------------------------------- |
@@ -558,9 +560,89 @@ A row of keys sits above the soft keyboard:
 | `←` `↓` `↑` `→` | The arrow keys                                                                                                               |
 | `Prefix`        | `Ctrl-b`, whatever `amux.opt.prefix` is set to                                                                               |
 
+In landscape, the soft keyboard stays hidden. The app's keyboard is split into two halves that each take the full height of the screen, with the terminal between them: left half, terminal, right half. Each half takes 25% of the screen's width, which [`keyboard.json`](#the-landscape-keyboard) can change. With a hardware keyboard attached, landscape works like portrait.
+
+- The keyboard is QWERTY split down the middle, with a number row on top and a thumb row at the bottom. The left half has `Esc`, `Tab`, `Ctrl` and `⇧` down its outer edge and `Prefix`, `Alt`, `nav`, `sym` and `Space` along the bottom. The right half has `⌫`, `'`, `⏎` and `⇧` down its outer edge and `Space`, `sym`, `nav`, `Ctrl` and `Alt` along the bottom.
+- `sym` is a layer of symbols. `nav` is a layer with `F1` to `F12`, `Home`, `End`, `PgUp` and `PgDn`, the arrows on the `h` `j` `k` `l` keys, `Ins`, `Del`, `Paste` and `Hide`. A layer keeps the base layer's keys where it has none of its own, so the modifiers and layer keys stay in place.
+- `Ctrl`, `Alt`, `⇧`, `sym` and `nav` all work the same way. A tap applies to the next key only, and shows the key's label in green meanwhile. A second tap locks it on and fills the key green, and a third tap turns it off. Holding the key applies it to every key you press until you let go, so one thumb can hold `nav` while the other taps arrows.
+- With `⇧`, a key types what it would on a US keyboard: `Q` for `q`, `!` for `1`, `"` for `'`.
+- `⌫`, `Del`, the arrows, `PgUp` and `PgDn` repeat while held.
+- `Paste` pastes the clipboard, as bracketed paste when the pane asks for it.
+- `Hide` hides the keyboard so the terminal takes the whole width, and a tap on the terminal brings it back.
+
+In both:
+
 - Pinch to zoom. The app remembers the text size.
 - Long-press to select text on the screen, then pick Copy or Paste from the menu that opens.
 - A tap on the terminal brings the keyboard back. In a window with several panes amux turns on mouse reporting (see [Windows and panes](#windows-and-panes)), so the tap also reaches amux as a click and makes the pane under it active.
+
+#### The landscape keyboard
+
+The landscape keyboard reads `$filesDir/config/amux/keyboard.json`, next to `init.lua`, which a pane sees as `$XDG_CONFIG_HOME/amux/keyboard.json`. The app doesn't create the file, and the file only holds what it changes: everything it leaves out keeps the built-in layout, [`android/app/src/main/res/raw/keyboard.json`](android/app/src/main/res/raw/keyboard.json). The app loads the file again whenever it is saved, and also when the app comes back to the front or the phone turns. A file with a mistake shows a message that names the setting, such as `width.left should be between 5 and 45 percent of the screen`, and the keyboard keeps the built-in layout until the file is fixed.
+
+To give each half 30% of the screen:
+
+```json
+{ "width": { "left": 30, "right": 30 } }
+```
+
+| Setting                                     | Is                                                                                                                                                                                    |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `width.left`, `width.right`                 | Each half's share of the screen's width, in percent, from 5 to 45. The terminal gets the rest                                                                                         |
+| `layers.<name>.left`, `layers.<name>.right` | One half of a layer, as a list of rows from top to bottom. A row is a list of keys from left to right. The rows share the half's height equally, and the keys share their row's width |
+
+A layer in the file replaces the halves it names and keeps the other one. A name the built-in layout doesn't have adds a layer, which needs both halves, and `"sym": null` removes a layer. The keyboard starts on the `base` layer, which every layout needs.
+
+A key is one of these:
+
+| Key                                                                                                                                                                 | Does                                                                                                        |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| One character, such as `"q"`, `"{"` or `"é"`                                                                                                                        | Types it, and with `⇧` its US-keyboard shifted form or its capital                                          |
+| `"esc"`, `"tab"`, `"enter"`, `"bksp"`, `"del"`, `"ins"`, `"home"`, `"end"`, `"pgup"`, `"pgdn"`, `"up"`, `"down"`, `"left"`, `"right"`, `"f1"` to `"f12"`, `"space"` | That key                                                                                                    |
+| `"ctrl"`, `"alt"`, `"shift"`                                                                                                                                        | That modifier                                                                                               |
+| `"layer:<name>"`                                                                                                                                                    | That layer, shown with the layer's name                                                                     |
+| `"prefix"`                                                                                                                                                          | Sends `Ctrl-b`                                                                                              |
+| `"paste"`, `"hide"`                                                                                                                                                 | Pastes the clipboard, or hides the keyboard                                                                 |
+| `""`                                                                                                                                                                | Nothing: an empty gap                                                                                       |
+| `null`                                                                                                                                                              | The key at the same place in the `base` layer. The `base` layer can't use it. A whole row can be `null` too |
+| An object                                                                                                                                                           | A key with more settings                                                                                    |
+
+An object has exactly one of `key`, `text` and `send`, and any of the others:
+
+| Field    | Is                                                                                                                                  |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `key`    | A key as in the table above                                                                                                         |
+| `text`   | Text the key types, such as `"git status\r"`. `Ctrl` and `Alt` apply to each of its characters                                      |
+| `send`   | Characters the key sends to the terminal as they are, without modifiers, such as `"\u0002c"` for `Ctrl-b c`. It shows them as `^Bc` |
+| `label`  | What the key shows instead                                                                                                          |
+| `shift`  | What the key types with `⇧`                                                                                                         |
+| `width`  | The key's share of its row, 1 unless set. `"space"` is 2 wide in the built-in layout                                                |
+| `repeat` | `true` to repeat the key while it is held                                                                                           |
+
+This file keeps the built-in keyboard but puts amux's window keys on the top row of `nav`'s right half:
+
+```json
+{
+  "layers": {
+    "nav": {
+      "right": [
+        [
+          { "send": "\u0002c", "label": "new" },
+          { "send": "\u0002p", "label": "prev" },
+          { "send": "\u0002n", "label": "next" },
+          { "send": "\u0002%", "label": "split" },
+          "",
+          null
+        ],
+        ["home", "pgdn", "pgup", "end", "", null],
+        ["left", "down", "up", "right", "del", null],
+        ["paste", "hide", "", "", "", null],
+        null
+      ]
+    }
+  }
+}
+```
 
 #### zsh, git and ssh
 

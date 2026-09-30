@@ -2,23 +2,37 @@ package io.github.blendonl.amux
 
 import android.Manifest
 import android.app.Activity
+import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.view.View
 import android.view.WindowInsets
-import android.view.inputmethod.InputMethodManager
+import android.widget.Toast
 import com.termux.terminal.TerminalEmulator
 import com.termux.terminal.TerminalSession
 import com.termux.view.TerminalView
+import io.github.blendonl.amux.keyboard.ConfigFileWatcher
+import io.github.blendonl.amux.keyboard.KeyboardConfigFile
+import io.github.blendonl.amux.keyboard.KeyboardHalfView
+import io.github.blendonl.amux.keyboard.KeyboardLayoutParser
+import io.github.blendonl.amux.keyboard.Side
+import io.github.blendonl.amux.keyboard.SplitKeyboard
+import io.github.blendonl.amux.keyboard.TerminalKeySink
+import java.io.File
 
 class MainActivity : Activity() {
     private lateinit var terminalView: TerminalView
     private lateinit var extraKeys: ExtraKeys
+    private lateinit var input: InputPanels
+    private lateinit var splitKeyboard: SplitKeyboard
+    private var keyboardConfig: KeyboardConfigFile? = null
+    private var keyboardWatcher: ConfigFileWatcher? = null
     private lateinit var status: StatusPanel
     private lateinit var sessionCallbacks: TerminalSessionCallbacks
     private var session: TerminalSession? = null
@@ -52,9 +66,10 @@ class MainActivity : Activity() {
         fitContentToInsets(findViewById(R.id.root))
         terminalView = findViewById(R.id.terminal)
         extraKeys = ExtraKeys(findViewById(R.id.extra_keys), terminalView)
+        setUpInput()
         val fontSize = FontSize(this)
         terminalView.setTextSize(fontSize.current)
-        terminalView.setTerminalViewClient(TerminalViewCallbacks(terminalView, extraKeys, fontSize, ::showKeyboard))
+        terminalView.setTerminalViewClient(TerminalViewCallbacks(terminalView, extraKeys, fontSize, input::onTerminalTap))
         sessionCallbacks = TerminalSessionCallbacks(this, terminalView, ::onClientExited)
         status = StatusPanel(findViewById(R.id.status), onReattach = ::reattach, onStop = ::stopAmux)
 
@@ -64,12 +79,53 @@ class MainActivity : Activity() {
         bind()
     }
 
+    override fun onResume() {
+        super.onResume()
+        reloadKeyboard()
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        reloadKeyboard()
+        input.configure(newConfig)
+    }
+
     override fun onDestroy() {
+        keyboardWatcher?.stop()
         service?.stopObserving(serverObserver)
         if (bound) unbindService(connection)
         session?.finishIfRunning()
         session = null
         super.onDestroy()
+    }
+
+    private fun setUpInput() {
+        val leftHalf = findViewById<KeyboardHalfView>(R.id.keyboard_left)
+        val rightHalf = findViewById<KeyboardHalfView>(R.id.keyboard_right)
+        input = InputPanels(window, terminalView, findViewById(R.id.terminal_pane), extraKeys, leftHalf, rightHalf)
+        val sink = TerminalKeySink(terminalView, getSystemService(ClipboardManager::class.java), input::hideSplitKeyboard)
+        splitKeyboard = SplitKeyboard(KeyboardLayoutParser.parse(defaultKeyboardLayout()), sink)
+        leftHalf.attach(splitKeyboard, Side.LEFT)
+        rightHalf.attach(splitKeyboard, Side.RIGHT)
+        input.resize(splitKeyboard.layout)
+        input.configure(resources.configuration)
+    }
+
+    private fun watchKeyboardConfig(file: File) {
+        if (keyboardConfig != null) return
+        keyboardConfig = KeyboardConfigFile(defaultKeyboardLayout(), file)
+        keyboardWatcher = ConfigFileWatcher(file, ::reloadKeyboard).also(ConfigFileWatcher::start)
+        reloadKeyboard()
+    }
+
+    private fun reloadKeyboard() {
+        val config = keyboardConfig ?: return
+        val loaded = config.loadIfChanged() ?: return
+        splitKeyboard.layout = loaded.layout
+        input.resize(loaded.layout)
+        loaded.problem?.let { problem ->
+            Toast.makeText(this, getString(R.string.keyboard_config_failed, config.file.name, problem), Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun bind() {
@@ -113,6 +169,7 @@ class MainActivity : Activity() {
 
     private fun attach(amux: AmuxEnvironment) {
         attachWhenReady = false
+        watchKeyboardConfig(amux.keyboardFile)
         val client = TerminalSession(
             amux.binary.path,
             amux.home.path,
@@ -150,9 +207,8 @@ class MainActivity : Activity() {
         status.hide()
         terminalView.visibility = View.VISIBLE
         terminalView.keepScreenOn = true
-        extraKeys.visible = true
         terminalView.requestFocus()
-        showKeyboard()
+        input.showTerminal()
     }
 
     private fun showProgress(title: String, detail: String?) {
@@ -162,24 +218,13 @@ class MainActivity : Activity() {
 
     private fun showDetached(title: String, detail: String?, reattachLabel: String = getString(R.string.action_reattach)) {
         hideTerminal()
-        hideKeyboard()
         status.show(title, detail, reattachLabel)
     }
 
     private fun hideTerminal() {
         terminalView.visibility = View.INVISIBLE
         terminalView.keepScreenOn = false
-        extraKeys.visible = false
-    }
-
-    private fun showKeyboard() {
-        terminalView.post {
-            getSystemService(InputMethodManager::class.java).showSoftInput(terminalView, InputMethodManager.SHOW_IMPLICIT)
-        }
-    }
-
-    private fun hideKeyboard() {
-        getSystemService(InputMethodManager::class.java).hideSoftInputFromWindow(terminalView.windowToken, 0)
+        input.hideTerminal()
     }
 
     private fun requestNotificationPermission() {
