@@ -69,6 +69,21 @@ impl FromStr for Key {
     }
 }
 
+pub fn parse_sequence(notation: &str) -> Result<Vec<Key>> {
+    let words: Vec<&str> = notation.split_whitespace().collect();
+    if words.is_empty() {
+        return Ok(vec![notation.parse()?]);
+    }
+    words.into_iter().map(str::parse).collect()
+}
+
+pub fn spell_sequence(keys: &[Key]) -> String {
+    keys.iter()
+        .map(Key::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn split_modifier(notation: &str) -> Option<(Mods, &str)> {
     MODIFIERS.iter().find_map(|&(modifier, spelling)| {
         notation
@@ -198,6 +213,21 @@ mod tests {
         for notation in ["", "C-", "Bogus", "F0", "F13", "F+1", "\x01", "ab", "X-a"] {
             assert!(notation.parse::<Key>().is_err(), "{notation:?}");
         }
+    }
+
+    #[test]
+    fn a_sequence_is_keys_separated_by_spaces() {
+        assert_eq!(parse_sequence("s p").unwrap(), [key("s"), key("p")]);
+        assert_eq!(
+            parse_sequence(" C-g  M-x Space ").unwrap(),
+            [key("C-g"), key("M-x"), key("Space")]
+        );
+        assert_eq!(parse_sequence("%").unwrap(), [key("%")]);
+        assert_eq!(parse_sequence(" ").unwrap(), [key("Space")]);
+        assert!(parse_sequence("").is_err());
+        assert!(parse_sequence("  ").is_err());
+        assert!(parse_sequence("s Bogus").is_err());
+        assert_eq!(spell_sequence(&[key("C-g"), key("Space")]), "C-g Space");
     }
 
     #[test]

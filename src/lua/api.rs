@@ -9,10 +9,10 @@ use tracing::info;
 
 use super::runtime::Process;
 use super::{client, from_lua, function, server};
-use crate::keys::Key;
+use crate::keys::{parse_sequence, spell_sequence, Key};
 use crate::settings::{
-    Binding, CallbackId, Keymap, PromptAction, Table as Bindings, TreeAction, PREFIX_TABLE,
-    PROMPT_TABLE, ROOT_TABLE, TREE_TABLE,
+    Binding, CallbackId, Keymap, PickerAction, PromptAction, Table as Bindings, TreeAction,
+    PICKER_TABLE, PREFIX_TABLE, PROMPT_TABLE, ROOT_TABLE, TREE_TABLE,
 };
 
 const SET_OPTIONS: [&str; 1] = ["desc"];
@@ -144,31 +144,43 @@ fn keymap(lua: &Lua, constructors: Table) -> mlua::Result<Table> {
         "set",
         function(
             lua,
-            move |lua, (table, key, value, options): (String, String, Value, Option<Table>)| {
-                let key = parse_key(&key)?;
+            move |lua, (table, keys, value, options): (String, String, Value, Option<Table>)| {
+                let keys = parse_keys(&keys)?;
                 let description = description(options)?;
                 match table.as_str() {
                     PROMPT_TABLE => {
+                        let key = single_key(&table, &keys)?;
                         let action = panel_action::<PromptAction>(&table, value)?;
                         bind(&mut registry(lua)?.keymap.prompt, key, action, description);
                     }
                     TREE_TABLE => {
+                        let key = single_key(&table, &keys)?;
                         let action = panel_action::<TreeAction>(&table, value)?;
                         bind(&mut registry(lua)?.keymap.tree, key, action, description);
                     }
+                    PICKER_TABLE => {
+                        let key = single_key(&table, &keys)?;
+                        let action = panel_action::<PickerAction>(&table, value)?;
+                        bind(&mut registry(lua)?.keymap.picker, key, action, description);
+                    }
+                    "" => return Err(mlua::Error::runtime("a keymap table needs a name")),
                     name => {
                         let bound = bound(lua, &constructors, value)?;
                         let mut registry = registry(lua)?;
                         let Registry {
                             keymap, callbacks, ..
                         } = &mut *registry;
-                        let bindings = bindings_mut(keymap, name)?;
+                        let (key, path) = split_sequence(&keys);
+                        let submap = keymap
+                            .open_submap(name, path)
+                            .map_err(mlua::Error::runtime)?;
                         let binding = match bound {
                             Bound::Binding(binding) => binding,
                             Bound::Callback(callback) => {
                                 Binding::Callback(callbacks.register(callback))
                             }
                         };
+                        let bindings = keymap.table_entry(&submap);
                         unbound(callbacks, bind(bindings, key, binding, description));
                     }
                 }
@@ -178,28 +190,29 @@ fn keymap(lua: &Lua, constructors: Table) -> mlua::Result<Table> {
     )?;
     keymap.set(
         "del",
-        function(lua, |lua, (table, key): (String, String)| {
-            let key = parse_key(&key)?;
+        function(lua, |lua, (table, keys): (String, String)| {
+            let keys = parse_keys(&keys)?;
             let mut registry = registry(lua)?;
             let Registry {
                 keymap, callbacks, ..
             } = &mut *registry;
             let removed = match table.as_str() {
-                PROMPT_TABLE => keymap.prompt.remove(&key).is_some(),
-                TREE_TABLE => keymap.tree.remove(&key).is_some(),
-                ROOT_TABLE => unbound(callbacks, keymap.root.remove(&key)),
-                PREFIX_TABLE => unbound(callbacks, keymap.prefix.remove(&key)),
+                PROMPT_TABLE => keymap.prompt.remove(&single_key(&table, &keys)?).is_some(),
+                TREE_TABLE => keymap.tree.remove(&single_key(&table, &keys)?).is_some(),
+                PICKER_TABLE => keymap.picker.remove(&single_key(&table, &keys)?).is_some(),
                 name => {
+                    let (key, path) = split_sequence(&keys);
                     let removed = keymap
-                        .custom
-                        .get_mut(name)
-                        .and_then(|bindings| bindings.remove(&key));
+                        .submap(name, path)
+                        .map(str::to_owned)
+                        .and_then(|submap| keymap.table_mut(&submap)?.remove(&key));
                     unbound(callbacks, removed)
                 }
             };
             if !removed {
                 return Err(mlua::Error::runtime(format!(
-                    "{key} is not bound in the {table} table"
+                    "{} is not bound in the {table} table",
+                    spell_sequence(&keys)
                 )));
             }
             Ok(())
@@ -207,17 +220,24 @@ fn keymap(lua: &Lua, constructors: Table) -> mlua::Result<Table> {
     )?;
     keymap.set(
         "get",
-        function(lua, |lua, (table, key): (String, String)| {
-            let key = parse_key(&key)?;
+        function(lua, |lua, (table, keys): (String, String)| {
+            let keys = parse_keys(&keys)?;
             let registry = registry(lua)?;
             let keymap = &registry.keymap;
             match table.as_str() {
-                PROMPT_TABLE => to_lua(lua, keymap.prompt.get(&key)),
-                TREE_TABLE => to_lua(lua, keymap.tree.get(&key)),
-                name => match keymap.table(name).and_then(|bindings| bindings.get(&key)) {
-                    Some(Binding::Callback(id)) => registry.callbacks.get(*id).into_lua(lua),
-                    binding => to_lua(lua, binding),
-                },
+                PROMPT_TABLE => to_lua(lua, keymap.prompt.get(&single_key(&table, &keys)?)),
+                TREE_TABLE => to_lua(lua, keymap.tree.get(&single_key(&table, &keys)?)),
+                PICKER_TABLE => to_lua(lua, keymap.picker.get(&single_key(&table, &keys)?)),
+                name => {
+                    let (key, path) = split_sequence(&keys);
+                    let bound = keymap
+                        .submap(name, path)
+                        .and_then(|submap| keymap.table(submap)?.get(&key));
+                    match bound {
+                        Some(Binding::Callback(id)) => registry.callbacks.get(*id).into_lua(lua),
+                        binding => to_lua(lua, binding),
+                    }
+                }
             }
         })?,
     )?;
@@ -231,6 +251,7 @@ fn keymap(lua: &Lua, constructors: Table) -> mlua::Result<Table> {
             match table.as_str() {
                 PROMPT_TABLE => keymap.prompt.clear(),
                 TREE_TABLE => keymap.tree.clear(),
+                PICKER_TABLE => keymap.picker.clear(),
                 ROOT_TABLE => clear_bindings(callbacks, &mut keymap.root),
                 PREFIX_TABLE => clear_bindings(callbacks, &mut keymap.prefix),
                 name => {
@@ -295,17 +316,25 @@ fn clear_bindings(callbacks: &mut Callbacks, bindings: &mut Bindings<Binding>) {
     bindings.clear();
 }
 
-fn parse_key(notation: &str) -> mlua::Result<Key> {
-    notation.parse().map_err(mlua::Error::runtime)
+fn parse_keys(notation: &str) -> mlua::Result<Vec<Key>> {
+    parse_sequence(notation).map_err(mlua::Error::runtime)
 }
 
-fn bindings_mut<'a>(keymap: &'a mut Keymap, name: &str) -> mlua::Result<&'a mut Bindings<Binding>> {
-    match name {
-        "" => Err(mlua::Error::runtime("a keymap table needs a name")),
-        ROOT_TABLE => Ok(&mut keymap.root),
-        PREFIX_TABLE => Ok(&mut keymap.prefix),
-        name => Ok(keymap.custom.entry(name.to_owned()).or_default()),
+fn single_key(table: &str, keys: &[Key]) -> mlua::Result<Key> {
+    match keys {
+        [key] => Ok(*key),
+        _ => Err(mlua::Error::runtime(format!(
+            "the {table} table binds single keys, not the sequence {}",
+            spell_sequence(keys)
+        ))),
     }
+}
+
+fn split_sequence(keys: &[Key]) -> (Key, &[Key]) {
+    let (last, path) = keys
+        .split_last()
+        .expect("a parsed key sequence holds at least one key");
+    (*last, path)
 }
 
 fn to_lua<T: Serialize>(lua: &Lua, value: Option<&T>) -> mlua::Result<Value> {
@@ -479,9 +508,14 @@ mod tests {
              amux.keymap.set('prefix', 'r', amux.action.switch_table('resize'))\n\
              amux.keymap.set('resize', 'h', amux.action.select_pane('left'))\n\
              amux.keymap.set('prompt', 'C-w', 'delete_line')\n\
-             amux.keymap.set('tree', 'x', 'cancel')",
+             amux.keymap.set('tree', 'x', 'cancel')\n\
+             amux.keymap.set('picker', 'C-j', 'down')\n\
+             amux.keymap.del('picker', 'C-u')\n\
+             assert(amux.keymap.get('picker', 'Enter') == 'pick')",
         )
         .keymap;
+        assert_eq!(keymap.picker.get(&key("C-j")), Some(&PickerAction::Down));
+        assert_eq!(keymap.picker.get(&key("C-u")), None);
         for (notation, binding) in [
             ("|", Binding::SplitPane(Split::LeftRight)),
             ("D", Binding::Detach),
@@ -573,6 +607,78 @@ mod tests {
     }
 
     #[test]
+    fn a_key_sequence_binds_through_submaps() {
+        let loaded = loaded(
+            "amux.keymap.set('prefix', 'g', amux.action.switch_table('git'), { desc = 'git' })\n\
+             amux.keymap.set('prefix', 'g s', 'new_window', { desc = 'status' })\n\
+             amux.keymap.set('prefix', 'g l L', function() return 'log' end)\n\
+             amux.keymap.set('root', 'M-s f', 'detach')\n\
+             assert(amux.keymap.get('prefix', 'g s') == 'new_window')\n\
+             assert(amux.keymap.get('git', 's') == 'new_window')\n\
+             assert(amux.keymap.get('prefix', 'g l').switch_table == 'git l')\n\
+             assert(amux.keymap.get('prefix', 'g l L')() == 'log')\n\
+             assert(amux.keymap.get('prefix', 'g z') == nil)\n\
+             assert(amux.keymap.get('prefix', 'd x') == nil)\n\
+             amux.keymap.set('prefix', 'g d', 'detach')\n\
+             amux.keymap.del('prefix', 'g d')",
+        );
+        let keymap = &loaded.keymap;
+        assert_eq!(
+            keymap.prefix.get(&key("g")),
+            Some(&Binding::SwitchTable("git".into()))
+        );
+        assert_eq!(keymap.prefix.description(&key("g")), Some("git"));
+        assert_eq!(
+            keymap.custom["git"].get(&key("s")),
+            Some(&Binding::NewWindow)
+        );
+        assert_eq!(keymap.custom["git"].description(&key("s")), Some("status"));
+        assert_eq!(keymap.custom["git"].get(&key("d")), None);
+        assert!(matches!(
+            keymap.custom["git l"].get(&key("L")),
+            Some(Binding::Callback(_))
+        ));
+        assert_eq!(
+            keymap.root.get(&key("M-s")),
+            Some(&Binding::SwitchTable("root M-s".into()))
+        );
+        assert_eq!(
+            keymap.custom["root M-s"].get(&key("f")),
+            Some(&Binding::Detach)
+        );
+        assert_eq!(loaded.callbacks.len(), 1);
+    }
+
+    #[test]
+    fn a_key_sequence_needs_submaps_and_a_table_that_takes_one() {
+        for (source, expected) in [
+            (
+                "amux.keymap.set('prefix', 'd x', 'detach')",
+                "init.lua:1: d in the prefix table is bound to detach, not to a submap",
+            ),
+            (
+                "amux.keymap.set('prompt', 'C-x C-w', 'delete_line')",
+                "init.lua:1: the prompt table binds single keys, not the sequence C-x C-w",
+            ),
+            (
+                "amux.keymap.get('tree', 'g g')",
+                "init.lua:1: the tree table binds single keys, not the sequence g g",
+            ),
+            (
+                "amux.keymap.del('prefix', 'z z')",
+                "init.lua:1: z z is not bound in the prefix table",
+            ),
+            (
+                "amux.keymap.set('prefix', 'g Bogus', 'detach')",
+                "init.lua:1: invalid key \"Bogus\"",
+            ),
+        ] {
+            let error = failure(source);
+            assert!(error.contains(expected), "{source}: {error}");
+        }
+    }
+
+    #[test]
     fn a_function_binding_becomes_a_callback() {
         let loaded = loaded(
             "local function greet() return 'hi' end\n\
@@ -634,7 +740,8 @@ mod tests {
                 "init.lua:1: unknown action zoom, expected one of detach, send_prefix, \
                  new_window, next_window, previous_window, select_window, split_pane, \
                  next_pane, select_pane, kill_pane, kill_window, rename_window, \
-                 rename_session, cluster_tree, switch_table, reload_config, which_key"
+                 rename_session, cluster_tree, search_projects, search_worktrees, switch_table, \
+                 reload_config, which_key"
             ),
             "{error}"
         );
@@ -731,7 +838,7 @@ mod tests {
     #[test]
     fn every_action_constructor_is_exposed() {
         let names = variants::<Binding>();
-        assert_eq!(names.len(), 17);
+        assert_eq!(names.len(), 19);
         assert!(names.contains(&"switch_table"));
         assert!(!names.contains(&"callback"));
         let loaded = loaded("");

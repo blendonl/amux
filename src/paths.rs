@@ -63,6 +63,14 @@ pub fn expand_home(path: PathBuf, home: &Path) -> PathBuf {
     }
 }
 
+pub fn abbreviate_home(path: &Path, home: &Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
 pub fn socket_name(socket: &Path) -> Result<String> {
     let name = socket
         .file_name()
@@ -132,6 +140,21 @@ mod tests {
             PathBuf::from("~other/a")
         );
         assert_eq!(expand_home("/srv/~".into(), home), PathBuf::from("/srv/~"));
+    }
+
+    #[test]
+    fn the_home_directory_is_shown_as_a_tilde() {
+        let home = Path::new("/home/tester");
+        assert_eq!(abbreviate_home(Path::new("/home/tester"), home), "~");
+        assert_eq!(
+            abbreviate_home(Path::new("/home/tester/projects/amux"), home),
+            "~/projects/amux"
+        );
+        assert_eq!(
+            abbreviate_home(Path::new("/home/testers/amux"), home),
+            "/home/testers/amux"
+        );
+        assert_eq!(abbreviate_home(Path::new("/srv/git"), home), "/srv/git");
     }
 
     #[test]

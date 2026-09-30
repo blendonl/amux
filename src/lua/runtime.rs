@@ -351,8 +351,8 @@ mod tests {
         assert!(
             error.contains(
                 "borders, cluster, discovery, escape_time_ms, lan, mouse, name, notice_ms, pane, \
-                 prefix, projects, projects_dir, servers, session, status, theme, tree, which_key, \
-                 window, worktrees"
+                 prefix, projects, projects_dir, search, servers, session, status, theme, tree, \
+                 which_key, window, worktrees"
             ),
             "{error}"
         );
@@ -721,11 +721,19 @@ mod tests {
                socket = 'dev',\n\
              }\n\
              opt.projects.amux = { default_server = 'desktop', worktrees_dir = '~/projects/amux-worktrees' }\n\
-             opt.projects.notes = {}",
+             opt.projects.notes = {}\n\
+             assert(opt.search.project_dirs[2] == '~/Projects')\n\
+             opt.search.project_dirs = { '~/code', '/srv/git' }\n\
+             opt.search.project_depth = 2",
         );
         let settings = loaded.settings;
         assert_eq!(settings.name.as_deref(), Some("desktop"));
         assert_eq!(settings.projects_dir, PathBuf::from("~/code"));
+        assert_eq!(
+            settings.search.project_dirs,
+            [PathBuf::from("~/code"), PathBuf::from("/srv/git")]
+        );
+        assert_eq!(settings.search.project_depth, 2);
         assert_eq!(settings.servers["laptop"], server("ssh://laptop"));
         assert_eq!(
             settings.servers["home-server"],

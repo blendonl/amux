@@ -1,9 +1,11 @@
 mod chrome;
+mod fuzzy;
 mod listing;
 mod projects;
 mod relay;
 mod router;
 pub mod scripting;
+mod search;
 mod terminal;
 mod tree;
 

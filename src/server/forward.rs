@@ -4,7 +4,9 @@ use anyhow::{anyhow, bail, Result};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
-use super::connection::{send, switch_or_refuse, ClientConnection, Origin, Outcome};
+use super::connection::{
+    open_or_refuse, send, switch_or_refuse, ClientConnection, Origin, Outcome,
+};
 use super::status::StatusFeed;
 use super::Server;
 use crate::cluster::{Channel, ChannelEnd};
@@ -160,6 +162,13 @@ impl Forward<'_> {
                             return Ok(Step::Done(outcome));
                         }
                     }
+                    Some(ClientMessage::NewSession(request)) => {
+                        if let Some(outcome) =
+                            open_or_refuse(self.server, &client.outgoing, request, Origin::Local).await?
+                        {
+                            return Ok(Step::Done(outcome));
+                        }
+                    }
                     Some(ClientMessage::Resize(new_size)) => {
                         *size = new_size.clamped();
                         let _ = channel.send(ClientMessage::Resize(*size)).await;
@@ -243,6 +252,13 @@ impl Forward<'_> {
                     Some(ClientMessage::Switch(target)) => {
                         if let Some(outcome) =
                             switch_or_refuse(self.server, &client.outgoing, target, Origin::Local).await?
+                        {
+                            return Ok(Step::Done(outcome));
+                        }
+                    }
+                    Some(ClientMessage::NewSession(request)) => {
+                        if let Some(outcome) =
+                            open_or_refuse(self.server, &client.outgoing, request, Origin::Local).await?
                         {
                             return Ok(Step::Done(outcome));
                         }

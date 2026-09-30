@@ -46,7 +46,7 @@ cargo run -- update                      # install the latest release in place o
 cargo run -- update --check              # only say whether a newer release is out
 ```
 
-Inside a session, press `Ctrl-b d` to detach and `Ctrl-b Ctrl-b` to send a literal `Ctrl-b`. The other keys after `Ctrl-b` manage windows and panes, as in tmux, and `Ctrl-b s` opens a tree of every session in the cluster. The bottom row is a status bar that shows the session, its server and its windows. The prefix, every binding, the status bar and the colours come from the [config](#config), and text pasted with bracketed paste reaches the pane whole, even when it contains the prefix.
+Inside a session, press `Ctrl-b d` to detach and `Ctrl-b Ctrl-b` to send a literal `Ctrl-b`. The other keys after `Ctrl-b` manage windows and panes, as in tmux. `Ctrl-b s` starts a search: `p` finds a project, `w` a worktree, and `s` opens a tree of every session in the cluster. The bottom row is a status bar that shows the session, its server and its windows. The prefix, every binding, the status bar and the colours come from the [config](#config), and text pasted with bracketed paste reaches the pane whole, even when it contains the prefix.
 
 `-L <name>` picks a named server socket in the runtime directory and `-S <path>` sets an explicit socket path. Both work like tmux's flags, so you can run an isolated dev server next to your usual one. Each `-L` name is its own cluster: a `-L dev` server only links to other `-L dev` servers.
 
@@ -54,24 +54,26 @@ Inside a session, press `Ctrl-b d` to detach and `Ctrl-b Ctrl-b` to send a liter
 
 A session holds numbered windows, and each window splits into panes, each running its own shell. The host lays the panes out and draws them into one screen with borders between them, and the border around the active pane is green.
 
-| Keys                    | Action                                           |
-| ----------------------- | ------------------------------------------------ |
-| `Ctrl-b c`              | New window                                       |
-| `Ctrl-b n`, `Ctrl-b p`  | Next and previous window                         |
-| `Ctrl-b 0` … `Ctrl-b 9` | The window with that number                      |
-| `Ctrl-b %`              | Split the active pane into left and right panes  |
-| `Ctrl-b "`              | Split the active pane into top and bottom panes  |
-| `Ctrl-b o`              | Next pane                                        |
-| `Ctrl-b` arrow key      | The pane in that direction                       |
-| `Ctrl-b x`              | Kill the active pane                             |
-| `Ctrl-b &`              | Kill the active window                           |
-| `Ctrl-b ,`              | Rename the active window                         |
-| `Ctrl-b $`              | Rename the session                               |
-| `Ctrl-b s`              | Pick a session or window anywhere in the cluster |
-| `Ctrl-b r`              | Reload the config, here and on this server       |
-| `Ctrl-b ?`              | Show every key that works after `Ctrl-b`         |
-| `Ctrl-b d`              | Detach                                           |
-| `Ctrl-b Ctrl-b`         | Send a literal `Ctrl-b`                          |
+| Keys                    | Action                                                 |
+| ----------------------- | ------------------------------------------------------ |
+| `Ctrl-b c`              | New window                                             |
+| `Ctrl-b n`, `Ctrl-b p`  | Next and previous window                               |
+| `Ctrl-b 0` … `Ctrl-b 9` | The window with that number                            |
+| `Ctrl-b %`              | Split the active pane into left and right panes        |
+| `Ctrl-b "`              | Split the active pane into top and bottom panes        |
+| `Ctrl-b o`              | Next pane                                              |
+| `Ctrl-b` arrow key      | The pane in that direction                             |
+| `Ctrl-b x`              | Kill the active pane                                   |
+| `Ctrl-b &`              | Kill the active window                                 |
+| `Ctrl-b ,`              | Rename the active window                               |
+| `Ctrl-b $`              | Rename the session                                     |
+| `Ctrl-b s p`            | Find a project in your project directories and open it |
+| `Ctrl-b s w`            | Find a worktree of this session's project and open it  |
+| `Ctrl-b s s`            | Pick a session or window anywhere in the cluster       |
+| `Ctrl-b r`              | Reload the config, here and on this server             |
+| `Ctrl-b ?`              | Show every key that works after `Ctrl-b`               |
+| `Ctrl-b d`              | Detach                                                 |
+| `Ctrl-b Ctrl-b`         | Send a literal `Ctrl-b`                                |
 
 - Windows are numbered from 0. A new window takes the lowest free number, and the others keep theirs when one closes. `amux ls` counts the windows of every session in the cluster.
 - A split shares the pane's space equally with its siblings, and every shell is resized to its pane. A split that leaves no room for the new pane is refused, and the status bar says why.
@@ -93,7 +95,7 @@ The client keeps the bottom row of the terminal for a status bar, so a session g
 - On the right are the servers that are offline and, for a session on another server, the latency of the link to it. On a narrow terminal the offline servers shrink to a count and then go away before any window does.
 - When something you asked for fails, such as a split with no room, a rename to a name that is taken or a switch to a session that has just gone, the status bar shows the error for three seconds. The client stays attached.
 
-`Ctrl-b s` opens the cluster tree over the session: every server, then its projects, then their sessions and windows, starting on the session you are in.
+`Ctrl-b s s` opens the cluster tree over the session: every server, then its projects, then their sessions and windows, starting on the session you are in.
 
 ```
 - desktop  (this server)
@@ -110,7 +112,31 @@ The client keeps the bottom row of the terminal for a status bar, so a session g
 
 `Ctrl-b ,` and `Ctrl-b $` open a prompt on the status bar, filled in with the window's or the session's current name. The arrow keys, `Home`, `End`, `Ctrl-a`, `Ctrl-e`, `Backspace`, `Delete` and `Ctrl-u` edit it, `Enter` renames and `Escape` or `Ctrl-c` cancels. Renaming a session works the same when it runs on another server.
 
-While the tree or a prompt is open, keys and mouse clicks go to it and never reach the session. A lone `Escape` closes it after 50 ms, since it could also be the start of an arrow key.
+While the tree, a picker or a prompt is open, keys and mouse clicks go to it and never reach the session. A lone `Escape` closes it after 50 ms, since it could also be the start of an arrow key.
+
+### Search
+
+`Ctrl-b s` is the search submap, and the key after it says what to find:
+
+- `Ctrl-b s p` lists the git repositories in `amux.opt.search.project_dirs`, which are `~/projects` and `~/Projects` by default. A directory with a `.git` directory in it is a project, and amux doesn't look further inside it. With `amux.opt.search.project_depth = 2`, a repo one directory further down, such as `~/projects/work/api`, is found too. Hidden directories and worktrees, whose `.git` is a file, are skipped, a directory that doesn't exist is ignored, and a repo reached twice, through a symlink or two names for one directory, is listed once.
+- `Ctrl-b s w` lists the worktrees of the attached session's project: its main checkout and every worktree on a branch, from this machine's checkout of the project.
+- `Ctrl-b s s` opens the [cluster tree](#status-bar-and-the-cluster-tree).
+
+The list opens over the session, with the best match at the top:
+
+```
+project> amx                                                              2/14
+> amux  ~/projects/amux
+  amux-old  ~/Projects/amux-old
+```
+
+- Typing filters the list. The letters of the query have to appear in order, a query in lowercase ignores case, and every word of a query with spaces has to match. Matches at the start of a word or in a run of letters rank first, and the matched letters are highlighted.
+- `Up` and `Down`, or `Ctrl-p` and `Ctrl-n`, move. `Enter` opens the selected entry. `Backspace`, `Ctrl-w` and `Ctrl-u` delete a letter, a word and the whole query, and `Escape` or `Ctrl-c` closes the list.
+- What you type while the list is loading filters it once it arrives.
+
+Opening a project or a worktree does what `amux new` does in its directory: this client switches to the session of that checkout and branch, such as `amux/main` or `amux/feature-x`, and starts it when there is none. The first session in a repo registers the repo with this server, a repo on a detached `HEAD` gets a plain session in its directory, and the session runs on the project's `default_server` when it has one. When the session can't start, the status bar shows why and you stay in the session you were in.
+
+The search runs on the machine you type on, so it lists that machine's repos and worktrees, also while you are attached to a session on another server.
 
 ### Which key
 
@@ -127,11 +153,11 @@ Like which-key in Neovim and Emacs, amux shows what the next key can do when you
 
 - The popup never changes what a key does. Pressing one runs it and closes the popup, and a key typed before the delay runs without the popup ever showing, so it stays out of the way once you know the keys.
 - `Ctrl-b ?` shows the popup at once, whether or not it is turned on.
-- A key that switches to another table (`switch_table`) shows as a group, `+resize`, and pressing it shows that table in place. The rule at the top names the keys typed so far, `C-b r`, and `Backspace` goes back one table.
+- A key that switches to another table (`switch_table`), a submap, shows as a group, `+resize`, and pressing it shows that table in place. The rule at the top names the keys typed so far, `C-b r`, and `Backspace` goes back one table.
 - `Escape`, or any key the table doesn't bind, closes it. When the keys don't fit, the rule shows the page, `1/3`, and `PageDown` and `PageUp` turn it.
 - The popup covers the bottom of the session while it shows, and the session is drawn again when it closes. Output from the pane keeps coming in around it.
 
-Each key shows a short description of its action, and `amux.keymap.set` takes your own: `amux.keymap.set("prefix", "g", fn, { desc = "show the log" })`. `amux.opt.which_key` turns the popup off and changes its delay and its look, and the theme colours it. [docs/lua.md](docs/lua.md#which-key) has the details.
+Each key shows a short description of its action, and `amux.keymap.set` takes your own: `amux.keymap.set("prefix", "g", fn, { desc = "show the log" })`. A binding can be a sequence of keys, `amux.keymap.set("prefix", "g l", fn)`, which makes `g` a submap when it isn't one yet (see [Submaps](docs/lua.md#submaps)). `amux.opt.which_key` turns the popup off and changes its delay and its look, and the theme colours it. [docs/lua.md](docs/lua.md#which-key) has the details.
 
 ### Targets
 
@@ -178,6 +204,8 @@ opt.projects.amux = {
   worktrees_dir = "~/projects/amux-worktrees",
 }
 
+opt.search.project_dirs = { "~/projects", "~/work" }
+
 opt.discovery.tailscale_tags = { "tag:server" }
 opt.lan.port = 7448
 ```
@@ -214,7 +242,7 @@ amux.on("session_created", function(event) amux.log("new session " .. event.sess
 | `amux config path`     | Prints where your `init.lua` is or goes: the `--config` file, or the one in the config dir  |
 | `amux config reload`   | Makes the running server load its config again, and prints what happened                    |
 
-`name` defaults to the hostname and `projects_dir` to `~/projects`. A leading `~` in `projects_dir` and `worktrees_dir` means your home directory. Each entry under `servers` is a peer to link to. Each entry under `projects` is keyed by project name: `default_server` is where `amux new` puts that project's sessions when you don't pass `--on`, and `worktrees_dir` is where its worktrees go instead of the default `<checkout>/../<project>-worktrees`.
+`name` defaults to the hostname and `projects_dir` to `~/projects`. A leading `~` in `projects_dir`, `worktrees_dir` and `search.project_dirs` means your home directory. Each entry under `servers` is a peer to link to. Each entry under `projects` is keyed by project name: `default_server` is where `amux new` puts that project's sessions when you don't pass `--on`, and `worktrees_dir` is where its worktrees go instead of the default `<checkout>/../<project>-worktrees`.
 
 `amux.opt.discovery` controls how servers find each other without a config entry (see [Cluster](#cluster)):
 
@@ -248,7 +276,7 @@ A config that fails to load changes nothing. The running settings, bindings and 
 
 What a reload changes:
 
-- **The client**: the prefix, the key bindings, the status bar, the tree, the which-key popup, the theme, and the notice and escape times, right away. An open prompt, tree or which-key popup closes.
+- **The client**: the prefix, the key bindings, the status bar, the tree, the which-key popup, the search directories, the theme, and the notice and escape times, right away. An open prompt, tree or which-key popup closes.
 - **Panes and windows**: the ones opened after the reload get the new `pane`, `window` and session naming settings. Panes that are already running keep the shell, `TERM` and environment they started with. Pane borders are drawn again with the new `borders` and theme.
 - **Projects**: `projects` and `projects_dir` apply to the next session.
 - **The cluster**: servers added to `amux.opt.servers` or `servers.lua` are linked, and removed ones are dropped. The status interval applies right away, and the other `cluster` timings to the next dial, backoff and link.
@@ -434,7 +462,7 @@ With both discovery sources off, amux opens no ports. Otherwise it listens on TC
 A client only ever talks to its local server. Attaching to a session on another server opens a channel over the peer link to that server, which treats the channel like any other attached client. `amux new --on laptop`, `attach`, `rename` and `kill` all work the same way whichever server holds the session.
 
 - A session created on another server starts in that server's `$HOME`, because paths differ between machines. The client's `LANG`, `LC_*` and `COLORTERM` are applied to the new shell wherever it runs, in place of the server's own.
-- When the link drops while you are attached, the session keeps running on its server, a box saying "reconnecting to laptop…" covers the screen and the status bar lists laptop as offline. Once the link is back you get a full redraw. `Ctrl-b d` still detaches in the meantime, and `Ctrl-b s` can switch to another session.
+- When the link drops while you are attached, the session keeps running on its server, a box saying "reconnecting to laptop…" covers the screen and the status bar lists laptop as offline. Once the link is back you get a full redraw. `Ctrl-b d` still detaches in the meantime, and `Ctrl-b s s` can switch to another session.
 - If that server is stopped with `kill-server`, or restarts and loses the session, the client exits as it would for a local session.
 - When several clients are attached to one session, the one that typed or resized last sets its size, like tmux's `window-size latest`.
 
@@ -622,7 +650,7 @@ amux servers add desktop tcp://100.101.7.12:7447
 
 The pairing saves the desktop under its name, `desktop` here, at the port of its LAN listener, which changes each time that listener opens unless `amux.opt.lan.port` is set there, so that address can go stale. The tailnet listener stays at port 7447, so the phone can dial it whenever the link drops. `servers add` refuses a name that is already configured, which is why the entry the pairing saved goes first.
 
-Once paired, the phone is a member like any other. `amux ls` lists the sessions of every machine, `amux attach -t work@desktop` attaches to one, `amux new --on desktop` starts one there, and `Ctrl-b s` switches between them. The rest of the cluster learns the phone's key (see [Trust](#trust)), and now that the phone trusts a key, its server listens on the LAN like any other (see [Listening ports](#listening-ports)).
+Once paired, the phone is a member like any other. `amux ls` lists the sessions of every machine, `amux attach -t work@desktop` attaches to one, `amux new --on desktop` starts one there, and `Ctrl-b s s` switches between them. The rest of the cluster learns the phone's key (see [Trust](#trust)), and now that the phone trusts a key, its server listens on the LAN like any other (see [Listening ports](#listening-ports)).
 
 #### Licenses and sources
 
@@ -673,8 +701,8 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 - The **protocol** uses length-prefixed `postcard` frames. A connection opens with a `Greeting` and a `Welcome` whose layout never changes, then carries `ClientMessage` and `ServerMessage`. Any change to those messages bumps the major version. The server handles a connection as a `Duplex`, a pair of message channels, so it doesn't care what transport sits underneath.
 - A **peer link** carries the same frames. After the greeting both servers send a `Hello`, the lower ID decides whether the link is a duplicate, and then each side sends a snapshot of its sessions followed by events stamped with its incarnation and a sequence number, so stale or repeated updates are dropped. One writer drains a control lane (pongs, credit, goodbyes, trust updates) ahead of a bulk lane (snapshots, events and channel data), and the reader never waits on anything the other side controls, so a peer that stops reading cannot stall this one.
 - Over **TCP**, a connection opens with a `TcpOpen` frame that says whether it is a link or a pairing, then runs a `Noise_XX_25519_ChaChaPoly_BLAKE2s` handshake whose prologue binds that frame. A pump seals and opens the Noise messages between the socket and an in-memory duplex stream, so the peer link runs its usual framing on top. A pairing runs SPAKE2 over the same kind of connection first and then carries on as a link.
-- A **channel** tunnels one client connection through a peer link. Each server numbers the channels it opens, and the server hosting the session runs the channel through the same connection handler as a local client, except that it only ever looks up its own sessions. The host sends at most four frames ahead and waits for the opening server to pass each one on to its client, so frames stay pulled end to end. Each channel has its own capped queue on the receiving side: a channel that overflows is closed on its own and the link stays up. The opening server forwards client messages without reading them, apart from detaching, switching sessions and listing the cluster, and reattaches by the host's incarnation and session ID when a dropped link comes back.
-- The client draws its own **chrome**: the status bar, the reconnect overlay, the prompts and the cluster tree. It sends the host its terminal size without the status row, in the first request, on every resize and on a reattach, so the host never draws there. The host sends the session's name, windows and active window when the client attaches and whenever they change. The server the client is connected to adds a cluster status (its own name, the session's server, the link latency and the offline servers) on attach, whenever the cluster changes and every two seconds. A channel never carries a cluster status, since the server at the client's end knows it best. The status bar is drawn again after each batch of output, saving and restoring the cursor around it. While the tree is open the client drops the session's output, and closing the tree or a prompt asks the host for a full redraw.
+- A **channel** tunnels one client connection through a peer link. Each server numbers the channels it opens, and the server hosting the session runs the channel through the same connection handler as a local client, except that it only ever looks up its own sessions. The host sends at most four frames ahead and waits for the opening server to pass each one on to its client, so frames stay pulled end to end. Each channel has its own capped queue on the receiving side: a channel that overflows is closed on its own and the link stays up. The opening server forwards client messages without reading them, apart from detaching, switching sessions, opening a new one and listing the cluster, and reattaches by the host's incarnation and session ID when a dropped link comes back.
+- The client draws its own **chrome**: the status bar, the reconnect overlay, the prompts, the cluster tree and the search pickers. It sends the host its terminal size without the status row, in the first request, on every resize and on a reattach, so the host never draws there. The host sends the session's name, windows and active window when the client attaches and whenever they change. The server the client is connected to adds a cluster status (its own name, the session's server, the link latency and the offline servers) on attach, whenever the cluster changes and every two seconds. A channel never carries a cluster status, since the server at the client's end knows it best. The status bar is drawn again after each batch of output, saving and restoring the cursor around it. While the tree or a picker is open the client drops the session's output, and closing one of them or a prompt asks the host for a full redraw. A picker scans directories and runs `git` in blocking tasks of the client, and a pick sends the host a `NewSession`, which an attached client may send like a `Switch`: the server switches it to the new or reused session, or refuses and keeps it attached.
 - A client's terminal size is clamped to at least 2 rows by 2 columns, on the client and on the server, because the terminal emulator can't handle anything smaller.
 - **Git** runs through the `git` CLI in blocking tasks, never while the server holds its sessions lock. Registry changes are serialized and saved before they are published as a `ProjectsChanged` event, and creates for the same project and branch wait on a per-worktree lock, so concurrent `amux new`s share one session.
 
@@ -727,8 +755,10 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 | `src/server/pane.rs`          | PTY, shell process, terminal emulation                                                                             |
 | `src/client/mod.rs`           | Commands, server bootstrap, attaching                                                                              |
 | `src/client/relay.rs`         | The attached client: keys, panels, chrome and switching sessions                                                   |
-| `src/client/chrome/`          | Status bar, prompt, reconnect overlay, key decoding and drawing helpers                                            |
-| `src/client/tree.rs`          | The `Ctrl-b s` cluster tree                                                                                        |
+| `src/client/chrome/`          | Status bar, prompt, search picker, reconnect overlay, key decoding and drawing helpers                             |
+| `src/client/tree.rs`          | The `Ctrl-b s s` cluster tree                                                                                      |
+| `src/client/search.rs`        | Finding the repos in the project directories and a checkout's worktrees, and opening a pick                        |
+| `src/client/fuzzy.rs`         | Fuzzy matching and ranking for the pickers                                                                         |
 | `src/client/listing.rs`       | `amux ls`, `amux projects`, `amux servers`, `amux discover` and `amux pair` output                                 |
 | `src/client/projects.rs`      | Resolving `-p` against the projects the cluster knows                                                              |
 | `src/client/terminal.rs`      | Raw mode, alternate screen, stdin reader                                                                           |
@@ -791,7 +821,7 @@ amux is growing into a multiplexer that spans machines, following [docs/design.m
 - [x] Projects and worktrees: `new -p -b`, `--clone`, `amux projects`
 - [x] Windows within a session (`Ctrl-b c`, `n`, `p`)
 - [x] Pane splits with a layout tree and a cell-level compositor
-- [x] Status bar with cluster information, rename prompts and the `Ctrl-b s` cluster tree
+- [x] Status bar with cluster information, rename prompts and the cluster tree
 - [x] A direct TCP transport with a keypair for each server (Noise), so links don't need sshd
 - [x] Finding peers from `tailscale status`, LAN discovery over mDNS and `amux pair`
 - [x] A trust store shared across the cluster, `amux servers forget` and `amux discover`
@@ -809,4 +839,5 @@ Beyond the design:
 - [x] A which-key popup that lists the keys after the prefix, with descriptions from the config
 - [x] Releases for Linux and macOS, an install script and `amux update`
 - [x] An Android app that runs amux on a phone and joins the cluster, with zsh, git and ssh in its panes
+- [x] Key sequences and submaps, and `Ctrl-b s` to fuzzy-find projects and worktrees
 - [ ] Scrollback and copy mode

@@ -28,6 +28,8 @@ pub enum Panel {
     RenameWindow,
     RenameSession,
     ClusterTree,
+    SearchProjects,
+    SearchWorktrees,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,6 +346,8 @@ impl KeyRouter {
             Binding::RenameWindow => Action::Open(Panel::RenameWindow),
             Binding::RenameSession => Action::Open(Panel::RenameSession),
             Binding::ClusterTree => Action::Open(Panel::ClusterTree),
+            Binding::SearchProjects => Action::Open(Panel::SearchProjects),
+            Binding::SearchWorktrees => Action::Open(Panel::SearchWorktrees),
             Binding::NewWindow => Action::Command(SessionCommand::NewWindow),
             Binding::NextWindow => Action::Command(SessionCommand::NextWindow),
             Binding::PreviousWindow => Action::Command(SessionCommand::PreviousWindow),
@@ -518,19 +522,26 @@ mod tests {
 
     #[test]
     fn panel_keys_open_a_panel_and_hand_it_the_rest_of_the_input() {
-        for (key, panel) in [
-            (b',', Panel::RenameWindow),
-            (b'$', Panel::RenameSession),
-            (b's', Panel::ClusterTree),
+        for (keys, panel) in [
+            (&b","[..], Panel::RenameWindow),
+            (b"$", Panel::RenameSession),
+            (b"ss", Panel::ClusterTree),
+            (b"sp", Panel::SearchProjects),
+            (b"sw", Panel::SearchWorktrees),
         ] {
-            let input = [b'a', DEFAULT_PREFIX, key, b'x', DEFAULT_PREFIX, b'd'];
+            let input = [
+                &[b'a', DEFAULT_PREFIX][..],
+                keys,
+                &[b'x', DEFAULT_PREFIX, b'd'],
+            ]
+            .concat();
             let mut router = router();
             let (actions, rest) = router.route(&input);
             assert_eq!(
                 actions,
                 vec![Action::Forward(b"a".to_vec()), Action::Open(panel)],
-                "key {:?}",
-                char::from(key)
+                "keys {:?}",
+                String::from_utf8_lossy(keys)
             );
             assert_eq!(rest, [b'x', DEFAULT_PREFIX, b'd']);
             assert_eq!(

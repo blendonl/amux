@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -66,6 +67,22 @@ impl Default for TreeSettings {
             collapsed_marker: "+ ".into(),
             leaf_marker: "  ".into(),
             detail_gap: "  ".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SearchSettings {
+    pub project_dirs: Vec<PathBuf>,
+    pub project_depth: u32,
+}
+
+impl Default for SearchSettings {
+    fn default() -> Self {
+        Self {
+            project_dirs: vec![PathBuf::from("~/projects"), PathBuf::from("~/Projects")],
+            project_depth: 1,
         }
     }
 }

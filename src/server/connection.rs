@@ -49,11 +49,11 @@ fn route_to(server: &Server, target: &Target, origin: Origin) -> Result<Route> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     Detached,
     Exited,
     Switch(Target),
+    Open(Route),
 }
 
 pub async fn handle(
@@ -292,6 +292,10 @@ async fn run_routes(
         };
         let target = match outcome {
             Outcome::Detached | Outcome::Exited => return Ok(()),
+            Outcome::Open(opened) => {
+                route = opened;
+                continue;
+            }
             Outcome::Switch(target) => target,
         };
         route = match route_to(server, &target, origin) {
@@ -300,6 +304,21 @@ async fn run_routes(
                 return send(&client.outgoing, ServerMessage::Error(format!("{err:#}"))).await
             }
         };
+    }
+}
+
+pub async fn open_or_refuse(
+    server: &Arc<Server>,
+    outgoing: &mpsc::Sender<ServerMessage>,
+    request: NewSession,
+    origin: Origin,
+) -> Result<Option<Outcome>> {
+    match new_session_route(server, request, origin).await {
+        Ok((route, _)) => Ok(Some(Outcome::Open(route))),
+        Err(err) => {
+            send(outgoing, ServerMessage::Error(format!("{err:#}"))).await?;
+            Ok(None)
+        }
     }
 }
 
@@ -433,6 +452,13 @@ async fn attach(
                 Some(ClientMessage::Switch(target)) => {
                     if let Some(outcome) =
                         switch_or_refuse(server, &client.outgoing, target, origin).await?
+                    {
+                        return Ok(outcome);
+                    }
+                }
+                Some(ClientMessage::NewSession(request)) => {
+                    if let Some(outcome) =
+                        open_or_refuse(server, &client.outgoing, request, origin).await?
                     {
                         return Ok(outcome);
                     }

@@ -35,6 +35,26 @@ pub(super) fn list(dir: &Path) -> Result<Vec<Worktree>> {
     Ok(worktrees)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchWorktree {
+    pub branch: String,
+    pub path: PathBuf,
+}
+
+pub fn branch_worktrees(checkout: &Path) -> Result<Vec<BranchWorktree>> {
+    Ok(list(checkout)?
+        .into_iter()
+        .filter_map(|worktree| {
+            let branch = worktree.branch_ref?.strip_prefix("refs/heads/")?.to_owned();
+            Some(BranchWorktree {
+                branch,
+                path: worktree.path,
+            })
+        })
+        .filter(|worktree| worktree.path.is_dir())
+        .collect())
+}
+
 pub fn default_branch(checkout: &Path) -> Result<String> {
     let remote_head = git::run(
         checkout,
@@ -379,6 +399,39 @@ mod tests {
             elsewhere
         );
         assert_eq!(list(&project.checkout).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn branch_worktrees_skip_detached_and_vanished_ones() {
+        let project = setup();
+        let feature = ensure_worktree(&project.checkout, "feature-x", &project.worktrees).unwrap();
+        let gone = ensure_worktree(&project.checkout, "gone", &project.worktrees).unwrap();
+        fs::remove_dir_all(&gone).unwrap();
+        let detached = project.fixture.path("detached");
+        git(
+            &project.checkout,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                path_str(&detached),
+            ],
+        );
+
+        assert_eq!(
+            branch_worktrees(&project.checkout).unwrap(),
+            [
+                BranchWorktree {
+                    branch: "main".into(),
+                    path: project.checkout.clone(),
+                },
+                BranchWorktree {
+                    branch: "feature-x".into(),
+                    path: feature,
+                },
+            ]
+        );
     }
 
     #[test]

@@ -1,4 +1,7 @@
+use std::path::PathBuf;
+
 use super::draw::Rect;
+use crate::client::search::{Candidate, Job};
 use crate::protocol::{ClientMessage, ServerView};
 use crate::settings::CallbackId;
 use crate::target::Target;
@@ -16,6 +19,8 @@ pub enum PanelEvent {
     Done(ClientMessage),
     Callback(CallbackId, String),
     Replace(Box<dyn Panel>, Vec<u8>),
+    Load(Job),
+    Open(PathBuf),
 }
 
 pub trait Panel {
@@ -32,6 +37,10 @@ pub trait Panel {
     fn hides_session(&self) -> bool;
 
     fn cluster_listed(&mut self, _servers: &[ServerView], _attached: &Target) -> PanelEvent {
+        PanelEvent::Unchanged
+    }
+
+    fn found(&mut self, _candidates: Result<Vec<Candidate>, String>) -> PanelEvent {
         PanelEvent::Unchanged
     }
 }

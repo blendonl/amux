@@ -10,6 +10,9 @@ pub const ROOT_TABLE: &str = "root";
 pub const PREFIX_TABLE: &str = "prefix";
 pub const PROMPT_TABLE: &str = "prompt";
 pub const TREE_TABLE: &str = "tree";
+pub const PICKER_TABLE: &str = "picker";
+pub const SEARCH_TABLE: &str = "search";
+const PANEL_TABLES: [&str; 3] = [PROMPT_TABLE, TREE_TABLE, PICKER_TABLE];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -28,6 +31,8 @@ pub enum Binding {
     RenameWindow,
     RenameSession,
     ClusterTree,
+    SearchProjects,
+    SearchWorktrees,
     SwitchTable(String),
     ReloadConfig,
     WhichKey(String),
@@ -53,6 +58,8 @@ impl Binding {
             Self::RenameWindow => "rename window".into(),
             Self::RenameSession => "rename session".into(),
             Self::ClusterTree => "cluster tree".into(),
+            Self::SearchProjects => "search projects".into(),
+            Self::SearchWorktrees => "search worktrees".into(),
             Self::SwitchTable(table) => table.clone(),
             Self::ReloadConfig => "reload config".into(),
             Self::WhichKey(table) => format!("show {table} keys"),
@@ -111,6 +118,18 @@ pub enum TreeAction {
     Expand,
     Pick,
     Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PickerAction {
+    Down,
+    Up,
+    Pick,
+    Cancel,
+    DeleteBackward,
+    DeleteWord,
+    DeleteLine,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +228,7 @@ pub struct Keymap {
     pub prefix: Table<Binding>,
     pub prompt: Table<PromptAction>,
     pub tree: Table<TreeAction>,
+    pub picker: Table<PickerAction>,
     pub custom: BTreeMap<String, Table<Binding>>,
 }
 
@@ -221,6 +241,49 @@ impl Keymap {
         }
     }
 
+    pub fn table_mut(&mut self, name: &str) -> Option<&mut Table<Binding>> {
+        match name {
+            ROOT_TABLE => Some(&mut self.root),
+            PREFIX_TABLE => Some(&mut self.prefix),
+            _ => self.custom.get_mut(name),
+        }
+    }
+
+    pub fn table_entry(&mut self, name: &str) -> &mut Table<Binding> {
+        match name {
+            ROOT_TABLE => &mut self.root,
+            PREFIX_TABLE => &mut self.prefix,
+            _ => self.custom.entry(name.to_owned()).or_default(),
+        }
+    }
+
+    pub fn submap<'a>(&'a self, table: &'a str, keys: &[Key]) -> Option<&'a str> {
+        keys.iter()
+            .try_fold(table, |name, key| submap_name(self.table(name)?.get(key)?))
+    }
+
+    pub fn open_submap(&mut self, table: &str, keys: &[Key]) -> Result<String, String> {
+        let mut name = table.to_owned();
+        for key in keys {
+            let bindings = self.table_entry(&name);
+            name = match bindings.get(key) {
+                None => {
+                    let created = format!("{name} {key}");
+                    bindings.insert(*key, Binding::SwitchTable(created.clone()));
+                    created
+                }
+                Some(binding) => submap_name(binding).map(str::to_owned).ok_or_else(|| {
+                    format!(
+                        "{key} in the {name} table is bound to {}, not to a submap",
+                        binding.description()
+                    )
+                })?,
+            };
+        }
+        self.table_entry(&name);
+        Ok(name)
+    }
+
     pub fn hint_for(&self, binding: &Binding, prefix: &Key) -> Option<String> {
         self.root.key_for(binding).map(Key::label).or_else(|| {
             self.prefix
@@ -230,6 +293,17 @@ impl Keymap {
     }
 }
 
+fn submap_name(binding: &Binding) -> Option<&str> {
+    match binding {
+        Binding::SwitchTable(name) if !is_panel_table(name) && name != ROOT_TABLE => Some(name),
+        _ => None,
+    }
+}
+
+pub fn is_panel_table(name: &str) -> bool {
+    PANEL_TABLES.contains(&name)
+}
+
 impl Default for Keymap {
     fn default() -> Self {
         Self {
@@ -237,9 +311,20 @@ impl Default for Keymap {
             prefix: prefix_table(),
             prompt: prompt_table(),
             tree: tree_table(),
-            custom: BTreeMap::new(),
+            picker: picker_table(),
+            custom: BTreeMap::from([(SEARCH_TABLE.to_owned(), search_table())]),
         }
     }
+}
+
+fn search_table() -> Table<Binding> {
+    [
+        (Key::char('p'), Binding::SearchProjects),
+        (Key::char('w'), Binding::SearchWorktrees),
+        (Key::char('s'), Binding::ClusterTree),
+    ]
+    .into_iter()
+    .collect()
 }
 
 fn prefix_table() -> Table<Binding> {
@@ -250,7 +335,10 @@ fn prefix_table() -> Table<Binding> {
         (Key::char('d'), Binding::Detach),
         (Key::char(','), Binding::RenameWindow),
         (Key::char('$'), Binding::RenameSession),
-        (Key::char('s'), Binding::ClusterTree),
+        (
+            Key::char('s'),
+            Binding::SwitchTable(SEARCH_TABLE.to_owned()),
+        ),
         (Key::char('c'), Binding::NewWindow),
         (Key::char('n'), Binding::NextWindow),
         (Key::char('p'), Binding::PreviousWindow),
@@ -294,6 +382,23 @@ fn prompt_table() -> Table<PromptAction> {
         (Key::ctrl('a'), PromptAction::CursorStart),
         (Key::from(KeyCode::End), PromptAction::CursorEnd),
         (Key::ctrl('e'), PromptAction::CursorEnd),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn picker_table() -> Table<PickerAction> {
+    [
+        (Key::from(KeyCode::Down), PickerAction::Down),
+        (Key::ctrl('n'), PickerAction::Down),
+        (Key::from(KeyCode::Up), PickerAction::Up),
+        (Key::ctrl('p'), PickerAction::Up),
+        (Key::from(KeyCode::Enter), PickerAction::Pick),
+        (Key::from(KeyCode::Escape), PickerAction::Cancel),
+        (Key::ctrl('c'), PickerAction::Cancel),
+        (Key::from(KeyCode::Backspace), PickerAction::DeleteBackward),
+        (Key::ctrl('w'), PickerAction::DeleteWord),
+        (Key::ctrl('u'), PickerAction::DeleteLine),
     ]
     .into_iter()
     .collect()
@@ -346,7 +451,7 @@ mod tests {
             ("d", Binding::Detach),
             (",", Binding::RenameWindow),
             ("$", Binding::RenameSession),
-            ("s", Binding::ClusterTree),
+            ("s", Binding::SwitchTable(SEARCH_TABLE.into())),
             ("c", Binding::NewWindow),
             ("n", Binding::NextWindow),
             ("p", Binding::PreviousWindow),
@@ -367,6 +472,76 @@ mod tests {
         assert_eq!(prefix.iter().count(), 28);
         assert_eq!(prefix.get(&key("C-b")), None);
         assert_eq!(Keymap::default().root, Table::default());
+    }
+
+    #[test]
+    fn the_default_search_submap_finds_projects_worktrees_and_sessions() {
+        let keymap = Keymap::default();
+        assert_eq!(keymap.submap(PREFIX_TABLE, &[key("s")]), Some(SEARCH_TABLE));
+        let search = &keymap.custom[SEARCH_TABLE];
+        assert_eq!(search.get(&key("p")), Some(&Binding::SearchProjects));
+        assert_eq!(search.get(&key("w")), Some(&Binding::SearchWorktrees));
+        assert_eq!(search.get(&key("s")), Some(&Binding::ClusterTree));
+        assert_eq!(search.iter().count(), 3);
+        assert_eq!(keymap.custom.len(), 1);
+    }
+
+    #[test]
+    fn a_sequence_walks_submaps_and_creates_the_missing_ones() {
+        let mut keymap = Keymap::default();
+        keymap
+            .prefix
+            .insert(key("g"), Binding::SwitchTable("git".into()));
+
+        assert_eq!(keymap.open_submap(PREFIX_TABLE, &[]).unwrap(), "prefix");
+        assert_eq!(
+            keymap.open_submap(PREFIX_TABLE, &[key("g")]).unwrap(),
+            "git"
+        );
+        assert_eq!(
+            keymap
+                .open_submap(PREFIX_TABLE, &[key("g"), key("l")])
+                .unwrap(),
+            "git l"
+        );
+        assert_eq!(
+            keymap.custom["git"].get(&key("l")),
+            Some(&Binding::SwitchTable("git l".into()))
+        );
+        assert_eq!(keymap.custom["git l"], Table::default());
+        assert_eq!(
+            keymap.open_submap(ROOT_TABLE, &[key("M-s")]).unwrap(),
+            "root M-s"
+        );
+
+        assert_eq!(
+            keymap.submap(PREFIX_TABLE, &[key("g"), key("l")]),
+            Some("git l")
+        );
+        assert_eq!(keymap.submap(PREFIX_TABLE, &[key("z")]), None);
+        assert_eq!(keymap.submap("nowhere", &[key("g")]), None);
+        assert_eq!(keymap.submap("nowhere", &[]), Some("nowhere"));
+    }
+
+    #[test]
+    fn a_sequence_never_walks_through_a_key_bound_to_something_else() {
+        let mut keymap = Keymap::default();
+        keymap
+            .prefix
+            .insert(key("t"), Binding::SwitchTable(TREE_TABLE.into()));
+        keymap
+            .prefix
+            .insert(key("R"), Binding::SwitchTable(ROOT_TABLE.into()));
+
+        assert_eq!(
+            keymap.open_submap(PREFIX_TABLE, &[key("d"), key("x")]),
+            Err("d in the prefix table is bound to detach, not to a submap".into())
+        );
+        assert!(keymap.open_submap(PREFIX_TABLE, &[key("t")]).is_err());
+        assert!(keymap.open_submap(PREFIX_TABLE, &[key("R")]).is_err());
+        assert_eq!(keymap.submap(PREFIX_TABLE, &[key("d")]), None);
+        assert_eq!(keymap.submap(PREFIX_TABLE, &[key("t")]), None);
+        assert_eq!(keymap.prefix.get(&key("d")), Some(&Binding::Detach));
     }
 
     #[test]

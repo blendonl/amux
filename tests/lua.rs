@@ -37,7 +37,7 @@ fn a_ctrl_a_prefix_opens_the_tree_and_detaches_while_ctrl_b_reaches_the_shell() 
     terminal.type_text("\x02");
     terminal.wait_for_text("^B");
 
-    terminal.type_text("\x01s");
+    terminal.type_text("\x01ss");
     terminal.wait_for_text("(this server)");
     terminal.type_text("q");
     terminal.wait_for("the tree to close", |contents| {

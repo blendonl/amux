@@ -9,6 +9,7 @@ use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize, Serializer};
 
 pub use decode::{Decoded, KeyDecoder};
+pub use notation::{parse_sequence, spell_sequence};
 pub use scan::Scanner;
 
 pub const ESC: u8 = 0x1b;
