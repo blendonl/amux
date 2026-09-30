@@ -253,6 +253,16 @@ Each slot under `amux.opt.theme` is a style: `fg`, `bg`, `bold`, `dim`, `italic`
 
 The pane border slots come from the server's config, since the host draws the borders. Everything else comes from the client's.
 
+## The Android keyboard
+
+`amux.opt.android.keyboard` is the landscape keyboard of the Android app, see [The landscape keyboard](../README.md#the-landscape-keyboard). The client and the server ignore it. The app reads it with `amux config keyboard`, which loads `init.lua` the way the client does, so `amux.process` is `"client"` there. Its keys are named the way `amux.keymap` names them (see [Keys](#keys)), without modifiers, and `false` stands for a key or row that shows the `base` layer's, since a Lua list can't hold `nil`.
+
+```lua
+local keyboard = amux.opt.android.keyboard
+keyboard.width.right = 30
+keyboard.layers.sym.right[4][5] = { key = "End", label = "end" }
+```
+
 ## Hooks
 
 `amux.on(event, fn)` runs `fn(event)` in the server when something happens there. The client accepts `amux.on` and never runs it. `event.event` is the event's name, and the other fields are:

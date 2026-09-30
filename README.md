@@ -241,6 +241,7 @@ amux.on("session_created", function(event) amux.log("new session " .. event.sess
 | `amux config defaults` | Prints every default as assignments to `amux.opt`, which works as a starting `init.lua`     |
 | `amux config path`     | Prints where your `init.lua` is or goes: the `--config` file, or the one in the config dir  |
 | `amux config reload`   | Makes the running server load its config again, and prints what happened                    |
+| `amux config keyboard` | Loads the config as the client and prints the Android app's landscape keyboard as JSON      |
 
 `name` defaults to the hostname and `projects_dir` to `~/projects`. A leading `~` in `projects_dir`, `worktrees_dir` and `search.project_dirs` means your home directory. Each entry under `servers` is a peer to link to. Each entry under `projects` is keyed by project name: `default_server` is where `amux new` puts that project's sessions when you don't pass `--on`, and `worktrees_dir` is where its worktrees go instead of the default `<checkout>/../<project>-worktrees`.
 
@@ -560,7 +561,7 @@ In portrait, a row of keys sits above the soft keyboard:
 | `←` `↓` `↑` `→` | The arrow keys                                                                                                               |
 | `Prefix`        | `Ctrl-b`, whatever `amux.opt.prefix` is set to                                                                               |
 
-In landscape, the soft keyboard stays hidden. The app's keyboard is split into two halves that each take the full height of the screen, with the terminal between them: left half, terminal, right half. Each half takes 25% of the screen's width, which [`keyboard.json`](#the-landscape-keyboard) can change. With a hardware keyboard attached, landscape works like portrait.
+In landscape, the soft keyboard stays hidden. The app's keyboard is split into two halves that each take the full height of the screen, with the terminal between them: left half, terminal, right half. Each half takes 25% of the screen's width, which [`amux.opt.android.keyboard`](#the-landscape-keyboard) can change. With a hardware keyboard attached, landscape works like portrait.
 
 - The keyboard is QWERTY split down the middle, with a number row on top and a thumb row at the bottom. The left half has `Esc`, `Tab`, `Ctrl` and `⇧` down its outer edge and `Prefix`, `Alt`, `nav`, `sym` and `Space` along the bottom. The right half has `⌫`, `'`, `⏎` and `⇧` down its outer edge and `Space`, `sym`, `nav`, `Ctrl` and `Alt` along the bottom.
 - `sym` is a layer of symbols. `nav` is a layer with `F1` to `F12`, `Home`, `End`, `PgUp` and `PgDn`, the arrows on the `h` `j` `k` `l` keys, `Ins`, `Del`, `Paste` and `Hide`. A layer keeps the base layer's keys where it has none of its own, so the modifiers and layer keys stay in place.
@@ -578,12 +579,15 @@ In both:
 
 #### The landscape keyboard
 
-The landscape keyboard reads `$filesDir/config/amux/keyboard.json`, next to `init.lua`, which a pane sees as `$XDG_CONFIG_HOME/amux/keyboard.json`. The app doesn't create the file, and the file only holds what it changes: everything it leaves out keeps the built-in layout, [`android/app/src/main/res/raw/keyboard.json`](android/app/src/main/res/raw/keyboard.json). The app loads the file again whenever it is saved, and also when the app comes back to the front or the phone turns. A file with a mistake shows a message that names the setting, such as `width.left should be between 5 and 45 percent of the screen`, and the keyboard keeps the built-in layout until the file is fixed.
+The landscape keyboard is `amux.opt.android.keyboard` in `init.lua`, next to the rest of the [config](#config). Only the app reads it. The app runs `amux config keyboard`, which loads `init.lua` as the client does and prints the keyboard as JSON, when it attaches, whenever `init.lua` is saved, when the app comes back to the front and when the phone turns. `amux config defaults` prints the built-in layout, a good start for your own.
+
+A mistake in the keyboard is a config error like any other: `amux config check` names it on any machine, and it stops `amux` and the server. When the config doesn't load, the app shows the error, such as `init.lua: amux.opt.android.keyboard.width.left must be between 5 and 45 percent of the screen, not 60`, and keeps the keyboard it had, or the built-in one when it has none yet.
 
 To give each half 30% of the screen:
 
-```json
-{ "width": { "left": 30, "right": 30 } }
+```lua
+amux.opt.android.keyboard.width.left = 30
+amux.opt.android.keyboard.width.right = 30
 ```
 
 | Setting                                     | Is                                                                                                                                                                                    |
@@ -591,56 +595,46 @@ To give each half 30% of the screen:
 | `width.left`, `width.right`                 | Each half's share of the screen's width, in percent, from 5 to 45. The terminal gets the rest                                                                                         |
 | `layers.<name>.left`, `layers.<name>.right` | One half of a layer, as a list of rows from top to bottom. A row is a list of keys from left to right. The rows share the half's height equally, and the keys share their row's width |
 
-A layer in the file replaces the halves it names and keeps the other one. A name the built-in layout doesn't have adds a layer, which needs both halves, and `"sym": null` removes a layer. The keyboard starts on the `base` layer, which every layout needs.
+`layers` works like `amux.opt.servers`: setting one layer, one half or one row keeps everything else, as `amux.opt.android.keyboard.layers.nav.right[1] = { … }` does. A new name adds a layer, which needs both halves, `amux.opt.android.keyboard.layers.sym = nil` removes one, and setting all of `layers` replaces every layer. The keyboard starts on the `base` layer, which every layout needs. Rows and keys count from 1, as Lua does, so an error names a key as `layers.base.left[2][3]`.
 
 A key is one of these:
 
-| Key                                                                                                                                                                 | Does                                                                                                        |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| One character, such as `"q"`, `"{"` or `"é"`                                                                                                                        | Types it, and with `⇧` its US-keyboard shifted form or its capital                                          |
-| `"esc"`, `"tab"`, `"enter"`, `"bksp"`, `"del"`, `"ins"`, `"home"`, `"end"`, `"pgup"`, `"pgdn"`, `"up"`, `"down"`, `"left"`, `"right"`, `"f1"` to `"f12"`, `"space"` | That key                                                                                                    |
-| `"ctrl"`, `"alt"`, `"shift"`                                                                                                                                        | That modifier                                                                                               |
-| `"layer:<name>"`                                                                                                                                                    | That layer, shown with the layer's name                                                                     |
-| `"prefix"`                                                                                                                                                          | Sends `Ctrl-b`                                                                                              |
-| `"paste"`, `"hide"`                                                                                                                                                 | Pastes the clipboard, or hides the keyboard                                                                 |
-| `""`                                                                                                                                                                | Nothing: an empty gap                                                                                       |
-| `null`                                                                                                                                                              | The key at the same place in the `base` layer. The `base` layer can't use it. A whole row can be `null` too |
-| An object                                                                                                                                                           | A key with more settings                                                                                    |
+| Key                                                                                                                                                                                                                                                | Does                                                                                                         |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| One character, such as `"q"`, `"{"` or `"é"`                                                                                                                                                                                                       | Types it, and with `Shift` its US-keyboard shifted form or its capital                                       |
+| A key named as [`amux.keymap`](docs/lua.md#keys) names it: `"Escape"`, `"Tab"`, `"Enter"`, `"Backspace"`, `"Delete"`, `"Insert"`, `"Home"`, `"End"`, `"PageUp"`, `"PageDown"`, `"Up"`, `"Down"`, `"Left"`, `"Right"`, `"F1"` to `"F12"`, `"Space"` | That key. tmux's spellings such as `"Esc"`, `"BSpace"` and `"PgUp"` work too, in any case                    |
+| `"Ctrl"`, `"Alt"`, `"Shift"`                                                                                                                                                                                                                       | That modifier                                                                                                |
+| `"layer:<name>"`                                                                                                                                                                                                                                   | That layer, shown with the layer's name                                                                      |
+| `"Prefix"`                                                                                                                                                                                                                                         | Sends `Ctrl-b`                                                                                               |
+| `"Paste"`, `"Hide"`                                                                                                                                                                                                                                | Pastes the clipboard, or hides the keyboard                                                                  |
+| `""`                                                                                                                                                                                                                                               | Nothing: an empty gap                                                                                        |
+| `false`                                                                                                                                                                                                                                            | The key at the same place in the `base` layer. The `base` layer can't use it. A whole row can be `false` too |
+| A table                                                                                                                                                                                                                                            | A key with more settings                                                                                     |
 
-An object has exactly one of `key`, `text` and `send`, and any of the others:
+A key with modifiers, such as `"C-c"`, is an error: use `Ctrl`, or a `send` key.
 
-| Field    | Is                                                                                                                                  |
-| -------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `key`    | A key as in the table above                                                                                                         |
-| `text`   | Text the key types, such as `"git status\r"`. `Ctrl` and `Alt` apply to each of its characters                                      |
-| `send`   | Characters the key sends to the terminal as they are, without modifiers, such as `"\u0002c"` for `Ctrl-b c`. It shows them as `^Bc` |
-| `label`  | What the key shows instead                                                                                                          |
-| `shift`  | What the key types with `⇧`                                                                                                         |
-| `width`  | The key's share of its row, 1 unless set. `"space"` is 2 wide in the built-in layout                                                |
-| `repeat` | `true` to repeat the key while it is held                                                                                           |
+A table has exactly one of `key`, `text` and `send`, and any of the others:
 
-This file keeps the built-in keyboard but puts amux's window keys on the top row of `nav`'s right half:
+| Field     | Is                                                                                                                              |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `key`     | A key as in the table above                                                                                                     |
+| `text`    | Text the key types, such as `"git status\r"`. `Ctrl` and `Alt` apply to each of its characters                                  |
+| `send`    | Characters the key sends to the terminal as they are, without modifiers, such as `"\2c"` for `Ctrl-b c`. It shows them as `^Bc` |
+| `label`   | What the key shows instead                                                                                                      |
+| `shift`   | What the key types with `Shift`                                                                                                 |
+| `width`   | The key's share of its row, 1 unless set. `"Space"` is 2 wide in the built-in layout                                            |
+| `repeats` | `true` to repeat the key while it is held                                                                                       |
 
-```json
-{
-  "layers": {
-    "nav": {
-      "right": [
-        [
-          { "send": "\u0002c", "label": "new" },
-          { "send": "\u0002p", "label": "prev" },
-          { "send": "\u0002n", "label": "next" },
-          { "send": "\u0002%", "label": "split" },
-          "",
-          null
-        ],
-        ["home", "pgdn", "pgup", "end", "", null],
-        ["left", "down", "up", "right", "del", null],
-        ["paste", "hide", "", "", "", null],
-        null
-      ]
-    }
-  }
+This keeps the built-in keyboard but puts amux's window keys on the top row of `nav`'s right half:
+
+```lua
+amux.opt.android.keyboard.layers.nav.right[1] = {
+  { send = "\2c", label = "new" },
+  { send = "\2p", label = "prev" },
+  { send = "\2n", label = "next" },
+  { send = "\2%", label = "split" },
+  "",
+  false,
 }
 ```
 
@@ -794,7 +788,7 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 | `src/lib.rs`                  | The library the binary and the tests share                                                                         |
 | `src/cli.rs`                  | Command-line interface                                                                                             |
 | `src/paths.rs`                | Runtime, config and state paths, and the `init.lua` lookup order                                                   |
-| `src/config/`                 | `amux config check`, `defaults` and `path`, and the checked, atomic rewrites of `servers.lua`                      |
+| `src/config/`                 | `amux config check`, `defaults`, `path` and `keyboard`, and the checked, atomic rewrites of `servers.lua`          |
 | `src/identity.rs`             | Server ID, incarnation and hostname                                                                                |
 | `src/settings/`               | Every setting with its built-in default, as one `Settings` tree                                                    |
 | `src/lua/`                    | The Lua runtime: the strict `amux.opt`, the `amux` API, data files like `servers.lua` and the Lua writer           |
