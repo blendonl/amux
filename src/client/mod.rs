@@ -9,6 +9,7 @@ mod tree;
 
 use std::env;
 use std::fs::OpenOptions;
+use std::net::IpAddr;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -24,6 +25,7 @@ use tokio::sync::mpsc;
 use crate::cli::{Grouping, NewArgs, PairArgs};
 use crate::cluster::{Address, LAN_PORT_FILE};
 use crate::config;
+use crate::discovery::lan;
 use crate::lua::{self, ConfigPaths, LuaScripting, Process};
 use crate::paths;
 use crate::project::{self, Detected};
@@ -341,10 +343,21 @@ pub async fn pair(endpoint: &Endpoint, args: PairArgs) -> Result<()> {
             Some(ServerMessage::PairingOpen {
                 code,
                 expires_in_secs,
-            }) => print!(
-                "{}",
-                listing::pairing_instructions(&code, expires_in_secs, lan_port(endpoint))
-            ),
+            }) => {
+                let addresses: Vec<IpAddr> = lan::lan_interfaces()
+                    .iter()
+                    .map(|interface| interface.ip())
+                    .collect();
+                print!(
+                    "{}",
+                    listing::pairing_instructions(
+                        &code,
+                        expires_in_secs,
+                        &addresses,
+                        lan_port(endpoint)
+                    )
+                )
+            }
             Some(ServerMessage::PairingAttemptFailed {
                 reason,
                 attempts_left,

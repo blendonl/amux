@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
+use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
 
 use crate::project::ProjectId;
@@ -289,18 +290,44 @@ fn discovery_status(peer: &DiscoveryView) -> String {
 pub const PAIRING_WARNING: &str = "pairing merges this machine's cluster with the other \
     machine's, and gives each machine full access to the other, like ssh as this user";
 
-pub fn pairing_instructions(code: &str, expires_in_secs: u64, port: Option<u16>) -> String {
-    let address = match port {
-        Some(port) => format!("<this machine's address>:{port}"),
-        None => "<this machine's address>:<port>".to_owned(),
+pub fn pairing_instructions(
+    code: &str,
+    expires_in_secs: u64,
+    addresses: &[IpAddr],
+    port: Option<u16>,
+) -> String {
+    let port = port.map_or_else(|| "<port>".to_owned(), |port| port.to_string());
+    let hosts: Vec<String> = match host_addresses(addresses).as_slice() {
+        [] => vec![format!("<this machine's address>:{port}")],
+        ips => ips
+            .iter()
+            .map(|ip| match ip {
+                IpAddr::V4(ip) => format!("{ip}:{port}"),
+                IpAddr::V6(ip) => format!("[{ip}]:{port}"),
+            })
+            .collect(),
     };
+    let choice = if hosts.len() == 1 { "" } else { ", one of" };
+    let mut fallbacks = String::new();
+    for host in &hosts {
+        let _ = writeln!(fallbacks, "  amux pair {code} --host {host}");
+    }
     format!(
         "pairing code {code}, valid for {} and one use\n\
          run this on the other machine:\n  amux pair {code}\n\
-         or, where multicast does not reach it:\n  amux pair {code} --host {address}\n\
+         or, where multicast does not reach it{choice}:\n{fallbacks}\
          waiting for the other machine...\n",
         duration(expires_in_secs)
     )
+}
+
+fn host_addresses(addresses: &[IpAddr]) -> Vec<IpAddr> {
+    let (v4, v6): (Vec<IpAddr>, Vec<IpAddr>) = addresses.iter().partition(|ip| ip.is_ipv4());
+    if v4.is_empty() {
+        v6
+    } else {
+        v4
+    }
 }
 
 pub fn pairing_step(elapsed: Duration, step: &str) -> String {
@@ -773,19 +800,22 @@ lan       mDNS failed: no multicast
 
     #[test]
     fn pairing_instructions_show_the_code_and_the_fallback_address() {
+        let wifi: IpAddr = "192.168.1.23".parse().unwrap();
         assert_eq!(
-            pairing_instructions("k7-4821-9930", 300, Some(40123)),
+            pairing_instructions("k7-4821-9930", 300, &[wifi], Some(40123)),
             "\
 pairing code k7-4821-9930, valid for 5 minutes and one use
 run this on the other machine:
   amux pair k7-4821-9930
 or, where multicast does not reach it:
-  amux pair k7-4821-9930 --host <this machine's address>:40123
+  amux pair k7-4821-9930 --host 192.168.1.23:40123
 waiting for the other machine...
 "
         );
-        assert!(pairing_instructions("k7-4821-9930", 300, None)
-            .contains("--host <this machine's address>:<port>\n"));
+        assert!(pairing_instructions("k7-4821-9930", 300, &[wifi], None)
+            .contains("--host 192.168.1.23:<port>\n"));
+        assert!(pairing_instructions("k7-4821-9930", 300, &[], Some(40123))
+            .contains("--host <this machine's address>:40123\n"));
         assert_eq!(
             pairing_attempt("a wrong code was tried", 2),
             "a wrong code was tried, 2 attempts left"
@@ -793,6 +823,27 @@ waiting for the other machine...
         assert_eq!(
             pairing_attempt("a wrong code was tried", 1),
             "a wrong code was tried, 1 attempt left"
+        );
+    }
+
+    #[test]
+    fn pairing_instructions_offer_every_ipv4_address_and_ipv6_only_without_one() {
+        let addresses: Vec<IpAddr> = ["192.168.1.23", "2001:db8::7", "100.86.12.3"]
+            .iter()
+            .map(|ip| ip.parse().unwrap())
+            .collect();
+        assert!(
+            pairing_instructions("k7-4821-9930", 300, &addresses, Some(40123)).contains(
+                "\
+or, where multicast does not reach it, one of:
+  amux pair k7-4821-9930 --host 192.168.1.23:40123
+  amux pair k7-4821-9930 --host 100.86.12.3:40123
+waiting"
+            )
+        );
+        assert!(
+            pairing_instructions("k7-4821-9930", 300, &addresses[1..2], Some(40123))
+                .contains("  amux pair k7-4821-9930 --host [2001:db8::7]:40123\n")
         );
     }
 
