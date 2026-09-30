@@ -18,21 +18,27 @@ import com.termux.terminal.TerminalEmulator
 import com.termux.terminal.TerminalSession
 import com.termux.view.TerminalView
 import io.github.blendonl.amux.keyboard.ConfigFileWatcher
-import io.github.blendonl.amux.keyboard.KeyboardConfigFile
 import io.github.blendonl.amux.keyboard.KeyboardHalfView
-import io.github.blendonl.amux.keyboard.KeyboardLayoutParser
+import io.github.blendonl.amux.keyboard.KeyboardLayout
+import io.github.blendonl.amux.keyboard.KeyboardLoader
 import io.github.blendonl.amux.keyboard.Side
 import io.github.blendonl.amux.keyboard.SplitKeyboard
 import io.github.blendonl.amux.keyboard.TerminalKeySink
-import java.io.File
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.time.Duration.Companion.seconds
 
 class MainActivity : Activity() {
     private lateinit var terminalView: TerminalView
     private lateinit var extraKeys: ExtraKeys
     private lateinit var input: InputPanels
     private lateinit var splitKeyboard: SplitKeyboard
-    private var keyboardConfig: KeyboardConfigFile? = null
+    private var keyboardLoader: KeyboardLoader? = null
     private var keyboardWatcher: ConfigFileWatcher? = null
+    private val keyboardLoads = Executors.newSingleThreadExecutor()
+    private val keyboardLoadQueued = AtomicBoolean(false)
+    private var keyboardLoaded = false
+    private var keyboardProblem: String? = null
     private lateinit var status: StatusPanel
     private lateinit var sessionCallbacks: TerminalSessionCallbacks
     private var session: TerminalSession? = null
@@ -92,6 +98,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         keyboardWatcher?.stop()
+        keyboardLoads.shutdownNow()
         service?.stopObserving(serverObserver)
         if (bound) unbindService(connection)
         session?.finishIfRunning()
@@ -104,28 +111,45 @@ class MainActivity : Activity() {
         val rightHalf = findViewById<KeyboardHalfView>(R.id.keyboard_right)
         input = InputPanels(window, terminalView, findViewById(R.id.terminal_pane), extraKeys, leftHalf, rightHalf)
         val sink = TerminalKeySink(terminalView, getSystemService(ClipboardManager::class.java), input::hideSplitKeyboard)
-        splitKeyboard = SplitKeyboard(KeyboardLayoutParser.parse(defaultKeyboardLayout()), sink)
+        splitKeyboard = SplitKeyboard(KeyboardLayout.BLANK, sink)
         leftHalf.attach(splitKeyboard, Side.LEFT)
         rightHalf.attach(splitKeyboard, Side.RIGHT)
         input.resize(splitKeyboard.layout)
         input.configure(resources.configuration)
     }
 
-    private fun watchKeyboardConfig(file: File) {
-        if (keyboardConfig != null) return
-        keyboardConfig = KeyboardConfigFile(defaultKeyboardLayout(), file)
-        keyboardWatcher = ConfigFileWatcher(file, ::reloadKeyboard).also(ConfigFileWatcher::start)
+    private fun loadKeyboardFrom(amux: AmuxEnvironment) {
+        if (keyboardLoader != null) return
+        val commands = AmuxCommands(amux)
+        keyboardLoader = KeyboardLoader { defaults -> commands.printKeyboard(defaults, KEYBOARD_TIMEOUT) }
+        keyboardWatcher = ConfigFileWatcher(amux.initFile, ::reloadKeyboard).also(ConfigFileWatcher::start)
         reloadKeyboard()
     }
 
     private fun reloadKeyboard() {
-        val config = keyboardConfig ?: return
-        val loaded = config.loadIfChanged() ?: return
-        splitKeyboard.layout = loaded.layout
-        input.resize(loaded.layout)
-        loaded.problem?.let { problem ->
-            Toast.makeText(this, getString(R.string.keyboard_config_failed, config.file.name, problem), Toast.LENGTH_LONG).show()
+        val loader = keyboardLoader ?: return
+        if (!keyboardLoadQueued.compareAndSet(false, true)) return
+        val keepCurrentOnFailure = keyboardLoaded
+        keyboardLoads.execute {
+            keyboardLoadQueued.set(false)
+            val loaded = loader.load(keepCurrentOnFailure)
+            runOnUiThread { if (!isDestroyed) applyKeyboard(loaded) }
         }
+    }
+
+    private fun applyKeyboard(loaded: KeyboardLoader.Loaded) {
+        loaded.layout?.let { layout ->
+            keyboardLoaded = true
+            if (layout != splitKeyboard.layout) {
+                splitKeyboard.layout = layout
+                input.resize(layout)
+            }
+        }
+        val problem = loaded.problem
+        if (problem != null && problem != keyboardProblem) {
+            Toast.makeText(this, getString(R.string.keyboard_config_failed, problem), Toast.LENGTH_LONG).show()
+        }
+        keyboardProblem = problem
     }
 
     private fun bind() {
@@ -169,7 +193,7 @@ class MainActivity : Activity() {
 
     private fun attach(amux: AmuxEnvironment) {
         attachWhenReady = false
-        watchKeyboardConfig(amux.keyboardFile)
+        loadKeyboardFrom(amux)
         val client = TerminalSession(
             amux.binary.path,
             amux.home.path,
@@ -247,5 +271,6 @@ class MainActivity : Activity() {
     private companion object {
         const val CLIENT_ARGV0 = "amux"
         const val NOTIFICATION_PERMISSION_REQUEST = 1
+        val KEYBOARD_TIMEOUT = 10.seconds
     }
 }

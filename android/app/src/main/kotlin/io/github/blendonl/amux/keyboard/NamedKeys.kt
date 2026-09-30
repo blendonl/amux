@@ -13,36 +13,36 @@ object NamedKeys {
             .toMap()
 
     private val NAMED: Map<String, Key> = buildMap {
-        put("esc", press(KeyEvent.KEYCODE_ESCAPE, "Esc"))
-        put("tab", press(KeyEvent.KEYCODE_TAB, "Tab"))
-        put("enter", press(KeyEvent.KEYCODE_ENTER, "⏎"))
-        put("bksp", press(KeyEvent.KEYCODE_DEL, "⌫", repeats = true))
-        put("del", press(KeyEvent.KEYCODE_FORWARD_DEL, "Del", repeats = true))
-        put("ins", press(KeyEvent.KEYCODE_INSERT, "Ins"))
-        put("home", press(KeyEvent.KEYCODE_MOVE_HOME, "Home"))
-        put("end", press(KeyEvent.KEYCODE_MOVE_END, "End"))
-        put("pgup", press(KeyEvent.KEYCODE_PAGE_UP, "PgUp", repeats = true))
-        put("pgdn", press(KeyEvent.KEYCODE_PAGE_DOWN, "PgDn", repeats = true))
-        put("up", press(KeyEvent.KEYCODE_DPAD_UP, "↑", repeats = true))
-        put("down", press(KeyEvent.KEYCODE_DPAD_DOWN, "↓", repeats = true))
-        put("left", press(KeyEvent.KEYCODE_DPAD_LEFT, "←", repeats = true))
-        put("right", press(KeyEvent.KEYCODE_DPAD_RIGHT, "→", repeats = true))
+        put("Escape", press(KeyEvent.KEYCODE_ESCAPE, "Esc"))
+        put("Tab", press(KeyEvent.KEYCODE_TAB, "Tab"))
+        put("Enter", press(KeyEvent.KEYCODE_ENTER, "⏎"))
+        put("Backspace", press(KeyEvent.KEYCODE_DEL, "⌫", repeats = true))
+        put("Delete", press(KeyEvent.KEYCODE_FORWARD_DEL, "Del", repeats = true))
+        put("Insert", press(KeyEvent.KEYCODE_INSERT, "Ins"))
+        put("Home", press(KeyEvent.KEYCODE_MOVE_HOME, "Home"))
+        put("End", press(KeyEvent.KEYCODE_MOVE_END, "End"))
+        put("PageUp", press(KeyEvent.KEYCODE_PAGE_UP, "PgUp", repeats = true))
+        put("PageDown", press(KeyEvent.KEYCODE_PAGE_DOWN, "PgDn", repeats = true))
+        put("Up", press(KeyEvent.KEYCODE_DPAD_UP, "↑", repeats = true))
+        put("Down", press(KeyEvent.KEYCODE_DPAD_DOWN, "↓", repeats = true))
+        put("Left", press(KeyEvent.KEYCODE_DPAD_LEFT, "←", repeats = true))
+        put("Right", press(KeyEvent.KEYCODE_DPAD_RIGHT, "→", repeats = true))
         for (number in 1..FUNCTION_KEYS) {
-            put("f$number", press(KeyEvent.KEYCODE_F1 + number - 1, "F$number"))
+            put("F$number", press(KeyEvent.KEYCODE_F1 + number - 1, "F$number"))
         }
-        put("space", Key(KeyAction.Type(" "), "Space"))
-        put("ctrl", Key(KeyAction.Modify(Modifier.CTRL), "Ctrl"))
-        put("alt", Key(KeyAction.Modify(Modifier.ALT), "Alt"))
-        put("shift", Key(KeyAction.Modify(Modifier.SHIFT), "⇧"))
-        put("prefix", Key(KeyAction.Send(AMUX_PREFIX), "Prefix"))
-        put("paste", Key(KeyAction.Paste, "Paste"))
-        put("hide", Key(KeyAction.Hide, "Hide"))
+        put("Space", Key(KeyAction.Type(" "), "Space"))
+        put("Ctrl", Key(KeyAction.Modify(Modifier.CTRL), "Ctrl"))
+        put("Alt", Key(KeyAction.Modify(Modifier.ALT), "Alt"))
+        put("Shift", Key(KeyAction.Modify(Modifier.SHIFT), "⇧"))
+        put("Prefix", Key(KeyAction.Send(AMUX_PREFIX), "Prefix"))
+        put("Paste", Key(KeyAction.Paste, "Paste"))
+        put("Hide", Key(KeyAction.Hide, "Hide"))
     }
 
     fun lookup(name: String): Key? = when {
         name.codePointCount(0, name.length) == 1 -> typing(name)
         name.startsWith(LAYER_PREFIX) && name.length > LAYER_PREFIX.length -> layer(name.removePrefix(LAYER_PREFIX))
-        else -> NAMED[name.lowercase()]
+        else -> NAMED[name]
     }
 
     fun typing(text: String): Key {

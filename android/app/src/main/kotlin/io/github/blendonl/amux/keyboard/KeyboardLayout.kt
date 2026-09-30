@@ -24,5 +24,12 @@ data class KeyboardLayout(val leftPercent: Float, val rightPercent: Float, val l
 
     companion object {
         const val BASE = "base"
+        private const val PLACEHOLDER_PERCENT = 25f
+
+        val BLANK = KeyboardLayout(
+            PLACEHOLDER_PERCENT,
+            PLACEHOLDER_PERCENT,
+            mapOf(BASE to Layer(BASE, listOf(listOf(Key.BLANK)), listOf(listOf(Key.BLANK)))),
+        )
     }
 }
