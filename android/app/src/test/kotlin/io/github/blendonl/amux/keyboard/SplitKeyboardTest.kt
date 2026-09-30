@@ -23,11 +23,11 @@ class SplitKeyboardTest {
         }
 
         override fun paste() {
-            events += "paste"
+            events += "Paste"
         }
 
         override fun hide() {
-            events += "hide"
+            events += "Hide"
         }
 
         private fun modifiers(ctrl: Boolean, alt: Boolean, shift: Boolean) =
@@ -38,9 +38,9 @@ class SplitKeyboardTest {
     private val tabCode = "#${KeyEvent.KEYCODE_TAB}"
     private val leftCode = "#${KeyEvent.KEYCODE_DPAD_LEFT}"
     private val homeCode = "#${KeyEvent.KEYCODE_MOVE_HOME}"
-    private val ctrl = NamedKeys.lookup("ctrl")!!
-    private val alt = NamedKeys.lookup("alt")!!
-    private val shift = NamedKeys.lookup("shift")!!
+    private val ctrl = NamedKeys.lookup("Ctrl")!!
+    private val alt = NamedKeys.lookup("Alt")!!
+    private val shift = NamedKeys.lookup("Shift")!!
     private val sym = NamedKeys.layer("sym")
     private val nav = NamedKeys.layer("nav")
 
@@ -50,9 +50,9 @@ class SplitKeyboardTest {
         leftPercent = 25f,
         rightPercent = 30f,
         layers = mapOf(
-            "base" to Layer("base", listOf(listOf(key("a"), key("1"), key("tab"))), listOf(listOf(ctrl, alt, shift, sym, nav))),
-            "sym" to Layer("sym", listOf(listOf(key("!"), key("{"), key("tab"))), listOf(listOf(ctrl, alt, shift, sym, nav))),
-            "nav" to Layer("nav", listOf(listOf(key("left"), key("home"), key("tab"))), listOf(listOf(ctrl, alt, shift, sym, nav))),
+            "base" to Layer("base", listOf(listOf(key("a"), key("1"), key("Tab"))), listOf(listOf(ctrl, alt, shift, sym, nav))),
+            "sym" to Layer("sym", listOf(listOf(key("!"), key("{"), key("Tab"))), listOf(listOf(ctrl, alt, shift, sym, nav))),
+            "nav" to Layer("nav", listOf(listOf(key("Left"), key("Home"), key("Tab"))), listOf(listOf(ctrl, alt, shift, sym, nav))),
         ),
     )
     private val keyboard = SplitKeyboard(layout, sink)
@@ -198,11 +198,11 @@ class SplitKeyboardTest {
 
     @Test
     fun `send, paste and hide reach the sink`() {
-        tap(key("prefix"))
-        tap(key("paste"))
-        tap(key("hide"))
+        tap(key("Prefix"))
+        tap(key("Paste"))
+        tap(key("Hide"))
 
-        assertEquals(listOf("send:\u0002", "paste", "hide"), sink.events)
+        assertEquals(listOf("send:\u0002", "Paste", "Hide"), sink.events)
     }
 
     @Test
@@ -216,7 +216,7 @@ class SplitKeyboardTest {
 
     @Test
     fun `repeats emit the key again without latching`() {
-        val left = key("left")
+        val left = key("Left")
         keyboard.press(left)
         keyboard.repeat(left)
         keyboard.repeat(shift)

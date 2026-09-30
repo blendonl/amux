@@ -32,8 +32,6 @@ fun Context.userlandInstaller(): UserlandInstaller =
 
 fun Context.zshrcTemplate(): String = assets.open(ZSHRC_ASSET).use { it.readBytes().decodeToString() }
 
-fun Context.defaultKeyboardLayout(): String = resources.openRawResource(R.raw.keyboard).use { it.readBytes().decodeToString() }
-
 fun Context.serverName(): String =
     ServerName.choose(Settings.Global.getString(contentResolver, Settings.Global.DEVICE_NAME), Build.MODEL)
 

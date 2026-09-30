@@ -6,7 +6,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DefaultLayoutTest {
-    private val layout = KeyboardLayoutParser.parse(File("src/main/res/raw/keyboard.json").readText())
+    private val layout = KeyboardLayoutParser.parse(File("src/test/resources/keyboard/default.json").readText())
 
     private fun widths(rows: KeyRows) = rows.map { row -> row.sumOf { it.width.toDouble() } }
 

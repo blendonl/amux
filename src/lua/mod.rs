@@ -6,7 +6,7 @@ mod opt;
 mod runtime;
 mod server;
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,7 @@ use mlua::{
     VmState,
 };
 use serde::de::DeserializeOwned;
+use serde_path_to_error::Segment;
 
 pub use api::{Callbacks, Hooks, EVENTS};
 pub use client::LuaScripting;
@@ -146,14 +147,52 @@ fn from_lua<T: DeserializeOwned>(value: Value) -> Result<T, Invalid> {
     let options = DeserializeOptions::new().sort_keys(true);
     let deserializer = mlua::serde::Deserializer::new_with_options(value, options);
     serde_path_to_error::deserialize(deserializer).map_err(|error| Invalid {
-        path: error.path().to_string(),
+        path: lua_path(error.path()),
         message: describe(error.inner()),
     })
+}
+
+fn lua_path(path: &serde_path_to_error::Path) -> String {
+    let mut shown = String::new();
+    for segment in path.iter() {
+        let name = match segment {
+            Segment::Seq { index } => {
+                let _ = write!(shown, "[{}]", index + 1);
+                continue;
+            }
+            Segment::Map { key } => key.as_str(),
+            Segment::Enum { variant } => variant.as_str(),
+            Segment::Unknown => "?",
+        };
+        if !shown.is_empty() {
+            shown.push('.');
+        }
+        shown.push_str(name);
+    }
+    if shown.is_empty() {
+        shown.push('.');
+    }
+    shown
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_paths_count_list_items_from_one_as_lua_does() {
+        let lua = Lua::new();
+        let value = lua
+            .load("{ rows = { { 1, 2 }, { 3, 'x' } } }")
+            .eval::<Value>()
+            .unwrap();
+        let invalid =
+            from_lua::<std::collections::BTreeMap<String, Vec<Vec<u8>>>>(value).unwrap_err();
+        assert_eq!(invalid.path, "rows[2][2]");
+
+        let whole = from_lua::<u8>(Value::Boolean(true)).unwrap_err();
+        assert_eq!(whole.path, ".");
+    }
 
     #[test]
     fn a_shortened_source_gets_its_full_path_back() {

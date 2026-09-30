@@ -30,6 +30,15 @@ pub fn path(given: Option<&Path>) -> Result<PathBuf> {
     paths::user_init(given)
 }
 
+pub fn keyboard(given: Option<&Path>) -> Result<String> {
+    let paths = paths::config_paths(given)?;
+    let keyboard = lua::load(&paths, Process::Client)?
+        .settings
+        .android
+        .keyboard;
+    Ok(serde_json::to_string(&keyboard.resolved())?)
+}
+
 fn report(paths: &ConfigPaths) -> String {
     let init = paths
         .init
@@ -135,6 +144,43 @@ mod tests {
         let missing = dir.path().join("missing.lua");
         let error = check(Some(&missing)).unwrap_err().to_string();
         assert!(error.starts_with("reading "), "{error}");
+    }
+
+    #[test]
+    fn keyboard_prints_the_resolved_keyboard_as_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = dir.path().join(INIT_FILE);
+        fs::write(
+            &init,
+            "amux.opt.android.keyboard.width.left = 30\n\
+             amux.opt.android.keyboard.layers.nav.right[1][1] = { send = '\\2c', label = 'new' }",
+        )
+        .unwrap();
+        let printed: serde_json::Value =
+            serde_json::from_str(&keyboard(Some(&init)).unwrap()).unwrap();
+        assert_eq!(
+            printed["width"],
+            serde_json::json!({ "left": 30.0, "right": 25.0 })
+        );
+        assert_eq!(
+            printed["layers"]["nav"]["right"][0][0],
+            serde_json::json!({ "send": "\u{2}c", "label": "new" })
+        );
+        assert_eq!(printed["layers"]["nav"]["right"][0][5], "Backspace");
+        assert_eq!(
+            printed["layers"]["sym"]["left"][4][4],
+            serde_json::json!({ "key": "Space", "width": 2.0 })
+        );
+
+        let defaults = keyboard(Some(Path::new("/dev/null"))).unwrap();
+        assert_eq!(
+            defaults,
+            serde_json::to_string(&Settings::default().android.keyboard.resolved()).unwrap()
+        );
+
+        fs::write(&init, "amux.opt.android.keyboard.layers.sym = nil").unwrap();
+        let error = keyboard(Some(&init)).unwrap_err().to_string();
+        assert!(error.contains("uses the unknown layer \"sym\""), "{error}");
     }
 
     #[test]

@@ -22,7 +22,6 @@ class AmuxEnvironment(
     val binary = File(dirs.nativeLibraries, BINARY_NAME)
     val binaryLink = File(binDir, "amux")
     val initFile = File(configHome, "amux/init.lua")
-    val keyboardFile = File(configHome, "amux/keyboard.json")
     val zshrc = File(home, ".zshrc")
     val runtimeDir = File(tmpDir, "amux-$uid")
     val socket = File(runtimeDir, "default")
