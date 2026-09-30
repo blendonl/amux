@@ -1,0 +1,26 @@
+diff --git a/packages/bash/build.sh b/packages/bash/build.sh
+index 4fe660c..a52b795 100644
+--- a/packages/bash/build.sh
++++ b/packages/bash/build.sh
+@@ -5,7 +5,7 @@ TERMUX_PKG_MAINTAINER="Joshua Kahn <tom@termux.dev>"
+ TERMUX_PKG_VERSION=5.3.20
+ TERMUX_PKG_SRCURL="https://mirrors.kernel.org/gnu/bash/bash-${TERMUX_PKG_VERSION%.*}.tar.gz"
+ TERMUX_PKG_SHA256=0d5cd86965f869a26cf64f4b71be7b96f90a3ba8b3d74e27e8e9d9d5550f31ba
+-TERMUX_PKG_DEPENDS="libandroid-support, libiconv, readline (>= 8.3), termux-tools"
++TERMUX_PKG_DEPENDS="libandroid-support, libiconv, readline (>= 8.3)"
+ TERMUX_PKG_RECOMMENDS="command-not-found, bash-completion"
+ TERMUX_PKG_BREAKS="bash-dev"
+ TERMUX_PKG_REPLACES="bash-dev"
+diff --git a/packages/zsh/build.sh b/packages/zsh/build.sh
+index 0f3ab6a..c020c56 100644
+--- a/packages/zsh/build.sh
++++ b/packages/zsh/build.sh
+@@ -7,7 +7,7 @@ TERMUX_PKG_VERSION=5.9.2
+ TERMUX_PKG_REVISION=2
+ TERMUX_PKG_SRCURL="https://www.zsh.org/pub/zsh-${TERMUX_PKG_VERSION}.tar.xz"
+ TERMUX_PKG_SHA256=36fa734374b44783582cec09bcd67822e2f992c779ec1624ab5596df078d2f81
+-TERMUX_PKG_DEPENDS="libandroid-support, libcap, ncurses, termux-tools, pcre2"
++TERMUX_PKG_DEPENDS="libandroid-support, libcap, ncurses, pcre2"
+ TERMUX_PKG_RECOMMENDS="command-not-found, zsh-completions"
+ TERMUX_PKG_EXTRA_CONFIGURE_ARGS="
+ --disable-gdbm

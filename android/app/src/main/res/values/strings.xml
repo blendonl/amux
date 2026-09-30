@@ -12,6 +12,10 @@
     <string name="key_right">→</string>
     <string name="key_prefix">Prefix</string>
 
+    <string name="status_installing">Installing zsh, git and ssh…</string>
+    <string name="status_installing_progress">%1$d%%</string>
+    <string name="status_userland_failed">Couldn’t install zsh, git and ssh</string>
+    <string name="userland_fallback">%1$s\n\nPanes run /system/bin/sh for now. amux tries the install again the next time it starts.</string>
     <string name="status_starting">Starting amux…</string>
     <string name="status_stopping">Stopping amux…</string>
     <string name="status_detached">Detached</string>
@@ -19,11 +23,13 @@
     <string name="status_server_failed">The amux server failed</string>
     <string name="status_stopped">amux stopped</string>
     <string name="action_reattach">Reattach</string>
+    <string name="action_continue">Continue</string>
     <string name="action_stop_amux">Stop amux</string>
 
     <string name="notification_channel">amux server</string>
     <string name="notification_channel_description">Shows while the amux server runs in the background.</string>
     <string name="notification_title">amux</string>
+    <string name="notification_installing">Installing zsh, git and ssh</string>
     <string name="notification_starting">Starting the server</string>
     <string name="notification_running">Server running</string>
     <string name="notification_running_awake">Server running, keeping the phone awake</string>

@@ -1,0 +1,32 @@
+diff --git a/packages/openssh/build.sh b/packages/openssh/build.sh
+index 025d639..d3ef023 100644
+--- a/packages/openssh/build.sh
++++ b/packages/openssh/build.sh
+@@ -5,7 +5,8 @@ TERMUX_PKG_MAINTAINER="Joshua Kahn <tom@termux.dev>"
+ TERMUX_PKG_VERSION="10.5p1"
+ TERMUX_PKG_SRCURL="https://github.com/openssh/openssh-portable/archive/refs/tags/V_$(sed 's/\./_/g; s/p/_P/g' <<< $TERMUX_PKG_VERSION).tar.gz"
+ TERMUX_PKG_SHA256=494c0624ed743a4eecc1bdd83d2aab9456bdb4cabc511e00599e71493537e258
+-TERMUX_PKG_DEPENDS="krb5, ldns, libandroid-support, libedit, openssh-sftp-server, openssl, termux-auth, zlib"
++TERMUX_PKG_DEPENDS="ldns, libandroid-support, libedit, openssh-sftp-server, openssl, zlib"
++TERMUX_PKG_BUILD_DEPENDS="termux-auth"
+ TERMUX_PKG_SUGGESTS="termux-services"
+ TERMUX_PKG_CONFLICTS="dropbear"
+ TERMUX_PKG_AUTO_UPDATE=true
+@@ -36,7 +37,7 @@ TERMUX_PKG_EXTRA_CONFIGURE_ARGS="
+ --with-pid-dir=$TERMUX_PREFIX/var/run
+ --with-privsep-path=$TERMUX_PREFIX/var/empty
+ --with-xauth=$TERMUX_PREFIX/bin/xauth
+---with-kerberos5
++--without-kerberos5
+ --with-default-path=$TERMUX_PREFIX/bin
+ ac_cv_func_endgrent=yes
+ ac_cv_func_fmt_scaled=no
+@@ -53,7 +54,7 @@ ac_cv_member_struct_passwd_pw_gecos=no
+ TERMUX_PKG_EXTRA_CONFIGURE_ARGS+="PATH_PASSWD_PROG=${TERMUX_PREFIX}/bin/passwd"
+ 
+ TERMUX_PKG_MAKE_INSTALL_TARGET="install-nokeys"
+-TERMUX_PKG_RM_AFTER_INSTALL="bin/slogin share/man/man1/slogin.1"
++TERMUX_PKG_RM_AFTER_INSTALL="bin/slogin share/man/man1/slogin.1 bin/sshd libexec/sshd-session libexec/sshd-auth var/service/sshd"
+ TERMUX_PKG_CONFFILES="etc/ssh/ssh_config etc/ssh/sshd_config"
+ 
+ termux_step_pre_configure() {

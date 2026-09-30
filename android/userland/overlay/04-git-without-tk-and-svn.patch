@@ -1,0 +1,68 @@
+diff --git a/packages/git/build.sh b/packages/git/build.sh
+index f3be7d8..96e2f43 100644
+--- a/packages/git/build.sh
++++ b/packages/git/build.sh
+@@ -19,7 +19,7 @@ ac_cv_snprintf_returns_bogus=no
+ --with-curl
+ --with-expat
+ --with-shell=$TERMUX_PREFIX/bin/sh
+---with-tcltk=$TERMUX_PREFIX/bin/wish
++--without-tcltk
+ "
+ # expat is only used by git-http-push for remote lock management over DAV, so disable:
+ # NO_INSTALL_HARDLINKS to use symlinks instead of hardlinks (which does not work on Android M):
+@@ -35,6 +35,11 @@ DEFAULT_EDITOR=editor
+ "
+ TERMUX_PKG_MAKE_INSTALL_TARGET="install install-man"
+ TERMUX_PKG_BUILD_IN_SRC=true
++TERMUX_PKG_RM_AFTER_INSTALL="
++libexec/git-core/git-svn*
++share/man/man1/git-svn*
++share/perl5/Git/SVN*
++"
+ 
+ termux_step_pre_configure() {
+ 	termux_setup_rust
+diff --git a/packages/git/git-gitk.subpackage.sh b/packages/git/git-gitk.subpackage.sh
+deleted file mode 100644
+index b902644..0000000
+--- a/packages/git/git-gitk.subpackage.sh
++++ /dev/null
+@@ -1,7 +0,0 @@
+-TERMUX_SUBPKG_DESCRIPTION="Git repository browser"
+-TERMUX_SUBPKG_DEPENDS="tk"
+-TERMUX_SUBPKG_INCLUDE="
+-bin/gitk
+-share/gitk
+-share/man/man1/gitk.1*
+-"
+diff --git a/packages/git/git-gui.subpackage.sh b/packages/git/git-gui.subpackage.sh
+deleted file mode 100644
+index 7147006..0000000
+--- a/packages/git/git-gui.subpackage.sh
++++ /dev/null
+@@ -1,10 +0,0 @@
+-TERMUX_SUBPKG_DESCRIPTION="A graphical interface to Git"
+-TERMUX_SUBPKG_DEPENDS="tk"
+-TERMUX_SUBPKG_INCLUDE="
+-libexec/git-core/git-gui
+-libexec/git-core/git-citool
+-libexec/git-core/git-gui--askpass
+-share/git-gui
+-share/man/man1/git-gui.1.gz
+-share/man/man1/git-citool.1.gz
+-"
+diff --git a/packages/git/git-svn.subpackage.sh b/packages/git/git-svn.subpackage.sh
+deleted file mode 100644
+index cf18440..0000000
+--- a/packages/git/git-svn.subpackage.sh
++++ /dev/null
+@@ -1,8 +0,0 @@
+-TERMUX_SUBPKG_DESCRIPTION="Convert between Git and Subversion repositories"
+-TERMUX_SUBPKG_DEPENDS="subversion-perl"
+-TERMUX_SUBPKG_PLATFORM_INDEPENDENT=true
+-TERMUX_SUBPKG_INCLUDE="
+-libexec/git-core/git-svn*
+-share/man/man1/git-svn*
+-share/perl5/Git/SVN*
+-"

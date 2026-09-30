@@ -1,0 +1,20 @@
+diff --git a/scripts/build/toolchain/termux_setup_toolchain_30.sh b/scripts/build/toolchain/termux_setup_toolchain_30.sh
+index b2df6ff..c07b9e7 100644
+--- a/scripts/build/toolchain/termux_setup_toolchain_30.sh
++++ b/scripts/build/toolchain/termux_setup_toolchain_30.sh
+@@ -133,12 +133,9 @@ termux_setup_toolchain_30() {
+ 	[ -d "${TERMUX_STANDALONE_TOOLCHAIN}-work" ] || mkdir -p "${TERMUX_STANDALONE_TOOLCHAIN}-work"
+ 
+ 
+-	if ! mountpoint -q "${TERMUX_STANDALONE_TOOLCHAIN}"; then
+-		fuse-overlayfs \
+-			"${TERMUX_STANDALONE_TOOLCHAIN}" \
+-			-o lowerdir="${NDK}/toolchains/llvm/prebuilt/linux-x86_64" \
+-			-o upperdir="${TERMUX_STANDALONE_TOOLCHAIN}-upper" \
+-			-o workdir="${TERMUX_STANDALONE_TOOLCHAIN}-work"
++	if [ ! -f "${TERMUX_STANDALONE_TOOLCHAIN}/.termux-standalone-toolchain" ]; then
++		find "${TERMUX_STANDALONE_TOOLCHAIN}" -mindepth 1 -delete
++		cp -a "${NDK}/toolchains/llvm/prebuilt/linux-x86_64/." "${TERMUX_STANDALONE_TOOLCHAIN}/"
+ 	fi
+ 
+ 	if [ -f "${TERMUX_STANDALONE_TOOLCHAIN}/.termux-standalone-toolchain" ]; then

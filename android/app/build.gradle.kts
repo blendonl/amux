@@ -18,6 +18,10 @@ fun versionCodeOf(version: String): Int {
     return major * 1_000_000 + minor * 1_000 + patch
 }
 
+val releaseKeystore = providers.environmentVariable("AMUX_RELEASE_KEYSTORE")
+val releaseKeystorePassword = providers.environmentVariable("AMUX_RELEASE_KEYSTORE_PASSWORD")
+val releaseKeyAlias = providers.environmentVariable("AMUX_RELEASE_KEY_ALIAS")
+
 android {
     namespace = "io.github.blendonl.amux"
     compileSdk = 35
@@ -36,9 +40,21 @@ android {
         }
     }
 
+    signingConfigs {
+        if (releaseKeystore.isPresent) {
+            create("release") {
+                storeFile = file(releaseKeystore.get())
+                storePassword = releaseKeystorePassword.get()
+                keyAlias = releaseKeyAlias.get()
+                keyPassword = releaseKeystorePassword.get()
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.findByName("release")
         }
     }
 
@@ -49,6 +65,7 @@ android {
 
     packaging {
         jniLibs.useLegacyPackaging = true
+        jniLibs.keepDebugSymbols += "**/libu_*.so"
     }
 
     lint {
