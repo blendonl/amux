@@ -1,3 +1,4 @@
+// Modified by amux: copies kitty placeholder cells as spaces
 package com.termux.view.textselection;
 
 import android.content.ClipData;
@@ -16,6 +17,7 @@ import androidx.annotation.Nullable;
 
 import com.termux.terminal.TerminalBuffer;
 import com.termux.terminal.WcWidth;
+import com.termux.view.PlaceholderText;
 import com.termux.view.R;
 import com.termux.view.TerminalView;
 
@@ -367,7 +369,7 @@ public class TextSelectionCursorController implements CursorController {
 
     /** Get the currently selected text. */
     public String getSelectedText() {
-        return terminalView.mEmulator.getSelectedText(mSelX1, mSelY1, mSelX2, mSelY2);
+        return PlaceholderText.blank(terminalView.mEmulator.getSelectedText(mSelX1, mSelY1, mSelX2, mSelY2));
     }
 
     /** Get the selected text stored before "MORE" button was pressed on the context menu. */

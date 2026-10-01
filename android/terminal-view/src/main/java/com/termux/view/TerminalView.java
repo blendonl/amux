@@ -1,3 +1,4 @@
+// Modified by amux: owns the kitty image bitmap cache, resends the pty size when the cell pixel size changes and reads placeholder cells as spaces
 package com.termux.view;
 
 import android.annotation.SuppressLint;
@@ -6,6 +7,7 @@ import android.app.Activity;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Typeface;
 import android.os.Build;
@@ -54,6 +56,8 @@ public final class TerminalView extends View {
     public TerminalEmulator mEmulator;
 
     public TerminalRenderer mRenderer;
+
+    private final BitmapCache<Bitmap> mBitmapCache = new BitmapCache<>(BitmapCache.DEFAULT_CAPACITY, new BitmapDecoder());
 
     public TerminalViewClient mClient;
 
@@ -284,6 +288,7 @@ public final class TerminalView extends View {
     public boolean attachSession(TerminalSession session) {
         if (session == mTermSession) return false;
         mTopRow = 0;
+        mBitmapCache.clear();
 
         mTermSession = session;
         mEmulator = null;
@@ -968,9 +973,12 @@ public final class TerminalView extends View {
         // Set to 80 and 24 if you want to enable vttest.
         int newColumns = Math.max(4, (int) (viewWidth / mRenderer.mFontWidth));
         int newRows = Math.max(4, (viewHeight - mRenderer.mFontLineSpacingAndAscent) / mRenderer.mFontLineSpacing);
+        int cellWidth = (int) mRenderer.getFontWidth();
+        int cellHeight = mRenderer.getFontLineSpacing();
 
-        if (mEmulator == null || (newColumns != mEmulator.mColumns || newRows != mEmulator.mRows)) {
-            mTermSession.updateSize(newColumns, newRows, (int) mRenderer.getFontWidth(), mRenderer.getFontLineSpacing());
+        if (mEmulator == null || (newColumns != mEmulator.mColumns || newRows != mEmulator.mRows)
+            || cellWidth != mEmulator.getCellWidthPixels() || cellHeight != mEmulator.getCellHeightPixels()) {
+            mTermSession.updateSize(newColumns, newRows, cellWidth, cellHeight);
             mEmulator = mTermSession.getEmulator();
             mClient.onEmulatorSet();
 
@@ -995,7 +1003,7 @@ public final class TerminalView extends View {
                 mTextSelectionCursorController.getSelectors(sel);
             }
 
-            mRenderer.render(mEmulator, canvas, mTopRow, sel[0], sel[1], sel[2], sel[3]);
+            mRenderer.render(mEmulator, canvas, mTopRow, sel[0], sel[1], sel[2], sel[3], mBitmapCache);
 
             // render the text selection handles
             renderTextSelection();
@@ -1007,7 +1015,7 @@ public final class TerminalView extends View {
     }
 
     private CharSequence getText() {
-        return mEmulator.getScreen().getSelectedText(0, mTopRow, mEmulator.mColumns, mTopRow + mEmulator.mRows);
+        return PlaceholderText.blank(mEmulator.getScreen().getSelectedText(0, mTopRow, mEmulator.mColumns, mTopRow + mEmulator.mRows));
     }
 
     public int getCursorX(float x) {

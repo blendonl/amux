@@ -1,10 +1,13 @@
+// Modified by amux: hides kitty placeholder glyphs and draws their images after the text
 package com.termux.view;
 
+import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.PorterDuff;
 import android.graphics.Typeface;
 
+import com.termux.terminal.Placeholders;
 import com.termux.terminal.TerminalBuffer;
 import com.termux.terminal.TerminalEmulator;
 import com.termux.terminal.TerminalRow;
@@ -33,6 +36,8 @@ public final class TerminalRenderer {
 
     private final float[] asciiMeasures = new float[127];
 
+    private final ImagePainter mImagePainter;
+
     public TerminalRenderer(int textSize, Typeface typeface) {
         mTextSize = textSize;
         mTypeface = typeface;
@@ -51,11 +56,14 @@ public final class TerminalRenderer {
             sb.setCharAt(0, (char) i);
             asciiMeasures[i] = mTextPaint.measureText(sb, 0, 1);
         }
+
+        mImagePainter = new ImagePainter(mFontWidth, mFontLineSpacing, mFontLineSpacingAndAscent);
     }
 
     /** Render the terminal to a canvas with at a specified row scroll, and an optional rectangular selection. */
     public final void render(TerminalEmulator mEmulator, Canvas canvas, int topRow,
-                             int selectionY1, int selectionY2, int selectionX1, int selectionX2) {
+                             int selectionY1, int selectionY2, int selectionX1, int selectionX2, BitmapCache<Bitmap> bitmaps) {
+        bitmaps.sync(mEmulator.getImages());
         final boolean reverseVideo = mEmulator.isReverseVideo();
         final int endRow = topRow + mEmulator.mRows;
         final int columns = mEmulator.mColumns;
@@ -99,15 +107,16 @@ public final class TerminalRenderer {
                 final int charsForCodePoint = charIsHighsurrogate ? 2 : 1;
                 final int codePoint = charIsHighsurrogate ? Character.toCodePoint(charAtIndex, line[currentCharIndex + 1]) : charAtIndex;
                 final int codePointWcWidth = WcWidth.width(codePoint);
+                final boolean placeholder = codePoint == Placeholders.BASE;
                 final boolean insideCursor = (cursorX == column || (codePointWcWidth == 2 && cursorX == column + 1));
-                final boolean insideSelection = column >= selx1 && column <= selx2;
-                final long style = lineObject.getStyle(column);
+                final boolean insideSelection = !placeholder && column >= selx1 && column <= selx2;
+                final long style = placeholder ? lineObject.getStyle(column) | TextStyle.CHARACTER_ATTRIBUTE_INVISIBLE : lineObject.getStyle(column);
 
                 // Check if the measured text width for this code point is not the same as that expected by wcwidth().
                 // This could happen for some fonts which are not truly monospace, or for more exotic characters such as
                 // smileys which android font renders as wide.
                 // If this is detected, we draw this code point scaled to match what wcwidth() expects.
-                final float measuredCodePointWidth = (codePoint < asciiMeasures.length) ? asciiMeasures[codePoint] : mTextPaint.measureText(line,
+                final float measuredCodePointWidth = placeholder ? codePointWcWidth * mFontWidth : (codePoint < asciiMeasures.length) ? asciiMeasures[codePoint] : mTextPaint.measureText(line,
                     currentCharIndex, charsForCodePoint);
                 final boolean fontWidthMismatch = Math.abs(measuredCodePointWidth / mFontWidth - codePointWcWidth) > 0.01;
 
@@ -154,6 +163,8 @@ public final class TerminalRenderer {
             drawTextRun(canvas, line, palette, heightOffset, lastRunStartColumn, columnWidthSinceLastRun, lastRunStartIndex, charsSinceLastRun,
                 measuredWidthForRun, cursorColor, cursorShape, lastRunStyle, reverseVideo || invertCursorTextColor || lastRunInsideSelection);
         }
+
+        mImagePainter.paint(mEmulator, canvas, bitmaps, topRow, selectionY1, selectionY2, selectionX1, selectionX2);
     }
 
     private void drawTextRun(Canvas canvas, char[] text, int[] palette, float y, int startColumn, int runWidthColumns,
