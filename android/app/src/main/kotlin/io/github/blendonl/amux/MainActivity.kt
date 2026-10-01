@@ -10,7 +10,9 @@ import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.view.View
 import android.view.WindowInsets
 import android.widget.Toast
@@ -18,6 +20,7 @@ import com.termux.terminal.TerminalEmulator
 import com.termux.terminal.TerminalSession
 import com.termux.view.TerminalView
 import io.github.blendonl.amux.keyboard.ConfigFileWatcher
+import io.github.blendonl.amux.keyboard.HandlerKeyTimer
 import io.github.blendonl.amux.keyboard.KeyboardHalfView
 import io.github.blendonl.amux.keyboard.KeyboardLayout
 import io.github.blendonl.amux.keyboard.KeyboardLoader
@@ -111,7 +114,7 @@ class MainActivity : Activity() {
         val rightHalf = findViewById<KeyboardHalfView>(R.id.keyboard_right)
         input = InputPanels(window, terminalView, findViewById(R.id.terminal_pane), extraKeys, leftHalf, rightHalf)
         val sink = TerminalKeySink(terminalView, getSystemService(ClipboardManager::class.java), input::hideSplitKeyboard)
-        splitKeyboard = SplitKeyboard(KeyboardLayout.BLANK, sink)
+        splitKeyboard = SplitKeyboard(KeyboardLayout.BLANK, sink, HandlerKeyTimer(Handler(Looper.getMainLooper())))
         leftHalf.attach(splitKeyboard, Side.LEFT)
         rightHalf.attach(splitKeyboard, Side.RIGHT)
         input.resize(splitKeyboard.layout)

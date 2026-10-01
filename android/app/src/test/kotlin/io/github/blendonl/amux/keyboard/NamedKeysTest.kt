@@ -53,6 +53,22 @@ class NamedKeysTest {
     }
 
     @Test
+    fun `modifier prefixes make chords`() {
+        val ctrlC = NamedKeys.lookup("C-c")!!
+        val altLeft = NamedKeys.lookup("M-Left")!!
+        val both = NamedKeys.lookup("C-M-x")!!
+
+        assertEquals(KeyAction.Chord(KeyAction.Type("c", "C"), setOf(Modifier.CTRL)), ctrlC.action)
+        assertEquals("^C", ctrlC.label)
+        assertEquals(KeyAction.Chord(KeyAction.Press(KeyEvent.KEYCODE_DPAD_LEFT), setOf(Modifier.ALT)), altLeft.action)
+        assertEquals("M-←", altLeft.label)
+        assertEquals("C-M-x", both.label)
+        assertNull(NamedKeys.lookup("C-Paste"))
+        assertNull(NamedKeys.lookup("C-layer:nav"))
+        assertNull(NamedKeys.lookup("C-"))
+    }
+
+    @Test
     fun `unknown names are not keys`() {
         assertNull(NamedKeys.lookup("escape"))
         assertNull(NamedKeys.lookup("layer:"))

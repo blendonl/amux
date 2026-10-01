@@ -23,6 +23,10 @@ class Latch {
         if (!usedWhileHeld) state = afterTap(state)
     }
 
+    fun lift() {
+        held = false
+    }
+
     fun use() {
         if (held) usedWhileHeld = true
         if (state == State.ONE_SHOT) state = State.OFF

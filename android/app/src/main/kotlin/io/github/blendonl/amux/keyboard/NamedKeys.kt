@@ -39,10 +39,35 @@ object NamedKeys {
         put("Hide", Key(KeyAction.Hide, "Hide"))
     }
 
+    private val MODIFIER_PREFIXES = listOf("C-" to Modifier.CTRL, "M-" to Modifier.ALT, "S-" to Modifier.SHIFT)
+
     fun lookup(name: String): Key? = when {
         name.codePointCount(0, name.length) == 1 -> typing(name)
         name.startsWith(LAYER_PREFIX) && name.length > LAYER_PREFIX.length -> layer(name.removePrefix(LAYER_PREFIX))
-        else -> NAMED[name]
+        else -> NAMED[name] ?: chord(name)
+    }
+
+    private fun chord(name: String): Key? {
+        val modifiers = linkedSetOf<Modifier>()
+        var rest = name
+        while (true) {
+            val (prefix, modifier) = MODIFIER_PREFIXES
+                .firstOrNull { (prefix, _) -> rest.startsWith(prefix) && rest.length > prefix.length }
+                ?: break
+            modifiers += modifier
+            rest = rest.removePrefix(prefix)
+        }
+        if (modifiers.isEmpty()) return null
+        val key = lookup(rest) ?: return null
+        if (key.action !is KeyAction.Type && key.action !is KeyAction.Press) return null
+        return Key(KeyAction.Chord(key.action, modifiers), chordLabel(modifiers, key.label))
+    }
+
+    private fun chordLabel(modifiers: Set<Modifier>, label: String): String {
+        if (modifiers == setOf(Modifier.CTRL) && label.codePointCount(0, label.length) == 1) {
+            return "^" + label.uppercase()
+        }
+        return modifiers.joinToString("") { modifier -> MODIFIER_PREFIXES.first { it.second == modifier }.first } + label
     }
 
     fun typing(text: String): Key {
