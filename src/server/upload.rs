@@ -4,11 +4,12 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::connection::Origin;
+use super::graphics::animation::{Animation, Shape, Step};
 use super::graphics::derive::{self, Plan};
 use super::graphics::place::ASSUMED_CELL_PIXELS;
 use super::graphics::store::{Derived, ImageData, ImageStore};
 use super::render::{ImageUse, Viewer};
-use crate::protocol::{CellPixels, ImageOp};
+use crate::protocol::{AnimationControl, CellPixels, FrameSpec, ImageOp};
 
 const LOCAL_CHUNK_LEN: usize = 1024 * 1024;
 const PEER_CHUNK_LEN: usize = 64 * 1024;
@@ -32,6 +33,7 @@ pub struct Uploader {
     current: BTreeSet<u32>,
     refused: BTreeSet<u32>,
     queue: VecDeque<ImageUse>,
+    syncs: BTreeSet<u32>,
     deletes: VecDeque<u32>,
     upload: Option<Upload>,
     upload_next: bool,
@@ -47,6 +49,15 @@ struct Held {
     used: u64,
     stale: bool,
     made_for: Option<CellPixels>,
+    shape: Option<Shape>,
+}
+
+impl Held {
+    fn moved(&self, store: &ImageStore) -> bool {
+        self.shape
+            .as_ref()
+            .is_some_and(|shape| store.revision(self.shown.image) != Some(shape.revision()))
+    }
 }
 
 pub struct Derivation {
@@ -83,20 +94,111 @@ impl Derivation {
     }
 }
 
-enum Upload {
-    Transmit {
-        shown: ImageUse,
-        data: ImageData,
-        offset: usize,
-        started: bool,
-    },
-    Place(ImageUse),
+struct Upload {
+    shown: ImageUse,
+    sends: VecDeque<Send>,
+    offset: usize,
+}
+
+enum Send {
+    Root(ImageData),
+    Place,
+    Frame(FrameSpec, ImageData),
+    Animate(AnimationControl),
+}
+
+impl From<Step> for Send {
+    fn from(step: Step) -> Self {
+        match step {
+            Step::Frame(spec, data) => Self::Frame(spec, data),
+            Step::Animate(control) => Self::Animate(control),
+        }
+    }
 }
 
 impl Upload {
     fn key(&self) -> u32 {
-        match self {
-            Self::Transmit { shown, .. } | Self::Place(shown) => shown.key,
+        self.shown.key
+    }
+
+    fn end_early(mut self) -> Option<Self> {
+        if self.offset == 0 {
+            return None;
+        }
+        self.sends.truncate(1);
+        self.offset = match self.sends.front()? {
+            Send::Root(data) | Send::Frame(_, data) => data.bytes.len(),
+            Send::Place | Send::Animate(_) => return None,
+        };
+        Some(self)
+    }
+
+    fn next(&mut self, chunk_len: usize) -> Option<ImageOp> {
+        let key = self.shown.key;
+        let (op, more) = match self.sends.front()? {
+            Send::Root(data) => {
+                let piece = Piece::of(data, self.offset, chunk_len);
+                let op = ImageOp::Transmit {
+                    key,
+                    format: data.format,
+                    width: data.width,
+                    height: data.height,
+                    compressed: data.compressed,
+                    total: piece.total,
+                    data: piece.data,
+                    last: piece.more.is_none(),
+                };
+                (op, piece.more)
+            }
+            Send::Frame(spec, data) => {
+                let piece = Piece::of(data, self.offset, chunk_len);
+                let op = ImageOp::Frame {
+                    key,
+                    spec: *spec,
+                    format: data.format,
+                    width: data.width,
+                    height: data.height,
+                    compressed: data.compressed,
+                    total: piece.total,
+                    data: piece.data,
+                    last: piece.more.is_none(),
+                };
+                (op, piece.more)
+            }
+            Send::Place => {
+                let (cols, rows) = (self.shown.cols, self.shown.rows);
+                (ImageOp::Place { key, cols, rows }, None)
+            }
+            Send::Animate(control) => {
+                let control = *control;
+                (ImageOp::Animate { key, control }, None)
+            }
+        };
+        match more {
+            Some(end) => self.offset = end,
+            None => {
+                self.sends.pop_front();
+                self.offset = 0;
+            }
+        }
+        Some(op)
+    }
+}
+
+struct Piece {
+    total: u32,
+    data: Vec<u8>,
+    more: Option<usize>,
+}
+
+impl Piece {
+    fn of(data: &ImageData, offset: usize, chunk_len: usize) -> Self {
+        let len = data.bytes.len();
+        let end = len.min(offset + chunk_len);
+        Self {
+            total: u32::try_from(len).unwrap_or(u32::MAX),
+            data: data.bytes[offset..end].to_vec(),
+            more: (end < len).then_some(end),
         }
     }
 }
@@ -119,6 +221,7 @@ impl Uploader {
             current: BTreeSet::new(),
             refused: BTreeSet::new(),
             queue: VecDeque::new(),
+            syncs: BTreeSet::new(),
             deletes: VecDeque::new(),
             upload: None,
             upload_next: false,
@@ -161,26 +264,14 @@ impl Uploader {
         if graphics {
             return;
         }
-        if let Some(Upload::Transmit {
-            shown,
-            data,
-            started: true,
-            ..
-        }) = self.upload.take()
-        {
-            self.upload = Some(Upload::Transmit {
-                shown,
-                offset: data.bytes.len(),
-                data,
-                started: true,
-            });
-        }
+        self.upload = self.upload.take().and_then(Upload::end_early);
         self.deletes.extend(self.held.keys());
         self.held.clear();
         self.used = 0;
         self.current.clear();
         self.refused.clear();
         self.queue.clear();
+        self.syncs.clear();
         self.deriving.clear();
         self.jobs.clear();
         self.ready.clear();
@@ -194,6 +285,7 @@ impl Uploader {
         }
         self.refused.clear();
         self.queue.clear();
+        self.syncs.clear();
     }
 
     pub fn frame(&mut self, images: &[ImageUse]) {
@@ -208,24 +300,29 @@ impl Uploader {
         self.deriving
             .retain(|key, _| current.contains(key) || Some(*key) == running);
         for shown in images {
-            let fresh = match self.held.get_mut(&shown.key) {
+            let (fresh, moved) = match self.held.get_mut(&shown.key) {
                 Some(held) => {
                     held.used = self.clock;
-                    !held.stale
+                    (!held.stale, held.moved(&self.store))
                 }
-                None => false,
+                None => (false, false),
             };
             let waiting = self.queue.iter().any(|queued| queued.key == shown.key)
                 || self.upload.as_ref().map(Upload::key) == Some(shown.key)
                 || self.deriving.contains_key(&shown.key);
             if !fresh && !waiting {
                 self.queue.push_back(*shown);
+            } else if fresh && moved && !waiting {
+                self.syncs.insert(shown.key);
             }
         }
     }
 
     pub fn has_work(&self) -> bool {
-        !self.deletes.is_empty() || self.upload.is_some() || !self.queue.is_empty()
+        !self.deletes.is_empty()
+            || self.upload.is_some()
+            || !self.queue.is_empty()
+            || !self.syncs.is_empty()
     }
 
     pub fn take_job(&mut self) -> Option<Derivation> {
@@ -279,48 +376,26 @@ impl Uploader {
         if let Some(key) = self.deletes.pop_front() {
             return Some(ImageOp::Delete { key });
         }
-        match self.upload.take()? {
-            Upload::Transmit {
-                shown,
-                data,
-                offset,
-                ..
-            } => {
-                let end = data.bytes.len().min(offset + self.chunk_len);
-                let last = end == data.bytes.len();
-                let op = ImageOp::Transmit {
-                    key: shown.key,
-                    format: data.format,
-                    width: data.width,
-                    height: data.height,
-                    compressed: data.compressed,
-                    total: u32::try_from(data.bytes.len()).unwrap_or(u32::MAX),
-                    data: data.bytes[offset..end].to_vec(),
-                    last,
-                };
-                self.upload = if !last {
-                    Some(Upload::Transmit {
-                        shown,
-                        data,
-                        offset: end,
-                        started: true,
-                    })
-                } else if self.graphics {
-                    Some(Upload::Place(shown))
-                } else {
-                    None
-                };
-                Some(op)
+        let upload = self.upload.as_mut()?;
+        let op = upload.next(self.chunk_len);
+        if upload.sends.is_empty() {
+            let key = upload.key();
+            self.upload = None;
+            if self
+                .held
+                .get(&key)
+                .is_some_and(|held| held.moved(&self.store))
+            {
+                self.syncs.insert(key);
             }
-            Upload::Place(shown) => Some(ImageOp::Place {
-                key: shown.key,
-                cols: shown.cols,
-                rows: shown.rows,
-            }),
         }
+        op
     }
 
     fn start(&mut self) {
+        if self.sync() {
+            return;
+        }
         while let Some(shown) = self.queue.pop_front() {
             let stale = match self.held.get(&shown.key) {
                 Some(held) if !held.stale => continue,
@@ -333,21 +408,22 @@ impl Uploader {
                 continue;
             };
             let plan = self.plan(&shown, &source);
-            let data = match plan.filter(Plan::fits) {
-                None => source,
+            let (data, animation) = match plan.filter(Plan::fits) {
+                None => self.plain(&shown, source),
                 Some(plan) => match self
                     .ready
                     .remove(&shown.key)
                     .or_else(|| self.store.derived(shown.key, self.cell))
                 {
-                    Some(Derived::Image(derived)) => derived,
-                    Some(Derived::Plain) => source,
+                    Some(Derived::Image(derived)) => (derived, None),
+                    Some(Derived::Plain) => self.plain(&shown, source),
                     None => {
                         self.request(shown, plan, source);
                         continue;
                     }
                 },
             };
+            let shape = animation.as_ref().map(Animation::shape);
             let made_for = plan.map(|_| self.cell);
             let decoded = u64::try_from(data.decoded_len).unwrap_or(u64::MAX);
             if stale {
@@ -359,6 +435,7 @@ impl Uploader {
                         used: held.used,
                         stale: false,
                         made_for,
+                        shape,
                     };
                 }
             } else if self.make_room(decoded) {
@@ -371,20 +448,67 @@ impl Uploader {
                         used: self.clock,
                         stale: false,
                         made_for,
+                        shape,
                     },
                 );
             } else {
                 self.refused.insert(shown.key);
                 continue;
             }
-            self.upload = Some(Upload::Transmit {
+            let mut sends = VecDeque::from([Send::Root(data)]);
+            if self.graphics {
+                sends.push_back(Send::Place);
+            }
+            if let Some(animation) = animation {
+                sends.extend(animation.steps().into_iter().map(Send::from));
+            }
+            self.upload = Some(Upload {
                 shown,
-                data,
+                sends,
                 offset: 0,
-                started: false,
             });
             return;
         }
+    }
+
+    fn plain(&self, shown: &ImageUse, source: ImageData) -> (ImageData, Option<Animation>) {
+        match self.store.animation(shown.image) {
+            Some(animation) => (animation.root().clone(), Some(animation)),
+            None => (source, None),
+        }
+    }
+
+    fn sync(&mut self) -> bool {
+        while let Some(key) = self.syncs.pop_first() {
+            if !self.current.contains(&key) {
+                continue;
+            }
+            let Some(held) = self.held.get_mut(&key) else {
+                continue;
+            };
+            let Some(shape) = held.shape.as_ref().filter(|_| !held.stale) else {
+                continue;
+            };
+            let Some(animation) = self.store.animation(held.shown.image) else {
+                continue;
+            };
+            let Some(steps) = animation.steps_since(shape) else {
+                held.stale = true;
+                self.queue.push_back(held.shown);
+                continue;
+            };
+            held.shape = Some(animation.shape());
+            if steps.is_empty() {
+                continue;
+            }
+            self.upload = Some(Upload {
+                shown: held.shown,
+                sends: steps.into_iter().map(Send::from).collect(),
+                offset: 0,
+            });
+            return true;
+        }
+        false
     }
 
     fn plan(&self, shown: &ImageUse, source: &ImageData) -> Option<Plan> {
@@ -487,10 +611,10 @@ mod tests {
     use miniz_oxide::inflate::decompress_to_vec_zlib;
 
     use super::*;
-    use crate::protocol::ImageFormat;
+    use crate::protocol::{AnimationState, ImageFormat};
     use crate::server::graphics::derive::{Look, Sizing};
     use crate::server::graphics::place::{CellOffset, SourceRect};
-    use crate::server::graphics::store::{Buffer, PaneImages};
+    use crate::server::graphics::store::{Buffer, ImageKey, PaneImages};
     use crate::server::graphics::transmit::Image;
 
     const MIB: usize = 1024 * 1024;
@@ -572,6 +696,40 @@ mod tests {
 
         fn bytes(&self, shown: ImageUse) -> Arc<[u8]> {
             self.store.get(shown.image).unwrap().bytes
+        }
+
+        fn animate(&self, shown: ImageUse, change: impl FnOnce(&mut Animation)) {
+            let mut animation = self.store.animation(shown.image).unwrap();
+            let read_at = animation.revision();
+            change(&mut animation);
+            self.pane.animate(shown.image, read_at, animation).unwrap();
+        }
+    }
+
+    fn frame_data(len: usize) -> ImageData {
+        ImageData {
+            key: ImageKey(0),
+            width: 1,
+            height: 1,
+            format: ImageFormat::Png,
+            compressed: false,
+            bytes: (0..len).map(|at| (at % 7) as u8).collect(),
+            decoded_len: 4,
+        }
+    }
+
+    fn add(len: usize) -> impl FnOnce(&mut Animation) {
+        move |animation| {
+            animation
+                .add(FrameSpec::default(), frame_data(len))
+                .unwrap();
+        }
+    }
+
+    fn running() -> AnimationControl {
+        AnimationControl {
+            state: Some(AnimationState::Running),
+            ..AnimationControl::default()
         }
     }
 
@@ -656,6 +814,10 @@ mod tests {
                 } => ('t', *key, data.len(), *last),
                 ImageOp::Place { key, .. } => ('p', *key, 0, true),
                 ImageOp::Delete { key } => ('d', *key, 0, true),
+                ImageOp::Frame {
+                    key, data, last, ..
+                } => ('f', *key, data.len(), *last),
+                ImageOp::Animate { key, .. } => ('a', *key, 0, true),
             })
             .collect()
     }
@@ -1135,6 +1297,288 @@ mod tests {
         let ops = drain(&mut uploader);
         assert_eq!(uploaded(&ops, second.key), *images.bytes(second));
         assert!(uploader.take_job().is_none());
+    }
+
+    #[test]
+    fn an_animated_image_is_sent_with_its_frames_and_then_its_state() {
+        let mut images = Images::new();
+        let shown = images.image(8, 4);
+        images.animate(shown, |animation| {
+            let gapped = FrameSpec {
+                gap: 70,
+                ..FrameSpec::default()
+            };
+            animation.add(gapped, frame_data(5)).unwrap();
+            let based = FrameSpec {
+                base: 1,
+                x: 1,
+                ..FrameSpec::default()
+            };
+            animation.add(based, frame_data(3)).unwrap();
+            animation.control(AnimationControl {
+                loops: 1,
+                ..running()
+            });
+        });
+        let mut uploader = images.uploader(Origin::Local, 100);
+        uploader.frame(&[shown]);
+        let ops = drain(&mut uploader);
+        let key = shown.key;
+        assert_eq!(
+            summary(&ops),
+            [
+                ('t', key, 8, true),
+                ('p', key, 0, true),
+                ('f', key, 5, true),
+                ('f', key, 3, true),
+                ('a', key, 0, true),
+            ]
+        );
+        assert_eq!(
+            ops[2],
+            ImageOp::Frame {
+                key,
+                spec: FrameSpec {
+                    gap: 70,
+                    ..FrameSpec::default()
+                },
+                format: ImageFormat::Png,
+                width: 1,
+                height: 1,
+                compressed: false,
+                total: 5,
+                data: vec![0, 1, 2, 3, 4],
+                last: true,
+            }
+        );
+        let ImageOp::Frame { spec, .. } = &ops[3] else {
+            panic!("expected a frame, got {:?}", ops[3]);
+        };
+        assert_eq!(
+            *spec,
+            FrameSpec {
+                base: 1,
+                x: 1,
+                gap: 40,
+                ..FrameSpec::default()
+            }
+        );
+        assert_eq!(
+            ops[4],
+            ImageOp::Animate {
+                key,
+                control: running()
+            }
+        );
+        uploader.frame(&[shown]);
+        assert!(!uploader.has_work());
+        assert!(drain(&mut uploader).is_empty());
+    }
+
+    #[test]
+    fn frames_go_in_the_same_chunks_as_images() {
+        let mut images = Images::new();
+        let shown = images.image(8, 4);
+        images.animate(shown, add(150 * 1024));
+        let mut uploader = images.uploader(Origin::Peer, 1 << 30);
+        uploader.frame(&[shown]);
+        let key = shown.key;
+        assert_eq!(
+            summary(&drain(&mut uploader)),
+            [
+                ('t', key, 8, true),
+                ('p', key, 0, true),
+                ('f', key, 64 * 1024, false),
+                ('f', key, 64 * 1024, false),
+                ('f', key, 22 * 1024, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn later_frames_and_controls_reach_a_client_that_holds_the_image() {
+        let mut images = Images::new();
+        let shown = images.image(8, 4);
+        let elsewhere = images.image(8, 4);
+        let mut uploader = images.uploader(Origin::Local, 100);
+        uploader.frame(&[shown, elsewhere]);
+        drain(&mut uploader);
+        let key = shown.key;
+
+        images.animate(shown, add(6));
+        assert!(!uploader.has_work());
+        uploader.frame(&[shown, elsewhere]);
+        assert!(uploader.has_work());
+        assert_eq!(summary(&drain(&mut uploader)), [('f', key, 6, true)]);
+
+        images.animate(shown, |animation| animation.control(running()));
+        images.animate(shown, add(2));
+        images.animate(shown, |animation| {
+            animation.control(AnimationControl {
+                current: 3,
+                ..AnimationControl::default()
+            });
+        });
+        uploader.frame(&[shown, elsewhere]);
+        let ops = drain(&mut uploader);
+        assert_eq!(summary(&ops), [('f', key, 2, true), ('a', key, 0, true)]);
+        assert_eq!(
+            ops[1],
+            ImageOp::Animate {
+                key,
+                control: AnimationControl {
+                    current: 3,
+                    ..running()
+                }
+            }
+        );
+        uploader.frame(&[shown, elsewhere]);
+        assert!(drain(&mut uploader).is_empty());
+
+        images.animate(shown, add(4));
+        uploader.frame(&[elsewhere]);
+        assert!(drain(&mut uploader).is_empty());
+        uploader.frame(&[shown, elsewhere]);
+        assert_eq!(summary(&drain(&mut uploader)), [('f', key, 4, true)]);
+    }
+
+    #[test]
+    fn an_edited_frame_is_sent_whole_and_a_deleted_one_sends_the_image_again() {
+        let mut images = Images::new();
+        let shown = images.pixels((3, 2), None);
+        let pixel = |colour: u8| Image {
+            width: 1,
+            height: 1,
+            format: ImageFormat::Rgba32,
+            compressed: false,
+            bytes: vec![colour, 0, 0, 255],
+            decoded_len: 4,
+        };
+        images.animate(shown, |animation| {
+            let data = ImageData::new(shown.image, pixel(9));
+            animation.add(FrameSpec::default(), data).unwrap();
+        });
+        let mut uploader = images.uploader(Origin::Local, 100);
+        uploader.frame(&[shown]);
+        let key = shown.key;
+        assert_eq!(
+            order(&drain(&mut uploader)),
+            [('t', key), ('p', key), ('f', key)]
+        );
+
+        images.animate(shown, |animation| {
+            let edit = FrameSpec {
+                edit: 2,
+                replace: true,
+                ..FrameSpec::default()
+            };
+            let data = ImageData::new(shown.image, pixel(5));
+            animation.add(edit, data).unwrap();
+        });
+        uploader.frame(&[shown]);
+        let ops = drain(&mut uploader);
+        let [ImageOp::Frame {
+            spec,
+            format,
+            width,
+            height,
+            compressed,
+            data,
+            ..
+        }] = ops.as_slice()
+        else {
+            panic!("expected one frame, got {ops:?}");
+        };
+        assert_eq!(
+            *spec,
+            FrameSpec {
+                edit: 2,
+                replace: true,
+                ..FrameSpec::default()
+            }
+        );
+        assert_eq!(
+            (*format, *width, *height, *compressed),
+            (ImageFormat::Rgba32, 4, 2, false)
+        );
+        assert_eq!(data[..8], [5, 0, 0, 255, 0, 0, 0, 0]);
+
+        images.animate(shown, |animation| {
+            animation.remove(2).unwrap();
+        });
+        uploader.frame(&[shown]);
+        let ops = drain(&mut uploader);
+        assert_eq!(order(&ops), [('t', key), ('p', key)]);
+        assert_eq!(uploaded(&ops, key), *images.bytes(shown));
+        uploader.frame(&[shown]);
+        assert!(drain(&mut uploader).is_empty());
+    }
+
+    #[test]
+    fn frames_that_arrive_during_the_upload_follow_it() {
+        let mut images = Images::new();
+        let shown = images.image(2 * MIB, 4);
+        let mut uploader = images.uploader(Origin::Local, 100);
+        uploader.frame(&[shown]);
+        let key = shown.key;
+        assert_eq!(
+            summary(&[uploader.next().unwrap()]),
+            [('t', key, MIB, false)]
+        );
+        images.animate(shown, add(5));
+        uploader.frame(&[shown]);
+        assert_eq!(
+            summary(&drain(&mut uploader)),
+            [
+                ('t', key, MIB, true),
+                ('p', key, 0, true),
+                ('f', key, 5, true)
+            ]
+        );
+        assert!(!uploader.has_work());
+    }
+
+    #[test]
+    fn turning_graphics_off_ends_a_frame_transmission() {
+        let mut images = Images::new();
+        let shown = images.image(8, 4);
+        images.animate(shown, add(2 * MIB));
+        let mut uploader = images.uploader(Origin::Local, 100);
+        uploader.frame(&[shown]);
+        let key = shown.key;
+        let ops: Vec<ImageOp> = std::iter::from_fn(|| uploader.next()).take(3).collect();
+        assert_eq!(
+            summary(&ops),
+            [
+                ('t', key, 8, true),
+                ('p', key, 0, true),
+                ('f', key, MIB, false)
+            ]
+        );
+        uploader.set_graphics(false);
+        assert_eq!(
+            summary(&drain(&mut uploader)),
+            [('d', key, 0, true), ('f', key, 0, true)]
+        );
+    }
+
+    #[test]
+    fn a_derived_image_is_not_animated() {
+        let mut images = Images::new();
+        let shown = images.pixels((1, 1), look(right_half(), Sizing::Native));
+        images.animate(shown, |animation| {
+            add(3)(animation);
+            animation.control(running());
+        });
+        let mut uploader = images.uploader(Origin::Local, 1 << 30);
+        uploader.set_cell_pixels(Some(SMALL));
+        uploader.frame(&[shown]);
+        let ops = settle(&mut uploader);
+        assert_eq!(order(&ops), [('t', shown.key), ('p', shown.key)]);
+        images.animate(shown, add(4));
+        uploader.frame(&[shown]);
+        assert!(settle(&mut uploader).is_empty());
+        assert!(!uploader.has_work());
     }
 
     #[test]

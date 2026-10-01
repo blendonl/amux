@@ -161,6 +161,17 @@ pub fn derive(image: &ImageData, plan: &Plan) -> Result<ImageData> {
     })
 }
 
+pub fn unpack(image: &ImageData) -> Result<Vec<u8>> {
+    let pixels = Pixels::decode(image)?;
+    if image.format == ImageFormat::Rgb24 || pixels.channels == RGBA {
+        return Ok(pixels.data);
+    }
+    Ok((0..pixels.height)
+        .flat_map(|y| (0..pixels.width).map(move |x| (x, y)))
+        .flat_map(|(x, y)| pixels.rgba(x, y))
+        .collect())
+}
+
 struct Pixels {
     width: u32,
     height: u32,

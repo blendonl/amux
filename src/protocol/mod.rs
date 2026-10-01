@@ -13,11 +13,12 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 pub use client::{
-    is_locale_variable, AttachedSession, CellPixels, ClientMessage, ClientTerminal, ClusterStatus,
-    DebugCommand, Direction, DiscoveryReport, DiscoveryStatus, DiscoveryView, ImageFormat, ImageOp,
-    LinkInfo, LinkState, LinkTransport, NewSession, ProjectCheckout, ProjectRef, ServerMessage,
-    ServerStatus, ServerView, SessionCommand, SessionId, SessionInfo, SessionState, Size,
-    SourceState, SourceView, Split, Via, WindowSummary, MIN_COLS, MIN_ROWS,
+    is_locale_variable, AnimationControl, AnimationState, AttachedSession, CellPixels,
+    ClientMessage, ClientTerminal, ClusterStatus, DebugCommand, Direction, DiscoveryReport,
+    DiscoveryStatus, DiscoveryView, FrameSpec, ImageFormat, ImageOp, LinkInfo, LinkState,
+    LinkTransport, NewSession, ProjectCheckout, ProjectRef, ServerMessage, ServerStatus,
+    ServerView, SessionCommand, SessionId, SessionInfo, SessionState, Size, SourceState,
+    SourceView, Split, Via, WindowSummary, MIN_COLS, MIN_ROWS,
 };
 pub use greeting::{
     accept, cli_version, greet, Greeting, IncompatibleServer, Role, TcpKind, TcpOpen, Version,
@@ -352,6 +353,39 @@ mod tests {
                 rows: 12,
             }),
             ServerMessage::Image(ImageOp::Delete { key: u32::MAX }),
+            ServerMessage::Image(ImageOp::Frame {
+                key: 70_000,
+                spec: FrameSpec {
+                    edit: 3,
+                    base: 2,
+                    x: 10,
+                    y: 20,
+                    background: 0xff00_00ff,
+                    replace: true,
+                    gap: -1,
+                },
+                format: ImageFormat::Rgba32,
+                width: 30,
+                height: 40,
+                compressed: true,
+                total: 9000,
+                data: vec![5; 9000],
+                last: false,
+            }),
+            ServerMessage::Image(ImageOp::Animate {
+                key: 70_000,
+                control: AnimationControl {
+                    frame: 1,
+                    gap: 120,
+                    current: 4,
+                    state: Some(AnimationState::Loading),
+                    loops: 3,
+                },
+            }),
+            ServerMessage::Image(ImageOp::Animate {
+                key: 1,
+                control: AnimationControl::default(),
+            }),
         ];
         for message in &sent {
             write_message(&mut server, message).await.unwrap();
@@ -380,6 +414,21 @@ mod tests {
         assert_eq!(
             postcard::to_stdvec(&transmit).unwrap(),
             [0, 1, 2, 2, 3, 1, 3, 3, 7, 8, 9, 1]
+        );
+        let frame = ImageOp::Frame {
+            key: 1,
+            spec: FrameSpec::default(),
+            format: ImageFormat::Png,
+            width: 2,
+            height: 3,
+            compressed: true,
+            total: 3,
+            data: vec![7, 8, 9],
+            last: true,
+        };
+        assert_eq!(
+            postcard::to_stdvec(&frame).unwrap(),
+            [3, 1, 0, 0, 0, 0, 0, 0, 0, 2, 2, 3, 1, 3, 3, 7, 8, 9, 1]
         );
     }
 

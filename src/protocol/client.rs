@@ -53,6 +53,33 @@ pub enum ImageFormat {
     Png,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameSpec {
+    pub edit: u32,
+    pub base: u32,
+    pub x: u32,
+    pub y: u32,
+    pub background: u32,
+    pub replace: bool,
+    pub gap: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AnimationState {
+    Stopped,
+    Loading,
+    Running,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnimationControl {
+    pub frame: u32,
+    pub gap: i32,
+    pub current: u32,
+    pub state: Option<AnimationState>,
+    pub loops: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ImageOp {
     Transmit {
@@ -73,6 +100,22 @@ pub enum ImageOp {
     },
     Delete {
         key: u32,
+    },
+    Frame {
+        key: u32,
+        spec: FrameSpec,
+        format: ImageFormat,
+        width: u32,
+        height: u32,
+        compressed: bool,
+        total: u32,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        last: bool,
+    },
+    Animate {
+        key: u32,
+        control: AnimationControl,
     },
 }
 

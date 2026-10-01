@@ -8,7 +8,9 @@ use base64::Engine;
 use crossterm::terminal::WindowSize;
 use tokio::time::Instant;
 
-use crate::protocol::{CellPixels, ClientTerminal, ImageFormat, ImageOp};
+use crate::protocol::{
+    AnimationControl, AnimationState, CellPixels, ClientTerminal, FrameSpec, ImageFormat, ImageOp,
+};
 use crate::settings::ClientImages;
 
 pub const PROBE: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[>q\x1b[16t\x1b[c";
@@ -340,7 +342,8 @@ impl KittyWriter {
     pub fn write(&mut self, op: ImageOp, out: &mut Vec<u8>) {
         let waits = match (&self.open, &op) {
             (None, _) => false,
-            (Some(open), ImageOp::Transmit { key, .. }) => *key != open.key,
+            (Some(open), ImageOp::Transmit { key, .. }) => !open.continues(*key, false),
+            (Some(open), ImageOp::Frame { key, .. }) => !open.continues(*key, true),
             (Some(_), _) => true,
         };
         if waits {
@@ -358,18 +361,28 @@ impl KittyWriter {
                 last,
                 ..
             } => {
-                self.keys.insert(key);
-                self.open
-                    .get_or_insert_with(|| {
-                        Transmission::new(key, format, width, height, compressed)
-                    })
-                    .send(&data, last, out);
-                if last {
-                    self.open = None;
-                    for queued in mem::take(&mut self.queued) {
-                        self.write(queued, out);
-                    }
-                }
+                let control = || {
+                    let pixels = pixel_keys(format, width, height, compressed);
+                    format!("a=t,i={key},{pixels},q=2")
+                };
+                self.send(key, false, control, &data, last, out);
+            }
+            ImageOp::Frame {
+                key,
+                spec,
+                format,
+                width,
+                height,
+                compressed,
+                data,
+                last,
+                ..
+            } => {
+                let control = || {
+                    let pixels = pixel_keys(format, width, height, compressed);
+                    format!("a=f,i={key},{pixels}{},q=2", frame_keys(spec))
+                };
+                self.send(key, true, control, &data, last, out);
             }
             ImageOp::Place { key, cols, rows } => {
                 self.keys.insert(key);
@@ -378,6 +391,30 @@ impl KittyWriter {
             ImageOp::Delete { key } => {
                 self.keys.remove(&key);
                 delete(key, out);
+            }
+            ImageOp::Animate { key, control } => {
+                command(out, &format!("a=a,i={key}{},q=2", animate_keys(control)));
+            }
+        }
+    }
+
+    fn send(
+        &mut self,
+        key: u32,
+        frame: bool,
+        control: impl FnOnce() -> String,
+        data: &[u8],
+        last: bool,
+        out: &mut Vec<u8>,
+    ) {
+        self.keys.insert(key);
+        self.open
+            .get_or_insert_with(|| Transmission::new(key, frame, control()))
+            .send(data, last, out);
+        if last {
+            self.open = None;
+            for queued in mem::take(&mut self.queued) {
+                self.write(queued, out);
             }
         }
     }
@@ -400,25 +437,23 @@ impl KittyWriter {
 #[derive(Debug)]
 struct Transmission {
     key: u32,
+    frame: bool,
     control: Option<String>,
     carry: Vec<u8>,
 }
 
 impl Transmission {
-    fn new(key: u32, format: ImageFormat, width: u32, height: u32, compressed: bool) -> Self {
-        let format = match format {
-            ImageFormat::Rgb24 => 24,
-            ImageFormat::Rgba32 => 32,
-            ImageFormat::Png => 100,
-        };
-        let compression = if compressed { ",o=z" } else { "" };
+    fn new(key: u32, frame: bool, control: String) -> Self {
         Self {
             key,
-            control: Some(format!(
-                "a=t,i={key},f={format},s={width},v={height}{compression},q=2"
-            )),
+            frame,
+            control: Some(control),
             carry: Vec::new(),
         }
+    }
+
+    fn continues(&self, key: u32, frame: bool) -> bool {
+        self.key == key && self.frame == frame
     }
 
     fn started(&self) -> bool {
@@ -454,6 +489,62 @@ impl Transmission {
         out.extend_from_slice(payload);
         out.extend_from_slice(ST);
     }
+}
+
+fn pixel_keys(format: ImageFormat, width: u32, height: u32, compressed: bool) -> String {
+    let format = match format {
+        ImageFormat::Rgb24 => 24,
+        ImageFormat::Rgba32 => 32,
+        ImageFormat::Png => 100,
+    };
+    let compression = if compressed { ",o=z" } else { "" };
+    format!("f={format},s={width},v={height}{compression}")
+}
+
+fn frame_keys(spec: FrameSpec) -> String {
+    let FrameSpec {
+        edit,
+        base,
+        x,
+        y,
+        background,
+        replace,
+        gap,
+    } = spec;
+    set_keys(&[
+        ("r", i64::from(edit)),
+        ("c", i64::from(base)),
+        ("x", i64::from(x)),
+        ("y", i64::from(y)),
+        ("Y", i64::from(background)),
+        ("X", i64::from(replace)),
+        ("z", i64::from(gap)),
+    ])
+}
+
+fn animate_keys(control: AnimationControl) -> String {
+    let state = match control.state {
+        None => 0,
+        Some(AnimationState::Stopped) => 1,
+        Some(AnimationState::Loading) => 2,
+        Some(AnimationState::Running) => 3,
+    };
+    set_keys(&[
+        ("r", i64::from(control.frame)),
+        ("z", i64::from(control.gap)),
+        ("c", i64::from(control.current)),
+        ("s", state),
+        ("v", i64::from(control.loops)),
+    ])
+}
+
+fn set_keys(keys: &[(&str, i64)]) -> String {
+    let set: Vec<String> = keys
+        .iter()
+        .filter(|(_, value)| *value != 0)
+        .map(|(key, value)| format!(",{key}={value}"))
+        .collect();
+    set.concat()
 }
 
 fn command(out: &mut Vec<u8>, control: &str) {
@@ -1044,6 +1135,151 @@ mod tests {
                 "a=p,U=1,i=3,c=3,r=1,q=2",
             ]
         );
+    }
+
+    fn frame(key: u32, spec: FrameSpec, data: &[u8], last: bool) -> ImageOp {
+        ImageOp::Frame {
+            key,
+            spec,
+            format: ImageFormat::Rgba32,
+            width: 2,
+            height: 1,
+            compressed: false,
+            total: 8,
+            data: data.to_vec(),
+            last,
+        }
+    }
+
+    #[test]
+    fn frames_are_quiet_a_f_commands_with_only_the_keys_they_set() {
+        let spec = FrameSpec {
+            edit: 0,
+            base: 1,
+            x: 1,
+            y: 2,
+            background: 255,
+            replace: true,
+            gap: 100,
+        };
+        let edit = ImageOp::Frame {
+            key: 9,
+            spec: FrameSpec {
+                edit: 2,
+                gap: -1,
+                ..FrameSpec::default()
+            },
+            format: ImageFormat::Png,
+            width: 640,
+            height: 480,
+            compressed: true,
+            total: 3,
+            data: vec![0xff, 0, 0x80],
+            last: true,
+        };
+        let plain = ImageOp::Frame {
+            key: 3,
+            spec: FrameSpec::default(),
+            format: ImageFormat::Rgb24,
+            width: 1,
+            height: 1,
+            compressed: false,
+            total: 3,
+            data: vec![1, 2, 3],
+            last: true,
+        };
+        let (writer, out) = written([frame(7, spec, &[1, 2, 3, 4, 5, 6, 7, 8], true), edit, plain]);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            concat!(
+                "\x1b_Ga=f,i=7,f=32,s=2,v=1,c=1,x=1,y=2,Y=255,X=1,z=100,q=2,m=0;AQIDBAUGBwg=\x1b\\",
+                "\x1b_Ga=f,i=9,f=100,s=640,v=480,o=z,r=2,z=-1,q=2,m=0;/wCA\x1b\\",
+                "\x1b_Ga=f,i=3,f=24,s=1,v=1,q=2,m=0;AQID\x1b\\",
+            )
+        );
+        assert_eq!(writer.keys, BTreeSet::from([3, 7, 9]));
+    }
+
+    #[test]
+    fn animate_commands_carry_only_the_keys_they_set() {
+        let animate = |control| ImageOp::Animate { key: 4, control };
+        let (writer, out) = written([
+            animate(AnimationControl {
+                frame: 1,
+                gap: 30,
+                current: 2,
+                state: Some(AnimationState::Running),
+                loops: 1,
+            }),
+            animate(AnimationControl {
+                frame: 3,
+                gap: -1,
+                ..AnimationControl::default()
+            }),
+            animate(AnimationControl {
+                state: Some(AnimationState::Stopped),
+                ..AnimationControl::default()
+            }),
+            animate(AnimationControl {
+                state: Some(AnimationState::Loading),
+                loops: 5,
+                ..AnimationControl::default()
+            }),
+            animate(AnimationControl::default()),
+        ]);
+        assert_eq!(
+            controls(&out),
+            [
+                "a=a,i=4,r=1,z=30,c=2,s=3,v=1,q=2",
+                "a=a,i=4,r=3,z=-1,q=2",
+                "a=a,i=4,s=1,q=2",
+                "a=a,i=4,s=2,v=5,q=2",
+                "a=a,i=4,q=2",
+            ]
+        );
+        assert!(writer.keys.is_empty());
+    }
+
+    #[test]
+    fn frames_are_chunked_and_nothing_lands_inside_one() {
+        let data = pattern(10_000);
+        let spec = FrameSpec {
+            edit: 2,
+            ..FrameSpec::default()
+        };
+        let (mut writer, out) = written([
+            frame(5, spec, &data[..6000], false),
+            ImageOp::Animate {
+                key: 5,
+                control: AnimationControl {
+                    current: 2,
+                    ..AnimationControl::default()
+                },
+            },
+            frame(6, FrameSpec::default(), &[1; 8], true),
+            transmit(5, &[2; 8], true),
+            ImageOp::Delete { key: 7 },
+            frame(5, spec, &data[6000..], false),
+        ]);
+        assert_eq!(
+            controls(&out),
+            ["a=f,i=5,f=32,s=2,v=1,r=2,q=2,m=1", "m=1", "m=1", "m=1"]
+        );
+        let mut rest = Vec::new();
+        writer.write(frame(5, spec, &[], true), &mut rest);
+        assert_eq!(
+            controls(&rest),
+            [
+                "m=0",
+                "a=a,i=5,c=2,q=2",
+                "a=f,i=6,f=32,s=2,v=1,q=2,m=0",
+                "a=t,i=5,f=32,s=2,v=1,q=2,m=0",
+                "a=d,d=I,i=7,q=2",
+            ]
+        );
+        let commands = commands(&[out, rest].concat());
+        assert_eq!(decoded(&commands[..5]), data);
+        assert!(writer.open.is_none() && writer.queued.is_empty());
     }
 
     #[test]
