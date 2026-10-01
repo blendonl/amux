@@ -787,7 +787,6 @@ git, which is GPL-2.0-only, links OpenSSL 3. openssh is built without Kerberos, 
 - The userland only works for the phone's primary user. Its programs look for their libraries, and its scripts for their interpreters, under `/data/data/io.github.blendonl.amux/`, which is the primary user's data directory, so zsh, git and ssh don't work in a work profile or for a secondary user.
 - `amux update` can't replace amux on the phone: when a newer release is out, it stops with `there are no amux releases for android; build amux from source`. amux comes with the APK, so update the app instead: install `amux-android.apk` from a newer release, which keeps the app's data. An APK you build yourself is signed with another key, so it only installs over another build of your own, with `adb install -r`.
 - Android 12 and later limit the processes that apps start, which Android calls phantom processes, and kill them when there are more than 32 across the phone or when one uses a lot of CPU in the background. The server, the client and every pane's shell are such processes, so a pane's shell can stop without warning, and a server that is killed starts again without its sessions. To lift the limit, turn on "Disable child process restrictions" in the developer options on Android 14 and later, or run `adb shell settings put global settings_enable_monitor_phantom_procs false` from a computer on Android 12L and later. Android 12.0 takes `adb shell device_config set_sync_disabled_for_tests persistent` followed by `adb shell device_config put activity_manager max_phantom_processes 2147483647`.
-- Termux's `libtermux.so` v0.118.3, which the terminal view loads, isn't aligned for 16 KB memory pages, so the terminal may fail to load on phones that use them. The amux binary itself is aligned for 16 KB pages.
 
 #### Without the APK
 
@@ -892,6 +891,8 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 | `android/`                    | The Android app, a Gradle project: the userland installer, the service that runs `amux server`, and the terminal   |
 | `android/build.sh`            | Builds the image, amux and the userland, packages the userland, smoke-tests both in Termux and builds the APK      |
 | `android/docker/`             | The build image: JDK 17, the Android SDK and NDK, Rust with the Android targets, and `cargo-ndk`                   |
+| `android/terminal-emulator/`  | Termux's terminal emulator v0.118.3 and its `libtermux.so`, vendored; `UPSTREAM.md` lists the files amux changed   |
+| `android/terminal-view/`      | Termux's terminal view v0.118.3, the Android view that draws the emulator's screen, vendored the same way          |
 | `android/userland/`           | The userland's `packages.txt`, and the termux-packages commit and builder image `termux-packages.txt` pins         |
 | `android/userland/overlay/`   | Patches to termux-packages, such as the app's package name and openssh without Kerberos or sshd                    |
 | `android/userland/package.py` | Splits a userland into `libu_*.so` programs and a zip with the rest, `SYMLINKS.txt` and `USERLAND_VERSION`         |
