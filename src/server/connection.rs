@@ -14,7 +14,8 @@ use super::status::StatusFeed;
 use super::{target_index, Resolved, Server};
 use crate::pairing;
 use crate::protocol::{
-    AttachedSession, ClientMessage, DebugCommand, Duplex, NewSession, ServerMessage, Size,
+    AttachedSession, ClientMessage, ClientTerminal, DebugCommand, Duplex, NewSession,
+    ServerMessage, Size,
 };
 use crate::target::{validate_session_name, Target};
 
@@ -61,8 +62,12 @@ pub async fn handle(
     mut client: ClientConnection,
     origin: Origin,
 ) -> Result<()> {
-    let Some(request) = client.incoming.recv().await else {
-        return Ok(());
+    let request = loop {
+        match client.incoming.recv().await {
+            Some(ClientMessage::Terminal(_)) => {}
+            Some(request) => break request,
+            None => return Ok(()),
+        }
     };
     debug!(?request, ?origin, "client request");
 
@@ -283,11 +288,14 @@ async fn run_routes(
     origin: Origin,
 ) -> Result<()> {
     let mut size = size.clamped();
+    let mut terminal = None;
     loop {
         let outcome = match route {
-            Route::Local(session) => attach(server, &session, &mut size, client, origin).await?,
+            Route::Local(session) => {
+                attach(server, &session, &mut size, &mut terminal, client, origin).await?
+            }
             Route::Remote { host, opening } => {
-                forward::run(server, client, &host, opening, &mut size).await?
+                forward::run(server, client, &host, opening, &mut size, &mut terminal).await?
             }
         };
         let target = match outcome {
@@ -348,10 +356,15 @@ async fn attach(
     server: &Arc<Server>,
     session: &Arc<Session>,
     size: &mut Size,
+    terminal: &mut Option<ClientTerminal>,
     client: &mut ClientConnection,
     origin: Origin,
 ) -> Result<Outcome> {
     let _client = server.track_client(session, origin);
+    let tracked = session.track_terminal();
+    if let Some(reported) = *terminal {
+        tracked.report(reported);
+    }
     session.resize(*size);
 
     let attached = ServerMessage::Attached(AttachedSession {
@@ -414,6 +427,7 @@ async fn attach(
             message = client.incoming.recv() => match message {
                 Some(ClientMessage::Input(bytes)) => {
                     resize_to_latest(session, *size);
+                    tracked.mark_active();
                     session.record_input();
                     for event in mouse.decode(&bytes) {
                         session.input(event);
@@ -426,11 +440,17 @@ async fn attach(
                 Some(ClientMessage::Resize(new_size)) => {
                     *size = new_size.clamped();
                     session.resize(*size);
+                    tracked.mark_active();
                     differ.set_client_size(*size);
                     dirty = true;
                 }
+                Some(ClientMessage::Terminal(reported)) => {
+                    *terminal = Some(reported);
+                    tracked.report(reported);
+                }
                 Some(ClientMessage::Command(command)) => {
                     resize_to_latest(session, *size);
+                    tracked.mark_active();
                     session.record_input();
                     if let Err(err) = session.run(command.clone()) {
                         debug!(?command, "command failed: {err:#}");

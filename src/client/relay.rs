@@ -13,6 +13,7 @@ use super::chrome::{
     detach_hint, draw_row, render_reconnecting, Panel, PanelEvent, Picker, Placement, Prompt,
     PromptPurpose, Rect, StatusLine, StatusSides, Style, WhichKey, WindowTab,
 };
+use super::graphics::{KittyWriter, TerminalProbe};
 use super::router::{self, Action, KeyRouter, Level};
 use super::scripting::{ClientContext, Effect, Scripting, StatusContext};
 use super::search::{self, Found, Job, JobId, Opening};
@@ -25,7 +26,7 @@ use crate::protocol::{
     AttachedSession, ClientMessage, ClusterStatus, NewSession, ServerMessage, ServerView,
     SessionState, Size,
 };
-use crate::settings::{CallbackId, Keymap, ReloadSettings, Settings};
+use crate::settings::{CallbackId, ClientImages, Keymap, ReloadSettings, Settings};
 use crate::target::Target;
 
 pub const RELOADED: &str = "config reloaded";
@@ -76,6 +77,7 @@ pub struct Relay {
     reload_requested: bool,
     reloading: Option<Result<(), String>>,
     output: Vec<u8>,
+    kitty: KittyWriter,
     messages: Vec<ClientMessage>,
     jobs: Vec<(JobId, Job)>,
     next_job: u64,
@@ -120,6 +122,7 @@ impl Relay {
             reload_requested: false,
             reloading: None,
             output: Vec::new(),
+            kitty: KittyWriter::default(),
             messages: Vec::new(),
             jobs: Vec::new(),
             next_job: 0,
@@ -141,6 +144,7 @@ impl Relay {
         let error = self.last_error.take();
         match message {
             Some(ServerMessage::Output(bytes)) => self.host_output(&bytes),
+            Some(ServerMessage::Image(op)) => self.kitty.write(op, &mut self.output),
             Some(ServerMessage::Attached(attached)) => self.attached_to(attached),
             Some(ServerMessage::SessionState(state)) => {
                 self.session = Some(state);
@@ -264,6 +268,16 @@ impl Relay {
 
     pub fn take_messages(&mut self) -> Vec<ClientMessage> {
         mem::take(&mut self.messages)
+    }
+
+    pub fn images(&self) -> ClientImages {
+        self.settings.images.client
+    }
+
+    pub fn clear_images(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.kitty.cleanup(&mut out);
+        out
     }
 
     pub fn take_jobs(&mut self) -> Vec<(JobId, Job)> {
@@ -482,6 +496,7 @@ impl Relay {
     }
 
     fn attached_to(&mut self, attached: AttachedSession) {
+        self.kitty.cleanup(&mut self.output);
         self.attached = attached;
         self.session = None;
         self.reconnecting = None;
@@ -895,6 +910,7 @@ pub async fn run(
     let mut stdin = terminal::stdin_chunks();
     let mut resizes = signal(SignalKind::window_change())?;
     let mut stdin_open = true;
+    let mut probe = TerminalProbe::new(terminal::cell_pixels());
     let (reloaded, mut reloads) = mpsc::channel(1);
     let (finished, mut finished_jobs) = mpsc::channel(8);
     let config_paths = super::config_paths(endpoint)?;
@@ -902,11 +918,13 @@ pub async fn run(
     let mut next_check = Instant::now() + relay.reload_settings().interval();
 
     loop {
-        let output = relay.take_output();
+        let mut output = relay.take_output();
+        output.extend_from_slice(probe.set_images(relay.images(), Instant::now()));
         if !output.is_empty() {
             terminal::write_output(&output)?;
         }
         if let Some(end) = relay.take_end() {
+            settle(&mut probe, &mut stdin).await;
             return end.map_err(|message| anyhow!(message));
         }
         if relay.take_reload() {
@@ -922,6 +940,9 @@ pub async fn run(
         }
         for message in relay.take_messages() {
             super::send(&outgoing, message).await?;
+        }
+        if let Some(report) = probe.take_report() {
+            super::send(&outgoing, ClientMessage::Terminal(report)).await?;
         }
         for (id, job) in relay.take_jobs() {
             let finished = finished.clone();
@@ -941,6 +962,7 @@ pub async fn run(
         let notice = relay.notice_deadline();
         let status = relay.status_deadline();
         let reload = relay.reload_settings().clone();
+        let probing = probe.deadline();
         tokio::select! {
             message = incoming.recv() => {
                 relay.server_message(message);
@@ -955,13 +977,16 @@ pub async fn run(
                 }
             }
             chunk = stdin.recv(), if stdin_open => match chunk {
-                Some(chunk) => relay.input(&chunk),
+                Some(chunk) => relay.input(&probe.filter(&chunk)),
                 None => {
                     stdin_open = false;
                     relay.stdin_closed();
                 }
             },
-            _ = resizes.recv() => relay.resize(terminal::size()?),
+            _ = resizes.recv() => {
+                relay.resize(terminal::size()?);
+                probe.resized(terminal::cell_pixels());
+            }
             Some(reply) = reloads.recv() => relay.server_reloaded(reply),
             Some((id, found)) = finished_jobs.recv() => relay.job_done(id, found),
             () = sleep_until(escape.unwrap_or_else(Instant::now)), if escape.is_some() => {
@@ -984,6 +1009,22 @@ pub async fn run(
                     );
                 }
             }
+            () = sleep_until(probing.unwrap_or_else(Instant::now)), if probing.is_some() => {
+                relay.input(&probe.time_out());
+            }
+        }
+    }
+}
+
+async fn settle(probe: &mut TerminalProbe, stdin: &mut mpsc::Receiver<Vec<u8>>) {
+    while let Some(deadline) = probe.deadline() {
+        tokio::select! {
+            Some(chunk) = stdin.recv() => {
+                probe.filter(&chunk);
+            }
+            () = sleep_until(deadline) => {
+                probe.time_out();
+            }
         }
     }
 }
@@ -1000,8 +1041,8 @@ mod tests {
     use crate::client::scripting::StatusSpan;
     use crate::identity::Incarnation;
     use crate::protocol::{
-        Direction, ProjectCheckout, ProjectRef, ServerStatus, SessionCommand, SessionId,
-        SessionInfo, WindowSummary,
+        Direction, ImageFormat, ImageOp, ProjectCheckout, ProjectRef, ServerStatus, SessionCommand,
+        SessionId, SessionInfo, WindowSummary,
     };
     use crate::settings::{Binding, Color, StyleSpec, PREFIX_TABLE};
 
@@ -1532,6 +1573,70 @@ mod tests {
                 ClientMessage::Redraw,
             ]
         );
+    }
+
+    const PLACE: &[u8] = b"\x1b_Ga=p,U=1,i=4,c=2,r=1,q=2\x1b\\";
+
+    fn transmit(key: u32, last: bool) -> ServerMessage {
+        ServerMessage::Image(ImageOp::Transmit {
+            key,
+            format: ImageFormat::Png,
+            width: 1,
+            height: 1,
+            compressed: false,
+            total: 6,
+            data: vec![1, 2, 3],
+            last,
+        })
+    }
+
+    #[test]
+    fn images_keep_their_place_in_the_output_even_under_a_panel() {
+        let (mut relay, _) = relay_on("laptop");
+        relay.take_output();
+        let place = ServerMessage::Image(ImageOp::Place {
+            key: 4,
+            cols: 2,
+            rows: 1,
+        });
+        relay.server_message(Some(ServerMessage::Output(b"a".to_vec())));
+        relay.server_message(Some(place.clone()));
+        relay.server_message(Some(ServerMessage::Output(b"b".to_vec())));
+        let output = relay.take_output();
+        assert!(
+            output.starts_with(&[b"a".as_slice(), PLACE, b"b"].concat()),
+            "{:?}",
+            String::from_utf8_lossy(&output)
+        );
+
+        relay.input(b"\x02ss");
+        relay.server_message(Some(cluster()));
+        relay.take_output();
+        relay.server_message(Some(ServerMessage::Output(b"hidden".to_vec())));
+        relay.server_message(Some(place));
+        assert_eq!(relay.take_output(), PLACE);
+    }
+
+    #[test]
+    fn attaching_again_ends_the_upload_and_deletes_the_images() {
+        let (mut relay, _) = relay_on("laptop");
+        relay.server_message(Some(transmit(3, true)));
+        relay.server_message(Some(transmit(5, false)));
+        relay.take_output();
+
+        relay.server_message(Some(ServerMessage::Attached(attached("notes", "laptop"))));
+        let output = relay.take_output();
+        let cleanup = b"\x1b_Gm=0;\x1b\\\x1b_Ga=d,d=I,i=3,q=2\x1b\\\x1b_Ga=d,d=I,i=5,q=2\x1b\\";
+        assert!(
+            output.starts_with(cleanup),
+            "{:?}",
+            String::from_utf8_lossy(&output)
+        );
+
+        relay.server_message(Some(transmit(6, true)));
+        relay.take_output();
+        assert_eq!(relay.clear_images(), b"\x1b_Ga=d,d=I,i=6,q=2\x1b\\");
+        assert_eq!(relay.clear_images(), b"");
     }
 
     fn relay_with(settings: Settings, keymap: Keymap) -> Relay {

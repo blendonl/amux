@@ -292,6 +292,7 @@
 ---@field tree amux.opt.tree
 ---@field which_key amux.opt.which_key
 ---@field search amux.opt.search
+---@field images amux.opt.images
 ---@field pane amux.opt.pane
 ---@field window amux.opt.window
 ---@field session amux.opt.session
@@ -360,6 +361,9 @@
 ---@class amux.opt.search
 ---@field project_dirs string[] The directories to look for repositories in
 ---@field project_depth integer How many levels below each directory to look
+
+---@class amux.opt.images
+---@field client "auto"|"on"|"off" Whether this terminal shows images, auto to ask it
 
 ---@class amux.opt.pane
 ---@field shell? string[] The command a new pane runs, your login shell by default

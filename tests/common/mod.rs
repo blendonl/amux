@@ -18,8 +18,9 @@ use std::time::{Duration, Instant};
 
 use amux::lua::emit;
 use amux::protocol::{
-    self, AttachedSession, ClientMessage, ClusterStatus, Duplex, NewSession, Role, ServerMessage,
-    SessionCommand, SessionInfo, SessionState, Size, Version, Welcome, WindowSummary,
+    self, AttachedSession, CellPixels, ClientMessage, ClientTerminal, ClusterStatus, Duplex,
+    NewSession, Role, ServerMessage, SessionCommand, SessionInfo, SessionState, Size, Version,
+    Welcome, WindowSummary,
 };
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::{getuid, Pid};
@@ -41,6 +42,17 @@ const LAN_PORT_FILE: &str = "lan-port";
 const WATCH_INTERVAL_MS: u64 = 50;
 const FAST_DISCOVERY_MS: &str = "100";
 const REMOTE_PATH: &str = "PATH=/usr/bin:/bin";
+pub const KITTY: ClientTerminal = ClientTerminal {
+    graphics: true,
+    cell_pixels: Some(CellPixels {
+        width: 10,
+        height: 21,
+    }),
+};
+pub const PLAIN: ClientTerminal = ClientTerminal {
+    graphics: false,
+    cell_pixels: None,
+};
 pub const DISCOVERY_OFF: &str =
     "amux.opt.discovery.tailscale = false\namux.opt.discovery.lan = false\n";
 
@@ -695,6 +707,10 @@ pub fn window_summary(index: usize, panes: usize) -> WindowSummary {
         name: "sh".into(),
         panes,
     }
+}
+
+pub fn terminal_log(session: &str, terminal: ClientTerminal) -> String {
+    format!("session={session} terminal={terminal:?}")
 }
 
 fn parse_links(output: &str) -> Vec<LinkLine> {

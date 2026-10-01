@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 
 pub use android::{AndroidSettings, KeyTable, KeyboardLayer, KeyboardSettings};
 pub use callback::{CallbackId, CALLBACK_SLOT};
-pub use client::{SearchSettings, StatusSettings, TreeSettings, WhichKeySettings};
+pub use client::{
+    ClientImages, ImagesSettings, SearchSettings, StatusSettings, TreeSettings, WhichKeySettings,
+};
 pub use cluster::{ClusterSettings, DiscoverySettings, LanSettings, ServerConfig, SshSettings};
 pub use host::{
     BorderSettings, MouseSettings, PaneSettings, ProjectConfig, SessionSettings, WindowSettings,
@@ -51,6 +53,7 @@ pub struct Settings {
     pub tree: TreeSettings,
     pub which_key: WhichKeySettings,
     pub search: SearchSettings,
+    pub images: ImagesSettings,
     pub pane: PaneSettings,
     pub window: WindowSettings,
     pub session: SessionSettings,
@@ -157,6 +160,7 @@ impl Default for Settings {
             tree: TreeSettings::default(),
             which_key: WhichKeySettings::default(),
             search: SearchSettings::default(),
+            images: ImagesSettings::default(),
             pane: PaneSettings::default(),
             window: WindowSettings::default(),
             session: SessionSettings::default(),
@@ -222,6 +226,22 @@ mod tests {
         assert!(toml::from_str::<Settings>("[tree]\nbogus = 1").is_err());
         assert!(toml::from_str::<Settings>("[theme]\nbogus = {}").is_err());
         assert!(toml::from_str::<Settings>("[theme.status]\nbogus = 1").is_err());
+    }
+
+    #[test]
+    fn the_client_images_mode_is_auto_on_or_off() {
+        assert_eq!(Settings::default().images.client, ClientImages::Auto);
+        for (written, mode) in [
+            ("auto", ClientImages::Auto),
+            ("on", ClientImages::On),
+            ("off", ClientImages::Off),
+        ] {
+            let settings: Settings =
+                toml::from_str(&format!("[images]\nclient = \"{written}\"")).unwrap();
+            assert_eq!(settings.images.client, mode);
+        }
+        assert!(toml::from_str::<Settings>("[images]\nclient = \"yes\"").is_err());
+        assert!(toml::from_str::<Settings>("[images]\nbogus = 1").is_err());
     }
 
     #[test]
