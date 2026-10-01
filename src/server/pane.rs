@@ -13,6 +13,7 @@ use portable_pty::{
 };
 
 use super::layout::PaneId;
+use super::replies::{CellPixels, PaneCallbacks};
 use crate::protocol::{is_locale_variable, Size};
 use crate::settings::PaneSettings;
 
@@ -36,7 +37,7 @@ pub struct Pane {
     master: Mutex<Box<dyn MasterPty + Send>>,
     input: mpsc::Sender<Vec<u8>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<vt100::Parser<PaneCallbacks>>>,
 }
 
 impl Pane {
@@ -44,7 +45,7 @@ impl Pane {
         check_working_directory(spec.cwd)?;
         let size = spec.size.clamped();
         let pair = native_pty_system()
-            .openpty(pty_size(size))
+            .openpty(pty_size(size, None))
             .context("opening a pty")?;
 
         let child = pair
@@ -54,12 +55,13 @@ impl Pane {
         drop(pair.slave);
 
         let reader = pair.master.try_clone_reader()?;
-        let writer = pair.master.take_writer()?;
+        let input = spawn_input_pump(pair.master.take_writer()?);
         let killer = child.clone_killer();
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(
+        let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
             size.rows,
             size.cols,
             spec.settings.scrollback,
+            PaneCallbacks::new(input.clone()),
         )));
 
         spawn_output_pump(
@@ -74,7 +76,7 @@ impl Pane {
 
         Ok(Self {
             master: Mutex::new(pair.master),
-            input: spawn_input_pump(writer),
+            input,
             killer: Mutex::new(killer),
             parser,
         })
@@ -99,11 +101,35 @@ impl Pane {
         if self.with_screen(|screen| screen.size()) == (size.rows, size.cols) {
             return Ok(());
         }
-        lock(&self.master).resize(pty_size(size))?;
+        let master = lock(&self.master);
+        master.resize(pty_size(size, self.cell_pixels()))?;
         lock(&self.parser)
             .screen_mut()
             .set_size(size.rows, size.cols);
         Ok(())
+    }
+
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub fn set_cell_pixels(&self, pixels: Option<CellPixels>) -> Result<()> {
+        let master = lock(&self.master);
+        let parser = lock(&self.parser);
+        if !parser.callbacks().set_cell_pixels(pixels) {
+            return Ok(());
+        }
+        let (rows, cols) = parser.screen().size();
+        let pixels = parser.callbacks().cell_pixels();
+        drop(parser);
+        master.resize(pty_size(Size { rows, cols }, pixels))?;
+        Ok(())
+    }
+
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub fn set_graphics(&self, graphics: bool) {
+        lock(&self.parser).callbacks().set_graphics(graphics);
+    }
+
+    fn cell_pixels(&self) -> Option<CellPixels> {
+        lock(&self.parser).callbacks().cell_pixels()
     }
 }
 
@@ -175,7 +201,7 @@ fn is_executable(path: &Path) -> bool {
 
 struct OutputSinks {
     pane: PaneId,
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<vt100::Parser<PaneCallbacks>>>,
     observer: Weak<dyn PaneObserver>,
 }
 
@@ -222,12 +248,13 @@ fn spawn_input_pump(mut writer: Box<dyn Write + Send>) -> mpsc::Sender<Vec<u8>> 
     sender
 }
 
-fn pty_size(size: Size) -> PtySize {
+fn pty_size(size: Size, cell_pixels: Option<CellPixels>) -> PtySize {
+    let (width, height) = cell_pixels.map_or((0, 0), |pixels| (pixels.width, pixels.height));
     PtySize {
         rows: size.rows,
         cols: size.cols,
-        pixel_width: 0,
-        pixel_height: 0,
+        pixel_width: size.cols.saturating_mul(width),
+        pixel_height: size.rows.saturating_mul(height),
     }
 }
 
@@ -258,6 +285,19 @@ mod tests {
             shell: Some(argv.iter().map(|arg| (*arg).to_owned()).collect()),
             ..PaneSettings::default()
         }
+    }
+
+    fn spawn_pane(settings: &PaneSettings, size: Size) -> Pane {
+        let observer: Weak<dyn PaneObserver> = Weak::<Quiet>::new();
+        Pane::spawn(PaneSpec {
+            id: PaneId(0),
+            cwd: Path::new("/"),
+            size,
+            env: &[],
+            settings,
+            observer,
+        })
+        .unwrap()
     }
 
     fn screen_text(pane: &Pane) -> String {
@@ -334,19 +374,62 @@ mod tests {
         assert!(by_path.is_default_prog());
         assert_eq!(by_path.get_env("SHELL"), Some(OsStr::new("/bin/sh")));
 
-        let observer: Weak<dyn PaneObserver> = Weak::<Quiet>::new();
-        let pane = Pane::spawn(PaneSpec {
-            id: PaneId(0),
-            cwd: Path::new("/"),
-            size: Size { rows: 10, cols: 40 },
-            env: &[],
-            settings: &with_shell(&["/bin/sh"]),
-            observer,
-        })
-        .unwrap();
+        let pane = spawn_pane(&with_shell(&["/bin/sh"]), Size { rows: 10, cols: 40 });
         pane.write_input(b"echo \"[$0]\"\r".to_vec()).unwrap();
         let text = wait_for(&pane, "[-sh]");
         assert!(text.contains("[-sh]"), "{text}");
+    }
+
+    #[test]
+    fn a_program_reads_the_cursor_position_it_asks_for() {
+        let script = r#"printf '\033[6n'; read -r reply; printf 'got%s' "${reply#?}""#;
+        let pane = spawn_pane(
+            &with_shell(&["/bin/sh", "-c", script]),
+            Size { rows: 10, cols: 40 },
+        );
+        let echoed = wait_for(&pane, "^[[1;1R");
+        assert!(echoed.contains("^[[1;1R"), "{echoed}");
+        pane.write_input(b"\r".to_vec()).unwrap();
+        let text = wait_for(&pane, "got[1;1R");
+        assert!(text.contains("got[1;1R"), "{text}");
+    }
+
+    #[test]
+    fn the_pty_size_carries_pixels_once_the_cell_size_is_known() {
+        let pane = spawn_pane(&with_shell(&["/bin/sh"]), Size { rows: 10, cols: 40 });
+        let pty = |rows, cols, pixel_width, pixel_height| {
+            assert_eq!(
+                lock(&pane.master).get_size().unwrap(),
+                PtySize {
+                    rows,
+                    cols,
+                    pixel_width,
+                    pixel_height
+                }
+            );
+        };
+        pty(10, 40, 0, 0);
+
+        let cell = CellPixels {
+            width: 9,
+            height: 18,
+        };
+        pane.set_cell_pixels(Some(cell)).unwrap();
+        pty(10, 40, 360, 180);
+        pane.resize(Size { rows: 12, cols: 50 }).unwrap();
+        pty(12, 50, 450, 216);
+        pane.resize(Size { rows: 12, cols: 50 }).unwrap();
+        pty(12, 50, 450, 216);
+        pane.set_cell_pixels(None).unwrap();
+        pty(12, 50, 0, 0);
+    }
+
+    #[test]
+    fn the_graphics_flag_reaches_the_responder() {
+        let pane = spawn_pane(&with_shell(&["/bin/sh"]), Size { rows: 10, cols: 40 });
+        assert!(!lock(&pane.parser).callbacks().graphics());
+        pane.set_graphics(true);
+        assert!(lock(&pane.parser).callbacks().graphics());
     }
 
     #[test]

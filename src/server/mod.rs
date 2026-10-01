@@ -7,6 +7,7 @@ mod pane;
 mod projects;
 mod reload;
 mod render;
+mod replies;
 mod session;
 mod status;
 mod window;
