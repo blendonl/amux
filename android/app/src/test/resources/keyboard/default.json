@@ -1,193 +1,485 @@
 {
   "width": {
-    "left": 25.0,
-    "right": 25.0
+    "left": 21.0,
+    "right": 21.0
   },
+  "hold_ms": 300,
+  "taps_ms": 250,
   "layers": {
-    "base": {
-      "left": [
-        [
-          "Escape",
-          "1",
-          "2",
-          "3",
-          "4",
-          "5"
-        ],
-        [
-          "Tab",
-          "q",
-          "w",
-          "e",
-          "r",
-          "t"
-        ],
-        [
-          "Ctrl",
-          "a",
-          "s",
-          "d",
-          "f",
-          "g"
-        ],
-        [
-          "Shift",
-          "z",
-          "x",
-          "c",
-          "v",
-          "b"
-        ],
-        [
-          "Prefix",
-          "Alt",
-          "layer:nav",
-          "layer:sym",
-          {
-            "key": "Space",
-            "width": 2.0
-          }
-        ]
-      ],
+    "amux": {
       "right": [
         [
-          "6",
-          "7",
-          "8",
-          "9",
-          "0",
-          "Backspace"
+          {
+            "send": "\u0002c",
+            "label": "+win"
+          },
+          {
+            "send": "\u0002p",
+            "label": "‹win"
+          },
+          {
+            "send": "\u0002n",
+            "label": "win›"
+          },
+          {
+            "send": "\u0002,",
+            "label": "rename"
+          },
+          {
+            "send": "\u0002&",
+            "label": "✕win"
+          }
         ],
         [
-          "y",
-          "u",
-          "i",
-          "o",
-          "p",
-          "'"
+          {
+            "send": "\u0002%",
+            "label": "split│"
+          },
+          {
+            "send": "\u0002\"",
+            "label": "split─"
+          },
+          {
+            "send": "\u0002o",
+            "label": "pane›"
+          },
+          {
+            "send": "\u0002x",
+            "label": "✕pane"
+          },
+          {
+            "send": "\u0002?",
+            "label": "help"
+          }
         ],
         [
-          "h",
-          "j",
-          "k",
-          "l",
-          ";",
-          "Enter"
+          {
+            "send": "\u0002sp",
+            "label": "projects"
+          },
+          {
+            "send": "\u0002sw",
+            "label": "worktrees"
+          },
+          {
+            "send": "\u0002ss",
+            "label": "tree"
+          },
+          {
+            "send": "\u0002r",
+            "label": "reload"
+          },
+          {
+            "send": "\u0002d",
+            "label": "detach"
+          }
         ],
         [
-          "n",
-          "m",
-          ",",
-          ".",
-          "/",
-          "Shift"
+          {
+            "send": "\u0002$",
+            "label": "session"
+          },
+          "Hide",
+          "",
+          "",
+          ""
         ],
         [
           {
             "key": "Space",
             "width": 2.0
           },
+          "Backspace",
           "layer:sym",
-          "layer:nav",
-          "Ctrl",
-          "Alt"
+          "layer:num"
         ]
       ]
     },
-    "nav": {
+    "base": {
       "left": [
         [
           "Escape",
-          "F1",
-          "F2",
-          "F3",
-          "F4",
-          "F5"
-        ],
-        [
           "Tab",
-          "F6",
-          "F7",
-          "F8",
-          "F9",
-          "F10"
+          "'",
+          "-",
+          ""
         ],
         [
-          "Ctrl",
-          "F11",
-          "F12",
-          "Insert",
-          "Delete",
-          "Paste"
+          {
+            "key": "q",
+            "hold": [
+              "Q",
+              "C-q",
+              "M-q"
+            ]
+          },
+          {
+            "key": "w",
+            "hold": [
+              "W",
+              "C-w",
+              "M-w"
+            ]
+          },
+          {
+            "key": "e",
+            "hold": [
+              "E",
+              "C-e",
+              "M-e"
+            ]
+          },
+          {
+            "key": "r",
+            "hold": [
+              "R",
+              "C-r",
+              "M-r"
+            ]
+          },
+          {
+            "key": "t",
+            "hold": [
+              "T",
+              "C-t",
+              "M-t"
+            ]
+          }
+        ],
+        [
+          {
+            "key": "a",
+            "hold": [
+              "A",
+              "C-a",
+              "M-a"
+            ]
+          },
+          {
+            "key": "s",
+            "hold": [
+              "S",
+              "C-s",
+              "M-s"
+            ]
+          },
+          {
+            "key": "d",
+            "hold": [
+              "D",
+              "C-d",
+              "M-d"
+            ]
+          },
+          {
+            "key": "f",
+            "hold": [
+              "F",
+              "C-f",
+              "M-f"
+            ]
+          },
+          {
+            "key": "g",
+            "hold": [
+              "G",
+              "C-g",
+              "M-g"
+            ]
+          }
+        ],
+        [
+          {
+            "key": "z",
+            "hold": [
+              "Z",
+              "C-z",
+              "M-z"
+            ]
+          },
+          {
+            "key": "x",
+            "hold": [
+              "X",
+              "C-x",
+              "M-x"
+            ]
+          },
+          {
+            "key": "c",
+            "hold": [
+              "C",
+              "C-c",
+              "M-c"
+            ]
+          },
+          {
+            "key": "v",
+            "hold": [
+              "V",
+              "C-v",
+              "M-v"
+            ]
+          },
+          {
+            "key": "b",
+            "hold": [
+              "B",
+              "C-b",
+              "M-b"
+            ]
+          }
         ],
         [
           "Shift",
-          "",
-          "",
-          "",
-          "",
-          "Hide"
-        ],
-        [
-          "Prefix",
-          "Alt",
           "layer:nav",
-          "layer:sym",
           {
-            "key": "Space",
-            "width": 2.0
+            "send": "\u0002",
+            "label": "Prefix",
+            "hold": "layer:amux"
           }
         ]
       ],
       "right": [
         [
           "",
-          "",
-          "",
-          "",
-          "",
-          "Backspace"
+          "Ctrl",
+          "Alt",
+          "Paste",
+          "Enter"
         ],
         [
-          "Home",
-          "PageDown",
-          "PageUp",
-          "End",
+          {
+            "key": "y",
+            "hold": [
+              "Y",
+              "C-y",
+              "M-y"
+            ]
+          },
+          {
+            "key": "u",
+            "hold": [
+              "U",
+              "C-u",
+              "M-u"
+            ]
+          },
+          {
+            "key": "i",
+            "hold": [
+              "I",
+              "M-i"
+            ]
+          },
+          {
+            "key": "o",
+            "hold": [
+              "O",
+              "C-o",
+              "M-o"
+            ]
+          },
+          {
+            "key": "p",
+            "hold": [
+              "P",
+              "C-p",
+              "M-p"
+            ]
+          }
+        ],
+        [
+          {
+            "key": "h",
+            "hold": [
+              "H",
+              "C-h",
+              "M-h"
+            ]
+          },
+          {
+            "key": "j",
+            "hold": [
+              "J",
+              "C-j",
+              "M-j"
+            ]
+          },
+          {
+            "key": "k",
+            "hold": [
+              "K",
+              "C-k",
+              "M-k"
+            ]
+          },
+          {
+            "key": "l",
+            "hold": [
+              "L",
+              "C-l",
+              "M-l"
+            ]
+          },
+          ";"
+        ],
+        [
+          {
+            "key": "n",
+            "hold": [
+              "N",
+              "C-n",
+              "M-n"
+            ]
+          },
+          {
+            "key": "m",
+            "hold": [
+              "M",
+              "M-m"
+            ]
+          },
+          ",",
+          ".",
+          "/"
+        ],
+        [
+          {
+            "key": "Space",
+            "width": 2.0
+          },
+          "Backspace",
+          "layer:sym",
+          "layer:num"
+        ]
+      ]
+    },
+    "nav": {
+      "right": [
+        [
           "",
-          "'"
+          "Ctrl",
+          "Alt",
+          "Paste",
+          "Enter"
+        ],
+        [
+          "",
+          "",
+          "",
+          "",
+          ""
         ],
         [
           "Left",
           "Down",
           "Up",
           "Right",
-          "Delete",
-          "Enter"
+          "Delete"
         ],
         [
-          "Paste",
-          "Hide",
-          "",
-          "",
-          "",
-          "Shift"
+          "Home",
+          "PageDown",
+          "PageUp",
+          "End",
+          "Insert"
         ],
         [
           {
             "key": "Space",
             "width": 2.0
           },
+          "Backspace",
           "layer:sym",
+          "layer:num"
+        ]
+      ]
+    },
+    "num": {
+      "left": [
+        [
+          "",
+          {
+            "key": "1",
+            "shift": "1",
+            "hold": "F1"
+          },
+          {
+            "key": "2",
+            "shift": "2",
+            "hold": "F2"
+          },
+          {
+            "key": "3",
+            "shift": "3",
+            "hold": "F3"
+          },
+          "F11"
+        ],
+        [
+          "",
+          {
+            "key": "4",
+            "shift": "4",
+            "hold": "F4"
+          },
+          {
+            "key": "5",
+            "shift": "5",
+            "hold": "F5"
+          },
+          {
+            "key": "6",
+            "shift": "6",
+            "hold": "F6"
+          },
+          "F12"
+        ],
+        [
+          "",
+          {
+            "key": "7",
+            "shift": "7",
+            "hold": "F7"
+          },
+          {
+            "key": "8",
+            "shift": "8",
+            "hold": "F8"
+          },
+          {
+            "key": "9",
+            "shift": "9",
+            "hold": "F9"
+          },
+          ""
+        ],
+        [
+          "",
+          "",
+          {
+            "key": "0",
+            "shift": "0",
+            "hold": "F10"
+          },
+          "",
+          ""
+        ],
+        [
+          "Shift",
           "layer:nav",
-          "Ctrl",
-          "Alt"
+          {
+            "send": "\u0002",
+            "label": "Prefix",
+            "hold": "layer:amux"
+          }
         ]
       ]
     },
     "sym": {
       "left": [
         [
-          "Escape",
           "!",
           "@",
           "#",
@@ -195,82 +487,49 @@
           "%"
         ],
         [
-          "Tab",
-          "`",
-          "~",
-          "\\",
-          "|",
-          "&"
-        ],
-        [
-          "Ctrl",
-          "-",
-          "_",
-          "=",
-          "+",
-          "*"
-        ],
-        [
-          "Shift",
-          "<",
-          ">",
-          "(",
-          ")",
-          "\""
-        ],
-        [
-          "Prefix",
-          "Alt",
-          "layer:nav",
-          "layer:sym",
-          {
-            "key": "Space",
-            "width": 2.0
-          }
-        ]
-      ],
-      "right": [
-        [
           "^",
           "&",
           "*",
           "(",
-          ")",
-          "Backspace"
-        ],
-        [
-          "[",
-          "]",
-          "{",
-          "}",
-          "|",
-          "'"
-        ],
-        [
-          "-",
-          "=",
-          "_",
-          "+",
-          ":",
-          "Enter"
-        ],
-        [
-          "<",
-          ">",
-          "~",
-          "`",
-          "?",
-          "Shift"
+          ")"
         ],
         [
           {
-            "key": "Space",
-            "width": 2.0
+            "key": "[",
+            "shift": "["
           },
-          "layer:sym",
+          {
+            "key": "]",
+            "shift": "]"
+          },
+          {
+            "key": "=",
+            "shift": "="
+          },
+          {
+            "key": "\\",
+            "shift": "\\"
+          },
+          {
+            "key": "`",
+            "shift": "`"
+          }
+        ],
+        [
+          "{",
+          "}",
+          "+",
+          "|",
+          "~"
+        ],
+        [
+          "Shift",
           "layer:nav",
-          "Ctrl",
-          "Alt"
+          {
+            "send": "\u0002",
+            "label": "Prefix",
+            "hold": "layer:amux"
+          }
         ]
       ]
     }
