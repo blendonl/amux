@@ -8,7 +8,7 @@ import org.junit.Test
 
 class KeyboardLoaderTest {
     private val defaults = File("src/test/resources/keyboard/default.json").readText()
-    private val configured = defaults.replace("\"left\": 25.0", "\"left\": 30.0")
+    private val configured = defaults.replace("\"left\": 21.0", "\"left\": 30.0")
     private val broken = "init.lua: amux.opt.android.keyboard.width.left must be between 5 and 45"
     private val asked = mutableListOf<Boolean>()
 
@@ -39,7 +39,7 @@ class KeyboardLoaderTest {
     fun `falls back to the defaults when there is no keyboard yet`() {
         val loaded = loader(Result.failure(IOException(broken))).load(keepCurrentOnFailure = false)
 
-        assertEquals(25f, loaded.layout?.leftPercent)
+        assertEquals(21f, loaded.layout?.leftPercent)
         assertEquals(broken, loaded.problem)
         assertEquals(listOf(false, true), asked)
     }

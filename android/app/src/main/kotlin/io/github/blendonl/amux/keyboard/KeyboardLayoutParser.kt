@@ -8,6 +8,8 @@ class KeyboardLayoutException(message: String) : Exception(message)
 
 object KeyboardLayoutParser {
     private const val WIDTH = "width"
+    private const val HOLD_MS = "hold_ms"
+    private const val TAPS_MS = "taps_ms"
     private const val LAYERS = "layers"
     private const val LEFT = "left"
     private const val RIGHT = "right"
@@ -17,6 +19,8 @@ object KeyboardLayoutParser {
     private const val LABEL = "label"
     private const val SHIFT = "shift"
     private const val REPEATS = "repeats"
+    private const val HOLD = "hold"
+    private const val TAPS = "taps"
     private const val DELETE = 0x7f
     private const val CONTROL_TO_CARET = 0x40
 
@@ -32,11 +36,21 @@ object KeyboardLayoutParser {
             for (name in layersJson.keys()) {
                 val path = "$LAYERS.$name"
                 val layer = objectField(layersJson, name, path)
-                put(name, Layer(name, rows(layer, "$path.$LEFT", LEFT), rows(layer, "$path.$RIGHT", RIGHT)))
+                val left = if (layer.has(LEFT)) rows(layer, "$path.$LEFT", LEFT) else null
+                val right = if (layer.has(RIGHT)) rows(layer, "$path.$RIGHT", RIGHT) else null
+                if (left == null && right == null) fail(path, "needs $LEFT, $RIGHT or both")
+                put(name, Layer(name, left, right))
             }
         }
-        if (KeyboardLayout.BASE !in layers) fail(LAYERS, "has no ${KeyboardLayout.BASE} layer")
-        return KeyboardLayout(number(width, LEFT, WIDTH), number(width, RIGHT, WIDTH), layers)
+        val base = layers[KeyboardLayout.BASE] ?: fail(LAYERS, "has no ${KeyboardLayout.BASE} layer")
+        if (base.left == null || base.right == null) fail("$LAYERS.${KeyboardLayout.BASE}", "needs both $LEFT and $RIGHT")
+        return KeyboardLayout(
+            number(width, LEFT, WIDTH),
+            number(width, RIGHT, WIDTH),
+            layers,
+            milliseconds(root, HOLD_MS, KeyboardLayout.DEFAULT_HOLD_MS),
+            milliseconds(root, TAPS_MS, KeyboardLayout.DEFAULT_TAPS_MS),
+        )
     }
 
     private fun rows(layer: JSONObject, path: String, side: String): KeyRows {
@@ -77,7 +91,20 @@ object KeyboardLayoutParser {
             shiftedLabel = if (label != null && shifted == null) label else withShift.shiftedLabel,
             width = if (json.has(WIDTH)) number(json, WIDTH, path) else withShift.width,
             repeats = if (json.has(REPEATS)) json.getBoolean(REPEATS) else withShift.repeats,
+            hold = if (json.has(HOLD)) hold(json.opt(HOLD), "$path.$HOLD") else null,
+            taps = if (json.has(TAPS)) keys(json.opt(TAPS), "$path.$TAPS") else emptyList(),
         )
+    }
+
+    private fun hold(value: Any?, path: String): Hold = when (value) {
+        is JSONArray -> Hold.Choices(keys(value, path))
+        else -> Hold.Alternate(key(value, path))
+    }
+
+    private fun keys(value: Any?, path: String): List<Key> {
+        val keys = value as? JSONArray ?: fail(path, "should be a list of keys")
+        if (keys.length() == 0) fail(path, "needs at least one key")
+        return List(keys.length()) { index -> key(keys.opt(index), "$path[${index + 1}]") }
     }
 
     private fun caretNotation(text: String): String = buildString {
@@ -89,6 +116,9 @@ object KeyboardLayoutParser {
             }
         }
     }
+
+    private fun milliseconds(json: JSONObject, field: String, default: Long): Long =
+        if (!json.has(field)) default else (json.opt(field) as? Number)?.toLong() ?: fail(field, "should be a number")
 
     private fun number(json: JSONObject, field: String, path: String): Float =
         (json.opt(field) as? Number)?.toFloat() ?: fail("$path.$field", "should be a number")
