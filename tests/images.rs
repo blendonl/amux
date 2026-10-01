@@ -5,7 +5,8 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use amux::protocol::{
-    CellPixels, ClientMessage, ClientTerminal, ImageFormat, ImageOp, ServerMessage,
+    AnimationControl, AnimationState, CellPixels, ClientMessage, ClientTerminal, FrameSpec,
+    ImageFormat, ImageOp, ServerMessage,
 };
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -104,7 +105,7 @@ fn uploaded(ops: &[ImageOp]) -> Option<(u32, Vec<u8>, (u16, u16))> {
                 }
             }
             ImageOp::Place { key, cols, rows } => return Some((*key, data, (*cols, *rows))),
-            ImageOp::Delete { .. } => {}
+            ImageOp::Delete { .. } | ImageOp::Frame { .. } | ImageOp::Animate { .. } => {}
         }
     }
     None
@@ -322,8 +323,77 @@ fn order(ops: &[ImageOp]) -> Vec<(char, u32, u32, u32)> {
             } => ('t', *key, *width, *height),
             ImageOp::Place { key, cols, rows } => ('p', *key, u32::from(*cols), u32::from(*rows)),
             ImageOp::Delete { key } => ('d', *key, 0, 0),
+            ImageOp::Frame {
+                key, width, height, ..
+            } => ('f', *key, *width, *height),
+            ImageOp::Animate { key, .. } => ('a', *key, 0, 0),
         })
         .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_two_frame_animation_reaches_a_kitty_client_and_comes_back_after_a_switch() {
+    let server = TestServer::start();
+    let mut other = server.client().await;
+    other.new_session(Some("t")).await;
+    other.detach().await;
+    let mut client = kitty_session(&server, "s").await;
+    let key = show_tiny_png(&mut client).await;
+
+    let quoted = shell_words::quote(&fixture().display().to_string()).into_owned();
+    client
+        .type_text(&show("a=f,i=1,f=100,z=120", &format!("cat {quoted}")))
+        .await;
+    client
+        .type_text("printf '\\033_Ga=a,i=1,s=3,v=1,q=2\\033\\\\'\r")
+        .await;
+    let ops = images_until(&mut client, "the frame and the animation", |ops, _| {
+        ops.iter().any(|op| matches!(op, ImageOp::Animate { .. }))
+    })
+    .await;
+    let png = fs::read(fixture()).unwrap();
+    let frame = ImageOp::Frame {
+        key,
+        spec: FrameSpec {
+            gap: 120,
+            ..FrameSpec::default()
+        },
+        format: ImageFormat::Png,
+        width: 20,
+        height: 40,
+        compressed: false,
+        total: u32::try_from(png.len()).unwrap(),
+        data: png,
+        last: true,
+    };
+    let running = ImageOp::Animate {
+        key,
+        control: AnimationControl {
+            state: Some(AnimationState::Running),
+            ..AnimationControl::default()
+        },
+    };
+    assert_eq!(ops, [frame.clone(), running.clone()]);
+
+    switch(&mut client, "t").await;
+    client.reset_screen();
+    let mut ops = switch(&mut client, "s").await;
+    ops.extend(
+        images_until(&mut client, "the animation to come back", |ops, _| {
+            ops.last() == Some(&running)
+        })
+        .await,
+    );
+    assert_eq!(
+        order(&ops),
+        [
+            ('t', key, 20, 40),
+            ('p', key, 2, 2),
+            ('f', key, 20, 40),
+            ('a', key, 0, 0),
+        ]
+    );
+    assert_eq!(ops[2], frame);
 }
 
 #[tokio::test(flavor = "multi_thread")]

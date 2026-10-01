@@ -1,3 +1,4 @@
+pub mod animation;
 pub mod apc;
 pub mod command;
 pub mod derive;
@@ -19,7 +20,7 @@ use command::{Action, Command};
 use place::{active_buffer, Marked};
 use respond::{Code, Failure, Recipient};
 use sixel_display::FinishedSixel;
-use store::{Buffer, Name, PaneImages, Stored};
+use store::{Animated, Buffer, ImageData, Name, PaneImages, Stored};
 use transmit::{Step, Transmission, Transmissions};
 
 type PaneParser = vt100::Parser<PaneCallbacks>;
@@ -114,12 +115,13 @@ impl KittyGraphics {
         };
         let buffer = active_buffer(lock(parser).screen());
         match command.action {
-            Action::Transmit | Action::TransmitAndPlace | Action::Query => {
+            Action::Transmit | Action::TransmitAndPlace | Action::Query | Action::Frame => {
                 self.transmit(buffer, command, parser);
             }
             Action::Place => self.put(buffer, &command, parser),
             Action::Delete => self.delete(buffer, &command, parser),
-            Action::Frame | Action::Animate | Action::Compose => {}
+            Action::Animate => self.animate(buffer, &command, parser),
+            Action::Compose => self.compose(buffer, &command, parser),
         }
     }
 
@@ -127,6 +129,15 @@ impl KittyGraphics {
         let (command, outcome) = match self.transmissions.receive(buffer, command) {
             Step::Waiting | Step::Swallowed => return,
             Step::Failed(command, failure) => (command, Err(failure)),
+            Step::Complete(Transmission { command, data }) if command.action == Action::Frame => {
+                let outcome = self.frame(buffer, &command, data);
+                let recipient = Recipient {
+                    frame: *outcome.as_ref().unwrap_or(&command.rows),
+                    ..Recipient::of(&command)
+                };
+                reply(recipient, &outcome.map(drop), parser);
+                return;
+            }
             Step::Complete(Transmission { command, data }) => {
                 let outcome = self.complete(buffer, &command, data, parser);
                 (command, outcome)
@@ -184,6 +195,86 @@ impl KittyGraphics {
         Ok(stored.id)
     }
 
+    fn frame(&mut self, buffer: Buffer, command: &Command, data: Vec<u8>) -> Result<u32, Failure> {
+        let mut animated = self.animated(buffer, command)?;
+        let image = transmit::load(command, data)?.packed();
+        let read_at = animated.animation.revision();
+        let frame = animated
+            .animation
+            .add(command.frame(), ImageData::new(animated.key, image))?;
+        self.images
+            .animate(animated.key, read_at, animated.animation)?;
+        Ok(frame)
+    }
+
+    fn animate(&mut self, buffer: Buffer, command: &Command, parser: &Mutex<PaneParser>) {
+        let outcome = self.animated(buffer, command).and_then(|mut animated| {
+            let read_at = animated.animation.revision();
+            animated.animation.control(command.control());
+            if animated.animation.revision() == read_at {
+                return Ok(());
+            }
+            self.images
+                .animate(animated.key, read_at, animated.animation)
+        });
+        if outcome.is_err() {
+            reply(Recipient::of(command), &outcome, parser);
+        }
+    }
+
+    fn compose(&mut self, buffer: Buffer, command: &Command, parser: &Mutex<PaneParser>) {
+        let outcome = self.animated(buffer, command).and_then(|mut animated| {
+            let read_at = animated.animation.revision();
+            animated.animation.compose(command.composition())?;
+            self.images
+                .animate(animated.key, read_at, animated.animation)
+        });
+        reply(Recipient::of(command), &outcome, parser);
+    }
+
+    fn delete_frame(&mut self, buffer: Buffer, command: &Command, parser: &Mutex<PaneParser>) {
+        let Ok(mut animated) = self.animated(buffer, command) else {
+            return;
+        };
+        let read_at = animated.animation.revision();
+        let removed = animated.animation.remove(command.rows).and_then(|removed| {
+            if removed {
+                self.images
+                    .animate(animated.key, read_at, animated.animation)?;
+            }
+            Ok(removed)
+        });
+        match removed {
+            Ok(false) if command.delete == b'F' => {
+                let image = Command {
+                    delete: if command.id == 0 { b'N' } else { b'I' },
+                    placement: 0,
+                    ..command.clone()
+                };
+                self.delete(buffer, &image, parser);
+            }
+            Ok(_) => {}
+            Err(failure) => debug!(?failure, "keeping a frame that can't be deleted"),
+        }
+    }
+
+    fn animated(&self, buffer: Buffer, command: &Command) -> Result<Animated, Failure> {
+        let name = match (command.id, command.number) {
+            (0, 0) => return Err(Failure::new(Code::Einval, "no image id or number")),
+            (0, number) => Name::Number(number),
+            (_, 0) => Name::Id(command.id),
+            _ => {
+                return Err(Failure::new(
+                    Code::Einval,
+                    "an image can't have both an id and a number",
+                ))
+            }
+        };
+        self.images
+            .animation(buffer, name)
+            .ok_or_else(|| Failure::new(Code::Enoent, "no such image"))
+    }
+
     fn delete(&mut self, buffer: Buffer, command: &Command, parser: &Mutex<PaneParser>) {
         self.transmissions.abort(buffer);
         {
@@ -203,6 +294,7 @@ impl KittyGraphics {
             (b'R', 0) => self
                 .images
                 .free_ids(buffer, command.source_x..=command.source_y),
+            (b'f' | b'F', _) => self.delete_frame(buffer, command, parser),
             _ => {}
         }
     }
@@ -223,7 +315,11 @@ fn answer(command: &Command, outcome: Result<u32, Failure>, parser: &Mutex<PaneP
         id: *outcome.as_ref().unwrap_or(&command.id),
         ..Recipient::of(command)
     };
-    if let Some(reply) = recipient.reply(&outcome.map(drop)) {
+    reply(recipient, &outcome.map(drop), parser);
+}
+
+fn reply(recipient: Recipient, outcome: &Result<(), Failure>, parser: &Mutex<PaneParser>) {
+    if let Some(reply) = recipient.reply(outcome) {
         lock(parser).callbacks().reply(reply);
     }
 }
@@ -236,10 +332,12 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use std::sync::{mpsc, Arc};
 
+    use super::animation::Step;
     use super::store::ImageStore;
     use super::*;
 
     const PIXEL: &str = "f=24,s=1,v=1;AAAA";
+    const WIDE: &str = "f=24,s=2,v=1;AAAAAAAA";
 
     struct Pane {
         graphics: PaneGraphics,
@@ -295,6 +393,20 @@ mod tests {
 
         fn show_images(&self, graphics: bool) {
             lock(&self.parser).callbacks().set_graphics(graphics);
+        }
+
+        fn frames(&self, name: Name) -> usize {
+            let animated = self.images.animation(Buffer::Main, name).unwrap();
+            let steps = animated.animation.steps();
+            steps
+                .iter()
+                .filter(|step| matches!(step, Step::Frame(..)))
+                .count()
+        }
+
+        fn revision(&self, name: Name) -> u64 {
+            let animated = self.images.animation(Buffer::Main, name).unwrap();
+            animated.animation.revision()
         }
 
         fn image(&self, buffer: Buffer, name: Name) -> Option<store::ImageData> {
@@ -514,20 +626,136 @@ mod tests {
     }
 
     #[test]
-    fn malformed_and_later_phase_commands_are_ignored() {
+    fn malformed_commands_are_ignored() {
         let mut pane = Pane::new();
         pane.show_images(true);
-        for body in [
-            "i=x;AAAA",
-            "a=z,i=1",
-            "a=f,i=1;AAAA",
-            "a=a,i=1",
-            "a=c,i=1",
-            "a=d,d=a",
-            "a=d,d=z",
-        ] {
+        for body in ["i=x;AAAA", "a=z,i=1", "a=d,d=a", "a=d,d=z", "a=d,d=f,i=1"] {
             assert!(pane.send(body).is_empty(), "{body}");
         }
         assert!(pane.image(Buffer::Main, Name::Id(1)).is_none());
+    }
+
+    #[test]
+    fn a_frame_is_stored_and_answered_with_its_number() {
+        let mut pane = Pane::new();
+        pane.send(&format!("i=1,q=2,{WIDE}"));
+        assert_eq!(pane.send(&format!("a=f,i=1,{PIXEL}")), [ok("i=1,r=2")]);
+        assert_eq!(
+            pane.send(&format!("a=f,i=1,r=2,x=1,{PIXEL}")),
+            [ok("i=1,r=2")]
+        );
+        assert_eq!(pane.send(&format!("a=f,i=1,r=7,{PIXEL}")), [ok("i=1,r=3")]);
+        assert!(pane.send("a=f,i=1,f=24,s=1,v=1,m=1;AA").is_empty());
+        assert_eq!(pane.send("m=0;AA"), [ok("i=1,r=4")]);
+        assert!(pane.send(&format!("a=f,i=1,q=1,{PIXEL}")).is_empty());
+        assert_eq!(pane.frames(Name::Id(1)), 4);
+
+        pane.send(&format!("I=7,q=2,{WIDE}"));
+        assert_eq!(pane.send(&format!("a=f,I=7,{PIXEL}")), [ok("I=7,r=2")]);
+        assert_eq!(pane.frames(Name::Number(7)), 1);
+    }
+
+    #[test]
+    fn frame_errors_are_answered_as_kitty_answers_them() {
+        let mut pane = Pane::new();
+        pane.send(&format!("i=1,q=2,{WIDE}"));
+        let failed = |pane: &mut Pane, body: &str| {
+            let replies = pane.send(body);
+            assert_eq!(replies.len(), 1, "{body}: {replies:?}");
+            replies[0].clone()
+        };
+        assert_eq!(
+            failed(&mut pane, &format!("a=f,i=5,{PIXEL}")),
+            "\x1b_Gi=5;ENOENT:no such image\x1b\\"
+        );
+        assert_eq!(
+            failed(&mut pane, "a=f,i=1,r=3,f=24,s=3,v=1;AAAAAAAAAAAA"),
+            "\x1b_Gi=1,r=3;EINVAL:frame width 3 larger than image width: 2\x1b\\"
+        );
+        assert!(failed(&mut pane, &format!("a=f,i=1,c=9,{PIXEL}"))
+            .starts_with("\x1b_Gi=1;EINVAL:no frame with number: 9"));
+        assert!(failed(&mut pane, "a=f,i=1,f=24,s=2,v=1;AAAA").starts_with("\x1b_Gi=1;ENODATA:"));
+        assert!(
+            failed(&mut pane, &format!("a=f,i=1,I=2,{PIXEL}")).starts_with("\x1b_Gi=1,I=2;EINVAL:")
+        );
+        assert!(pane.send(&format!("a=f,{PIXEL}")).is_empty());
+        assert!(pane.send(&format!("a=f,i=1,q=2,c=9,{PIXEL}")).is_empty());
+        assert_eq!(pane.frames(Name::Id(1)), 0);
+
+        let mut small = Pane::with_quota(64);
+        small.send(&format!("i=1,q=2,{WIDE}"));
+        assert!(small.image(Buffer::Main, Name::Id(1)).is_some());
+        assert!(failed(&mut small, &format!("a=f,i=1,{PIXEL}")).starts_with("\x1b_Gi=1;ENOSPC:"));
+    }
+
+    #[test]
+    fn animation_control_is_answered_only_when_it_fails() {
+        let mut pane = Pane::new();
+        pane.send(&format!("i=1,q=2,{WIDE}"));
+        pane.send(&format!("a=f,i=1,q=2,{PIXEL}"));
+        let revision = pane.revision(Name::Id(1));
+        assert!(pane.send("a=a,i=1,s=3,v=1,c=2").is_empty());
+        assert_eq!(pane.revision(Name::Id(1)), revision + 1);
+        assert!(pane.send("a=a,i=1,s=3").is_empty());
+        assert_eq!(pane.revision(Name::Id(1)), revision + 1);
+        assert_eq!(
+            pane.send("a=a,i=9,s=3"),
+            ["\x1b_Gi=9;ENOENT:no such image\x1b\\"]
+        );
+        assert_eq!(
+            pane.send("a=a,i=9,r=2,z=10"),
+            ["\x1b_Gi=9,r=2;ENOENT:no such image\x1b\\"]
+        );
+        assert!(pane.send("a=a,i=9,q=2").is_empty());
+        assert!(pane.send("a=a,s=3").is_empty());
+    }
+
+    #[test]
+    fn a_composition_is_answered_like_a_transmission() {
+        let mut pane = Pane::new();
+        pane.send(&format!("i=1,q=2,{WIDE}"));
+        pane.send(&format!("a=f,i=1,q=2,{PIXEL}"));
+        let revision = pane.revision(Name::Id(1));
+        assert_eq!(pane.send("a=c,i=1,r=1,c=2,w=1"), [ok("i=1")]);
+        assert_eq!(pane.revision(Name::Id(1)), revision + 1);
+        assert!(pane.send("a=c,i=1,r=2,c=1,q=1").is_empty());
+        assert_eq!(
+            pane.send("a=c,i=1,r=1,c=5"),
+            ["\x1b_Gi=1;ENOENT:no destination frame number 5 exists\x1b\\"]
+        );
+        assert_eq!(
+            pane.send("a=c,i=1,r=1,c=2,w=3"),
+            ["\x1b_Gi=1;EINVAL:the destination rectangle is out of bounds\x1b\\"]
+        );
+        assert_eq!(
+            pane.send("a=c,i=4,r=1,c=1"),
+            ["\x1b_Gi=4;ENOENT:no such image\x1b\\"]
+        );
+        assert_eq!(pane.revision(Name::Id(1)), revision + 2);
+    }
+
+    #[test]
+    fn frame_deletes_drop_one_frame_or_the_whole_image() {
+        let mut pane = Pane::new();
+        pane.send(&format!("i=1,q=2,{WIDE}"));
+        pane.send(&format!("a=f,i=1,q=2,{PIXEL}"));
+        pane.send(&format!("a=f,i=1,q=2,{PIXEL}"));
+        assert!(pane.send("a=d,d=f,i=1,r=2").is_empty());
+        assert_eq!(pane.frames(Name::Id(1)), 1);
+        pane.send("a=d,d=f,i=1");
+        assert_eq!(pane.frames(Name::Id(1)), 0);
+        pane.send("a=d,d=f,i=1");
+        assert!(pane.image(Buffer::Main, Name::Id(1)).is_some());
+        pane.send("a=d,d=F,i=1");
+        assert!(pane.image(Buffer::Main, Name::Id(1)).is_none());
+
+        pane.send(&format!("a=T,i=2,q=2,{PIXEL}"));
+        pane.send(&format!("I=3,q=2,{PIXEL}"));
+        assert_eq!(pane.spans().len(), 1);
+        pane.send("a=d,d=F,i=2");
+        assert!(pane.spans().is_empty());
+        assert!(pane.image(Buffer::Main, Name::Id(2)).is_none());
+        pane.send("a=d,d=F,I=3");
+        assert!(pane.image(Buffer::Main, Name::Number(3)).is_none());
     }
 }

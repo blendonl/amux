@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use super::animation::Animation;
 use super::respond::{Code, Failure};
 use super::transmit::Image;
 use crate::protocol::{CellPixels, ImageFormat};
@@ -35,6 +36,20 @@ pub struct ImageData {
     pub decoded_len: usize,
 }
 
+impl ImageData {
+    pub fn new(key: ImageKey, image: Image) -> Self {
+        Self {
+            key,
+            width: image.width,
+            height: image.height,
+            format: image.format,
+            compressed: image.compressed,
+            bytes: image.bytes.into(),
+            decoded_len: image.decoded_len,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Derived {
     Image(ImageData),
@@ -47,6 +62,13 @@ pub struct Stored {
     pub id: u32,
     pub width: u32,
     pub height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Animated {
+    pub key: ImageKey,
+    pub id: u32,
+    pub animation: Animation,
 }
 
 pub struct ImageStore {
@@ -89,11 +111,18 @@ impl Cached {
 
 struct Entry {
     data: ImageData,
+    animation: Animation,
     owner: Owner,
     buffer: Buffer,
     id: u32,
     used: u64,
     placements: u32,
+}
+
+impl Entry {
+    fn len(&self) -> usize {
+        self.data.bytes.len() + self.animation.stored_len()
+    }
 }
 
 impl ImageStore {
@@ -129,6 +158,22 @@ impl ImageStore {
         let entry = state.images.get_mut(&key)?;
         entry.used = clock;
         Some(entry.data.clone())
+    }
+
+    pub fn animation(&self, key: ImageKey) -> Option<Animation> {
+        let mut state = self.lock();
+        let clock = state.tick();
+        let entry = state.images.get_mut(&key)?;
+        entry.used = clock;
+        Some(entry.animation.clone())
+    }
+
+    pub fn revision(&self, key: ImageKey) -> Option<u64> {
+        let state = self.lock();
+        state
+            .images
+            .get(&key)
+            .map(|entry| entry.animation.revision())
     }
 
     pub fn is_displayed(&self, display: u32) -> bool {
@@ -251,18 +296,11 @@ impl State {
         }
         let used = self.tick();
         let (width, height) = (image.width, image.height);
-        let data = ImageData {
-            key,
-            width,
-            height,
-            format: image.format,
-            compressed: image.compressed,
-            bytes: image.bytes.into(),
-            decoded_len: image.decoded_len,
-        };
+        let data = ImageData::new(key, image);
         self.images.insert(
             key,
             Entry {
+                animation: Animation::new(data.clone()),
                 data,
                 owner,
                 buffer,
@@ -279,6 +317,43 @@ impl State {
             width,
             height,
         })
+    }
+
+    fn animated(&mut self, owner: Owner, buffer: Buffer, name: Name) -> Option<Animated> {
+        let key = self.lookup(owner, buffer, name)?;
+        let entry = self.images.get(&key)?;
+        Some(Animated {
+            key,
+            id: entry.id,
+            animation: entry.animation.clone(),
+        })
+    }
+
+    fn animate(
+        &mut self,
+        key: ImageKey,
+        read_at: u64,
+        animation: Animation,
+    ) -> Result<(), Failure> {
+        let quota = self.quota;
+        let clock = self.tick();
+        let entry = self
+            .images
+            .get_mut(&key)
+            .filter(|entry| entry.animation.revision() == read_at)
+            .ok_or_else(|| Failure::new(Code::Enoent, "no such image"))?;
+        let (old, new) = (entry.animation.stored_len(), animation.stored_len());
+        if new > old && entry.data.bytes.len() + new > quota {
+            return Err(Failure::new(
+                Code::Enospc,
+                "the image's frames are larger than images.memory_mb",
+            ));
+        }
+        entry.animation = animation;
+        entry.used = clock;
+        self.used = self.used - old + new;
+        self.evict(Some(key));
+        Ok(())
     }
 
     fn mint_display(&mut self, owner: Owner) -> Result<u32, Failure> {
@@ -337,7 +412,7 @@ impl State {
         let Some(entry) = self.images.remove(&key) else {
             return false;
         };
-        self.used -= entry.data.bytes.len();
+        self.used -= entry.len();
         self.names.retain(|_, named| *named != key);
         true
     }
@@ -394,7 +469,7 @@ impl State {
         self.images.retain(|_, entry| {
             let kept = entry.owner != owner;
             if !kept {
-                freed += entry.data.bytes.len();
+                freed += entry.len();
             }
             kept
         });
@@ -435,6 +510,19 @@ impl PaneImages {
 
     pub fn find(&self, buffer: Buffer, name: Name) -> Option<Stored> {
         self.store.lock().find(self.owner, buffer, name)
+    }
+
+    pub fn animation(&self, buffer: Buffer, name: Name) -> Option<Animated> {
+        self.store.lock().animated(self.owner, buffer, name)
+    }
+
+    pub fn animate(
+        &self,
+        key: ImageKey,
+        read_at: u64,
+        animation: Animation,
+    ) -> Result<(), Failure> {
+        self.store.lock().animate(key, read_at, animation)
     }
 
     pub fn add_placement(&self, key: ImageKey) -> bool {
@@ -499,6 +587,17 @@ fn bytes(quota: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::FrameSpec;
+
+    impl Animated {
+        fn of(image: Image) -> Self {
+            Self {
+                key: ImageKey(0),
+                id: 0,
+                animation: Animation::new(ImageData::new(ImageKey(0), image)),
+            }
+        }
+    }
 
     fn image(len: usize) -> Image {
         Image {
@@ -863,6 +962,83 @@ mod tests {
         assert_eq!(used(&store), 7);
         assert_eq!(store.derived(gone, CELL), None);
         assert_eq!(store.derived(kept, CELL), Some(derived_image(7)));
+    }
+
+    fn frame(len: usize) -> ImageData {
+        ImageData::new(ImageKey(0), image(len))
+    }
+
+    fn with_frame(animated: &Animated, len: usize) -> Animation {
+        let mut animation = animated.animation.clone();
+        animation.add(FrameSpec::default(), frame(len)).unwrap();
+        animation
+    }
+
+    #[test]
+    fn frames_count_against_the_quota_and_push_out_other_images() {
+        let one_frame = with_frame(&Animated::of(image(10)), 300).stored_len();
+        let store = store(10 + 2 * one_frame as u64);
+        let pane = store.open_pane();
+        let loose = pane.insert(Buffer::Main, 1, 0, image(100)).unwrap().key;
+        let animated = pane.insert(Buffer::Main, 2, 0, image(10)).unwrap().key;
+        assert_eq!(store.revision(animated), Some(0));
+
+        let read = pane.animation(Buffer::Main, Name::Id(2)).unwrap();
+        assert_eq!((read.key, read.id), (animated, 2));
+        pane.animate(animated, 0, with_frame(&read, 300)).unwrap();
+        assert_eq!(used(&store), 110 + one_frame);
+        assert_eq!(store.revision(animated), Some(1));
+        assert_eq!(keys(&store), [loose.0, animated.0]);
+
+        let read = pane.animation(Buffer::Main, Name::Id(2)).unwrap();
+        let two_frames = with_frame(&read, 300);
+        pane.animate(animated, 1, two_frames.clone()).unwrap();
+        assert_eq!(keys(&store), [animated.0]);
+        assert_eq!(used(&store), 10 + two_frames.stored_len());
+        assert_eq!(store.animation(animated), Some(two_frames));
+    }
+
+    #[test]
+    fn frames_that_cannot_fit_beside_their_image_are_refused() {
+        let store = store(500);
+        let pane = store.open_pane();
+        let key = pane.insert(Buffer::Main, 1, 0, image(100)).unwrap().key;
+        let read = pane.animation(Buffer::Main, Name::Id(1)).unwrap();
+        let failure = pane.animate(key, 0, with_frame(&read, 400)).unwrap_err();
+        assert_eq!(failure.code, Code::Enospc);
+        assert_eq!(store.revision(key), Some(0));
+        assert_eq!(used(&store), 100);
+    }
+
+    #[test]
+    fn an_animation_is_kept_only_over_the_revision_it_was_read_at() {
+        let store = store(1 << 20);
+        let pane = store.open_pane();
+        let key = pane.insert(Buffer::Main, 1, 0, image(10)).unwrap().key;
+        let first = pane.animation(Buffer::Main, Name::Id(1)).unwrap();
+        let second = pane.animation(Buffer::Main, Name::Id(1)).unwrap();
+        pane.animate(key, 0, with_frame(&first, 5)).unwrap();
+        let stale = pane.animate(key, 0, with_frame(&second, 7)).unwrap_err();
+        assert_eq!(stale.code, Code::Enoent);
+        assert_eq!(store.animation(key), Some(with_frame(&first, 5)));
+        assert!(pane.animation(Buffer::Main, Name::Id(2)).is_none());
+        assert!(pane.animation(Buffer::Alt, Name::Id(1)).is_none());
+    }
+
+    #[test]
+    fn freeing_or_closing_lets_go_of_the_frames() {
+        let store = store(1 << 20);
+        let pane = store.open_pane();
+        for id in [1, 2] {
+            let key = pane.insert(Buffer::Main, id, 0, image(10)).unwrap().key;
+            let read = pane.animation(Buffer::Main, Name::Id(id)).unwrap();
+            pane.animate(key, 0, with_frame(&read, 50)).unwrap();
+        }
+        assert!(used(&store) > 120);
+        assert!(pane.free(Buffer::Main, Name::Id(1)));
+        assert!(used(&store) > 60);
+        pane.close();
+        assert_eq!(used(&store), 0);
     }
 
     #[test]

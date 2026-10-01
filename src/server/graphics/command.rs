@@ -1,5 +1,7 @@
 use memchr::memchr;
 
+use crate::protocol::{AnimationControl, AnimationState, FrameSpec};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Action {
     #[default]
@@ -18,6 +20,19 @@ pub enum ParseError {
     MissingValue(Vec<u8>),
     BadKey(Vec<u8>),
     BadValue(char),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Composition {
+    pub source: u32,
+    pub dest: u32,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub source_x: u32,
+    pub source_y: u32,
+    pub replace: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +128,47 @@ impl Command {
         }
         command.payload = payload.to_vec();
         Ok(command)
+    }
+
+    pub fn frame(&self) -> FrameSpec {
+        FrameSpec {
+            edit: self.rows,
+            base: self.columns,
+            x: self.source_x,
+            y: self.source_y,
+            background: self.cell_y_offset,
+            replace: self.cell_x_offset == 1,
+            gap: self.z_index,
+        }
+    }
+
+    pub fn control(&self) -> AnimationControl {
+        AnimationControl {
+            frame: self.rows,
+            gap: self.z_index,
+            current: self.columns,
+            state: match self.width {
+                1 => Some(AnimationState::Stopped),
+                2 => Some(AnimationState::Loading),
+                3 => Some(AnimationState::Running),
+                _ => None,
+            },
+            loops: self.height,
+        }
+    }
+
+    pub fn composition(&self) -> Composition {
+        Composition {
+            source: self.rows,
+            dest: self.columns,
+            x: self.source_x,
+            y: self.source_y,
+            width: self.source_width,
+            height: self.source_height,
+            source_x: self.cell_x_offset,
+            source_y: self.cell_y_offset,
+            replace: self.cursor_movement != 0,
+        }
     }
 
     fn set(&mut self, key: u8, value: &[u8]) -> Result<(), ParseError> {
@@ -277,6 +333,72 @@ mod tests {
         ] {
             assert_eq!(parse(&format!("a={letter}")).action, action);
         }
+    }
+
+    #[test]
+    fn every_frame_key_is_read() {
+        let command = parse("a=f,i=1,r=3,c=2,x=4,y=5,X=1,Y=4278190335,z=-1,s=6,v=7,f=24;AAAA");
+        assert_eq!(
+            command.frame(),
+            FrameSpec {
+                edit: 3,
+                base: 2,
+                x: 4,
+                y: 5,
+                background: 0xff00_00ff,
+                replace: true,
+                gap: -1,
+            }
+        );
+        assert_eq!((command.width, command.height, command.format), (6, 7, 24));
+        assert_eq!(parse("a=f").frame(), FrameSpec::default());
+        assert!(!parse("a=f,X=2").frame().replace);
+        assert_eq!(parse("a=f,z=80").frame().gap, 80);
+    }
+
+    #[test]
+    fn every_animation_control_key_is_read() {
+        assert_eq!(
+            parse("a=a,i=1,s=3,v=5,r=2,z=80,c=4").control(),
+            AnimationControl {
+                frame: 2,
+                gap: 80,
+                current: 4,
+                state: Some(AnimationState::Running),
+                loops: 5,
+            }
+        );
+        assert_eq!(parse("a=a").control(), AnimationControl::default());
+        for (value, state) in [
+            ("0", None),
+            ("1", Some(AnimationState::Stopped)),
+            ("2", Some(AnimationState::Loading)),
+            ("3", Some(AnimationState::Running)),
+            ("4", None),
+        ] {
+            assert_eq!(parse(&format!("a=a,s={value}")).control().state, state);
+        }
+        assert_eq!(parse("a=a,r=1,z=-5").control().gap, -5);
+    }
+
+    #[test]
+    fn every_composition_key_is_read() {
+        assert_eq!(
+            parse("a=c,i=1,r=7,c=9,w=23,h=27,X=4,Y=8,x=1,y=3,C=1").composition(),
+            Composition {
+                source: 7,
+                dest: 9,
+                x: 1,
+                y: 3,
+                width: 23,
+                height: 27,
+                source_x: 4,
+                source_y: 8,
+                replace: true,
+            }
+        );
+        assert_eq!(parse("a=c").composition(), Composition::default());
+        assert!(parse("a=c,C=2").composition().replace);
     }
 
     #[test]

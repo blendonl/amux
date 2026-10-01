@@ -1,4 +1,4 @@
-use super::command::Command;
+use super::command::{Action, Command};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Code {
@@ -7,6 +7,7 @@ pub enum Code {
     Ebadf,
     Enodata,
     Efbig,
+    Enospc,
     Ebadpng,
     Enoparent,
     Ecycle,
@@ -21,6 +22,7 @@ impl Code {
             Self::Ebadf => "EBADF",
             Self::Enodata => "ENODATA",
             Self::Efbig => "EFBIG",
+            Self::Enospc => "ENOSPC",
             Self::Ebadpng => "EBADPNG",
             Self::Enoparent => "ENOPARENT",
             Self::Ecycle => "ECYCLE",
@@ -49,6 +51,7 @@ pub struct Recipient {
     pub id: u32,
     pub number: u32,
     pub placement: u32,
+    pub frame: u32,
     pub quiet: u32,
 }
 
@@ -58,6 +61,10 @@ impl Recipient {
             id: command.id,
             number: command.number,
             placement: command.placement,
+            frame: match command.action {
+                Action::Frame | Action::Animate => command.rows,
+                _ => 0,
+            },
             quiet: command.quiet,
         }
     }
@@ -73,11 +80,16 @@ impl Recipient {
             }
             _ => return None,
         };
-        let keys: Vec<String> = [("i", self.id), ("I", self.number), ("p", self.placement)]
-            .into_iter()
-            .filter(|(_, value)| *value != 0)
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect();
+        let keys: Vec<String> = [
+            ("i", self.id),
+            ("I", self.number),
+            ("p", self.placement),
+            ("r", self.frame),
+        ]
+        .into_iter()
+        .filter(|(_, value)| *value != 0)
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
         Some(format!("\x1b_G{};{message}\x1b\\", keys.join(",")).into_bytes())
     }
 }
@@ -91,6 +103,7 @@ mod tests {
             id,
             number,
             placement,
+            frame: 0,
             quiet,
         }
     }
@@ -133,6 +146,7 @@ mod tests {
             (Code::Ebadf, "EBADF"),
             (Code::Enodata, "ENODATA"),
             (Code::Efbig, "EFBIG"),
+            (Code::Enospc, "ENOSPC"),
             (Code::Ebadpng, "EBADPNG"),
             (Code::Enoparent, "ENOPARENT"),
             (Code::Ecycle, "ECYCLE"),
@@ -144,6 +158,26 @@ mod tests {
                 Some(format!("\x1b_Gi=1;{name}:why\x1b\\"))
             );
         }
+    }
+
+    #[test]
+    fn a_frame_reply_names_the_frame() {
+        let frame = Recipient {
+            frame: 2,
+            ..to(7, 0, 0, 0)
+        };
+        assert_eq!(
+            reply(frame, &Ok(())).as_deref(),
+            Some("\x1b_Gi=7,r=2;OK\x1b\\")
+        );
+        let everything = Recipient {
+            frame: 4,
+            ..to(7, 3, 2, 0)
+        };
+        assert_eq!(
+            reply(everything, &missing()).as_deref(),
+            Some("\x1b_Gi=7,I=3,p=2,r=4;ENOENT:no such image\x1b\\")
+        );
     }
 
     #[test]
@@ -162,7 +196,11 @@ mod tests {
 
     #[test]
     fn the_recipient_comes_from_the_command() {
-        let command = Command::parse(b"i=3,I=4,p=5,q=1").unwrap();
+        let command = Command::parse(b"i=3,I=4,p=5,q=1,r=6").unwrap();
         assert_eq!(Recipient::of(&command), to(3, 4, 5, 1));
+        for (action, frame) in [("f", 6), ("a", 6), ("c", 0), ("t", 0), ("p", 0)] {
+            let command = Command::parse(format!("a={action},i=3,r=6").as_bytes()).unwrap();
+            assert_eq!(Recipient::of(&command).frame, frame, "a={action}");
+        }
     }
 }
