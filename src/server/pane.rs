@@ -54,7 +54,8 @@ impl Pane {
             .context("opening a pty")?;
 
         let input = spawn_input_pump(pair.master.take_writer()?);
-        let callbacks = PaneCallbacks::new(input.clone());
+        let images = spec.settings.images.then(|| spec.store.open_pane());
+        let callbacks = PaneCallbacks::new(input.clone(), images.clone());
         let terminal = spec.terminal.unwrap_or_default();
         callbacks.set_cell_pixels(terminal.cell_pixels);
         callbacks.set_graphics(terminal.graphics && spec.settings.images);
@@ -70,10 +71,7 @@ impl Pane {
 
         let reader = pair.master.try_clone_reader()?;
         let killer = child.clone_killer();
-        let images = spec.settings.images.then(|| spec.store.open_pane());
-        let graphics = images
-            .clone()
-            .map(|images| PaneGraphics::new(images, callbacks.clone()));
+        let graphics = images.clone().map(PaneGraphics::new);
         let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
             size.rows,
             size.cols,
@@ -122,9 +120,12 @@ impl Pane {
         }
         let master = lock(&self.master);
         master.resize(pty_size(size, self.cell_pixels()))?;
-        lock(&self.parser)
-            .screen_mut()
-            .set_size(size.rows, size.cols);
+        let mut parser = lock(&self.parser);
+        let (screen, callbacks) = parser.parts_mut();
+        screen.set_size(size.rows, size.cols);
+        if let Some(placements) = callbacks.placements_mut() {
+            placements.settle(screen);
+        }
         Ok(())
     }
 
@@ -347,6 +348,36 @@ mod tests {
         pane.with_screen(|screen| screen.contents())
     }
 
+    fn spans(pane: &Pane) -> Vec<(u16, u16)> {
+        let parser = lock(&pane.parser);
+        let placements = parser.callbacks().placements().unwrap();
+        placements
+            .spans(parser.screen())
+            .map(|span| (span.row, span.image_row))
+            .collect()
+    }
+
+    fn placed(pane: &Pane) -> bool {
+        !lock(&pane.parser)
+            .callbacks()
+            .placements()
+            .unwrap()
+            .is_empty()
+    }
+
+    fn wait_until(mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if done() {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn wait_for(pane: &Pane, wanted: &str) -> String {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -556,6 +587,40 @@ mod tests {
         assert!(pane.images.is_none());
         let text = wait_for(&pane, "ready");
         assert!(text.starts_with("ready"), "{text}");
+    }
+
+    #[test]
+    fn an_image_scrolls_away_with_the_text_under_it() {
+        let script = r#"printf 'top\n\033_Ga=T,i=1,q=2,c=4,r=3,f=24,s=1,v=1;AAAA\033\\'; read -r go; seq 1 7; read -r go; seq 1 100; read -r go"#;
+        let pane = spawn_pane(
+            &with_shell(&["/bin/sh", "-c", script]),
+            Size { rows: 10, cols: 40 },
+        );
+        let shown = wait_until(|| spans(&pane) == [(1, 0), (2, 1), (3, 2)]);
+        assert!(shown, "{:?}", spans(&pane));
+        pane.write_input(b"\r".to_vec()).unwrap();
+        let moved = wait_until(|| spans(&pane) == [(0, 1), (1, 2)]);
+        assert!(moved, "{:?}", spans(&pane));
+        pane.write_input(b"\r".to_vec()).unwrap();
+        assert!(wait_until(|| !placed(&pane)), "{:?}", spans(&pane));
+        assert!(spans(&pane).is_empty());
+        assert!(screen_text(&pane).contains("100"));
+    }
+
+    #[test]
+    fn resizing_a_pane_cuts_the_image_rows_it_drops() {
+        let script = r#"printf '\033[5;1H\033_Ga=T,i=1,q=2,C=1,c=2,r=2,f=24,s=1,v=1;AAAA\033\\ready'; read -r go"#;
+        let pane = spawn_pane(
+            &with_shell(&["/bin/sh", "-c", script]),
+            Size { rows: 10, cols: 40 },
+        );
+        let shown = wait_until(|| spans(&pane) == [(4, 0), (5, 1)]);
+        assert!(shown, "{:?}", spans(&pane));
+        pane.resize(Size { rows: 5, cols: 40 }).unwrap();
+        assert_eq!(spans(&pane), [(4, 0)]);
+        pane.resize(Size { rows: 4, cols: 40 }).unwrap();
+        assert!(spans(&pane).is_empty());
+        assert!(!placed(&pane));
     }
 
     #[test]

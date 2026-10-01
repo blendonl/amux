@@ -65,11 +65,19 @@ struct Pending {
 }
 
 impl Transmissions {
-    pub fn receive(&mut self, buffer: Buffer, mut command: Command) -> Step {
-        let slot = match buffer {
+    pub fn abort(&mut self, buffer: Buffer) {
+        *self.slot(buffer) = None;
+    }
+
+    fn slot(&mut self, buffer: Buffer) -> &mut Option<Pending> {
+        match buffer {
             Buffer::Main => &mut self.main,
             Buffer::Alt => &mut self.alt,
-        };
+        }
+    }
+
+    pub fn receive(&mut self, buffer: Buffer, mut command: Command) -> Step {
+        let slot = self.slot(buffer);
         let payload = mem::take(&mut command.payload);
         let mut pending = match slot.take() {
             Some(mut pending) if command.medium == b'd' => {

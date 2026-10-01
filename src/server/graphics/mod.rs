@@ -1,5 +1,6 @@
 pub mod apc;
 pub mod command;
+pub mod place;
 pub mod respond;
 #[cfg_attr(not(test), expect(dead_code))]
 pub mod sixel;
@@ -15,8 +16,9 @@ use tracing::debug;
 use super::replies::PaneCallbacks;
 use apc::{ApcScanner, Segment};
 use command::{Action, Command};
-use respond::{Failure, Recipient};
-use store::{Buffer, ImageKey, Name, PaneImages};
+use place::active_buffer;
+use respond::{Code, Failure, Recipient};
+use store::{Buffer, Name, PaneImages, Stored};
 use transmit::{Step, Transmission, Transmissions};
 
 type PaneParser = vt100::Parser<PaneCallbacks>;
@@ -27,10 +29,10 @@ pub struct PaneGraphics {
 }
 
 impl PaneGraphics {
-    pub fn new(images: PaneImages, callbacks: PaneCallbacks) -> Self {
+    pub fn new(images: PaneImages) -> Self {
         Self {
             scanner: ApcScanner::new(),
-            kitty: KittyGraphics::new(images, callbacks),
+            kitty: KittyGraphics::new(images),
         }
     }
 
@@ -42,21 +44,28 @@ impl PaneGraphics {
                 Segment::Graphics(body) => self.kitty.handle(&body, parser),
             }
         }
+        settle(parser);
+    }
+}
+
+fn settle(parser: &Mutex<PaneParser>) {
+    let mut parser = lock(parser);
+    let (screen, callbacks) = parser.parts_mut();
+    if let Some(placements) = callbacks.placements_mut() {
+        placements.settle(screen);
     }
 }
 
 struct KittyGraphics {
     images: PaneImages,
     transmissions: Transmissions,
-    callbacks: PaneCallbacks,
 }
 
 impl KittyGraphics {
-    fn new(images: PaneImages, callbacks: PaneCallbacks) -> Self {
+    fn new(images: PaneImages) -> Self {
         Self {
             images,
             transmissions: Transmissions::default(),
-            callbacks,
         }
     }
 
@@ -68,17 +77,14 @@ impl KittyGraphics {
                 return;
             }
         };
-        let buffer = if lock(parser).screen().alternate_screen() {
-            Buffer::Alt
-        } else {
-            Buffer::Main
-        };
+        let buffer = active_buffer(lock(parser).screen());
         match command.action {
             Action::Transmit | Action::TransmitAndPlace | Action::Query => {
                 self.transmit(buffer, command, parser);
             }
-            Action::Delete => self.delete(buffer, &command),
-            Action::Place | Action::Frame | Action::Animate | Action::Compose => {}
+            Action::Place => self.put(buffer, &command, parser),
+            Action::Delete => self.delete(buffer, &command, parser),
+            Action::Frame | Action::Animate | Action::Compose => {}
         }
     }
 
@@ -91,16 +97,33 @@ impl KittyGraphics {
                 (command, outcome)
             }
         };
-        if command.action == Action::Query && !self.callbacks.graphics() {
+        if command.action == Action::Query && !lock(parser).callbacks().graphics() {
             return;
         }
-        let recipient = Recipient {
-            id: *outcome.as_ref().unwrap_or(&command.id),
-            ..Recipient::of(&command)
+        answer(&command, outcome, parser);
+    }
+
+    fn put(&mut self, buffer: Buffer, command: &Command, parser: &Mutex<PaneParser>) {
+        let name = match (command.id, command.number) {
+            (0, 0) => return,
+            (0, number) => Name::Number(number),
+            (id, _) => Name::Id(id),
         };
-        if let Some(reply) = recipient.reply(&outcome.map(drop)) {
-            self.callbacks.reply(reply);
-        }
+        let outcome = if command.id != 0 && command.number != 0 {
+            Err(Failure::new(
+                Code::Einval,
+                "an image can't have both an id and a number",
+            ))
+        } else {
+            self.images
+                .find(buffer, name)
+                .ok_or_else(|| Failure::new(Code::Enoent, "no such image"))
+                .and_then(|image| {
+                    place(image, command, parser)?;
+                    Ok(image.id)
+                })
+        };
+        answer(command, outcome, parser);
     }
 
     fn complete(
@@ -117,28 +140,56 @@ impl KittyGraphics {
         let stored = self
             .images
             .insert(buffer, command.id, command.number, image.packed())?;
+        if let Some(placements) = lock(parser).callbacks_mut().placements_mut() {
+            placements.forget_replaced(buffer, stored);
+        }
         if command.action == Action::TransmitAndPlace {
-            self.place(stored.key, command, parser)?;
+            place(stored, command, parser)?;
         }
         Ok(stored.id)
     }
 
-    fn place(
-        &mut self,
-        _key: ImageKey,
-        _command: &Command,
-        _parser: &Mutex<PaneParser>,
-    ) -> Result<(), Failure> {
-        Ok(())
+    fn delete(&mut self, buffer: Buffer, command: &Command, parser: &Mutex<PaneParser>) {
+        self.transmissions.abort(buffer);
+        {
+            let mut parser = lock(parser);
+            let (screen, callbacks) = parser.parts_mut();
+            if let Some(placements) = callbacks.placements_mut() {
+                placements.delete(screen, command);
+            }
+        }
+        match (command.delete, command.placement) {
+            (b'I', 0) if command.id != 0 => {
+                self.images.free(buffer, Name::Id(command.id));
+            }
+            (b'N', 0) if command.number != 0 => {
+                self.images.free(buffer, Name::Number(command.number));
+            }
+            (b'R', 0) => self
+                .images
+                .free_ids(buffer, command.source_x..=command.source_y),
+            _ => {}
+        }
     }
+}
 
-    fn delete(&mut self, buffer: Buffer, command: &Command) {
-        let name = match (command.delete, command.placement) {
-            (b'I', 0) if command.id != 0 => Name::Id(command.id),
-            (b'N', 0) if command.number != 0 => Name::Number(command.number),
-            _ => return,
-        };
-        self.images.free(buffer, name);
+fn place(image: Stored, command: &Command, parser: &Mutex<PaneParser>) -> Result<(), Failure> {
+    let mut parser = lock(parser);
+    let (screen, callbacks) = parser.parts_mut();
+    let cell_pixels = callbacks.cell_pixels();
+    match callbacks.placements_mut() {
+        Some(placements) => placements.place(screen, image, command, cell_pixels),
+        None => Err(Failure::new(Code::Einval, "images are off in this pane")),
+    }
+}
+
+fn answer(command: &Command, outcome: Result<u32, Failure>, parser: &Mutex<PaneParser>) {
+    let recipient = Recipient {
+        id: *outcome.as_ref().unwrap_or(&command.id),
+        ..Recipient::of(command)
+    };
+    if let Some(reply) = recipient.reply(&outcome.map(drop)) {
+        lock(parser).callbacks().reply(reply);
     }
 }
 
@@ -156,7 +207,7 @@ mod tests {
     const PIXEL: &str = "f=24,s=1,v=1;AAAA";
 
     struct Pane {
-        graphics: KittyGraphics,
+        graphics: PaneGraphics,
         parser: Mutex<PaneParser>,
         replies: mpsc::Receiver<Vec<u8>>,
         store: Arc<ImageStore>,
@@ -170,11 +221,11 @@ mod tests {
 
         fn with_quota(quota: u64) -> Self {
             let (input, replies) = mpsc::channel();
-            let callbacks = PaneCallbacks::new(input);
             let store = Arc::new(ImageStore::new(quota));
             let images = store.open_pane();
+            let callbacks = PaneCallbacks::new(input, Some(images.clone()));
             Self {
-                graphics: KittyGraphics::new(images.clone(), callbacks.clone()),
+                graphics: PaneGraphics::new(images.clone()),
                 parser: Mutex::new(vt100::Parser::new_with_callbacks(4, 10, 0, callbacks)),
                 replies,
                 store,
@@ -183,10 +234,27 @@ mod tests {
         }
 
         fn send(&mut self, body: &str) -> Vec<String> {
-            self.graphics.handle(body.as_bytes(), &self.parser);
+            self.output(&format!("\x1b_G{body}\x1b\\"))
+        }
+
+        fn output(&mut self, output: &str) -> Vec<String> {
+            self.graphics.process(output.as_bytes(), &self.parser);
             self.replies
                 .try_iter()
                 .map(|reply| String::from_utf8(reply).unwrap())
+                .collect()
+        }
+
+        fn cursor(&self) -> (u16, u16) {
+            lock(&self.parser).screen().cursor_position()
+        }
+
+        fn spans(&self) -> Vec<(u16, u16, u16)> {
+            let parser = lock(&self.parser);
+            let placements = parser.callbacks().placements().unwrap();
+            placements
+                .spans(parser.screen())
+                .map(|span| (span.row, span.col, span.cols))
                 .collect()
         }
 
@@ -326,6 +394,76 @@ mod tests {
     }
 
     #[test]
+    fn a_put_is_answered_with_its_image_and_placement() {
+        let mut pane = Pane::new();
+        pane.send(&format!("i=1,q=2,{PIXEL}"));
+        assert_eq!(pane.send("a=p,i=1,p=4"), [ok("i=1,p=4")]);
+        assert!(pane.send("a=p,i=1,p=5,q=1").is_empty());
+        assert!(pane.send("a=p,i=1,p=6,q=2").is_empty());
+        let missing = pane.send("a=p,i=2,q=1");
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].starts_with("\x1b_Gi=2;ENOENT:"), "{missing:?}");
+        assert!(pane.send("a=p,i=2,q=2").is_empty());
+        assert!(pane.send("a=p,p=3").is_empty());
+        assert_eq!(pane.spans(), [(0, 0, 1), (0, 1, 1), (0, 2, 1)]);
+    }
+
+    #[test]
+    fn a_put_by_number_answers_with_the_id_of_the_newest_image() {
+        let mut pane = Pane::new();
+        pane.send(&format!("I=7,q=2,{PIXEL}"));
+        pane.send(&format!("I=7,q=2,{PIXEL}"));
+        assert_eq!(pane.send("a=p,I=7,p=1"), [ok("i=2,I=7,p=1")]);
+        let missing = pane.send("a=p,I=8");
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].starts_with("\x1b_GI=8;ENOENT:"), "{missing:?}");
+        let both = pane.send("a=p,i=1,I=7");
+        assert_eq!(both.len(), 1);
+        assert!(both[0].starts_with("\x1b_Gi=1,I=7;EINVAL:"), "{both:?}");
+    }
+
+    #[test]
+    fn transmit_and_place_moves_the_cursor_before_the_text_after_it() {
+        let mut pane = Pane::new();
+        pane.output(&format!("ab\x1b_Ga=T,q=2,c=3,r=2,{PIXEL}\x1b\\cd"));
+        assert_eq!(pane.spans(), [(0, 2, 3), (1, 2, 3)]);
+        assert_eq!(pane.cursor(), (1, 7));
+        let parser = lock(&pane.parser);
+        assert_eq!(parser.screen().cell(1, 5).unwrap().contents(), "c");
+    }
+
+    #[test]
+    fn a_failed_placement_is_answered_and_keeps_the_image() {
+        let mut pane = Pane::new();
+        let failed = pane.send(&format!("a=T,i=3,P=9,{PIXEL}"));
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].starts_with("\x1b_Gi=3;ENOPARENT:"), "{failed:?}");
+        assert!(pane.image(Buffer::Main, Name::Id(3)).is_some());
+        assert_eq!(pane.cursor(), (0, 0));
+        assert!(pane.spans().is_empty());
+    }
+
+    #[test]
+    fn sending_an_id_again_drops_the_placements_of_the_old_image() {
+        let mut pane = Pane::new();
+        pane.send(&format!("a=T,i=1,q=2,{PIXEL}"));
+        pane.send(&format!("a=T,i=2,q=2,{PIXEL}"));
+        assert_eq!(pane.spans().len(), 2);
+        pane.send(&format!("a=t,i=1,q=2,{PIXEL}"));
+        assert_eq!(pane.spans(), [(0, 1, 1)]);
+    }
+
+    #[test]
+    fn a_delete_aborts_a_chunked_upload() {
+        let mut pane = Pane::new();
+        pane.show_images(true);
+        assert!(pane.send("i=5,f=24,s=2,v=1,m=1;AAA").is_empty());
+        assert!(pane.send("a=d,d=i,i=9").is_empty());
+        assert!(pane.send("m=0;AAA").is_empty());
+        assert!(pane.image(Buffer::Main, Name::Id(5)).is_none());
+    }
+
+    #[test]
     fn the_alternate_screen_has_its_own_ids() {
         let mut pane = Pane::new();
         pane.send(&format!("i=1,{PIXEL}"));
@@ -347,7 +485,6 @@ mod tests {
         for body in [
             "i=x;AAAA",
             "a=z,i=1",
-            "a=p,i=1",
             "a=f,i=1;AAAA",
             "a=a,i=1",
             "a=c,i=1",
