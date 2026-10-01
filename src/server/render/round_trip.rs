@@ -1,12 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{mpsc, Arc, Mutex};
 
 use vt100::{Color, MouseProtocolEncoding, MouseProtocolMode};
 
 use super::grid::Cell;
 use super::placeholder::{ImageSpan, DIACRITICS, PLACEHOLDER};
-use super::{compose, Frame, GridDiffer, InputModes};
+use super::{compose, Frame, GraphicsParser, GridDiffer, InputModes, Viewer};
 use crate::protocol::Size;
+use crate::server::graphics::store::ImageStore;
 use crate::server::layout::{Layout, PaneId, Rect, SplitDirection};
+use crate::server::replies::PaneCallbacks;
 use crate::settings::Settings;
 
 const A: PaneId = PaneId(0);
@@ -61,32 +64,39 @@ impl Window {
             self.active,
             &self.panes,
             &Settings::default(),
+            Viewer::text(),
         )
     }
 
     fn fill(&mut self) {
-        self.feed(
-            A,
-            "\x1b[31mred\x1b[0m \x1b[1;44mbold on blue\x1b[0m\r\n\
-             \x1b[7minverse\x1b[27m \x1b[2mdim\x1b[22m \x1b[3;4mitalic under\x1b[0m\r\n\
-             \x1b[38;5;200mindexed \x1b[38;2;10;20;30;48;2;200;100;50mrgb\x1b[0m\r\n\
-             \x1b[93;104mbright\x1b[0m\r\n\
-             \x1b[43m   \x1b[0m  gap  \x1b[46m\x1b[K\x1b[0m\r\n\
-             abcdefghijklmnopqrstuvwxyz",
-        );
-        self.feed(
-            B,
-            "中文字符 wide\r\n\
-             e\u{301}a\u{308} combining 한국어\r\n\
-             \x1b[32m日本語\x1b[0mテキストです。改行されます",
-        );
-        self.feed(
-            C,
-            "\x1b[45m\x1b[K\x1b[0mmagenta erase\r\n\
-             \x1b[1;7m bold inverse \x1b[0m\r\n$ prompt",
-        );
+        for (pane, input) in FILL {
+            self.feed(pane, input);
+        }
     }
 }
+
+const FILL: [(PaneId, &str); 3] = [
+    (
+        A,
+        "\x1b[31mred\x1b[0m \x1b[1;44mbold on blue\x1b[0m\r\n\
+         \x1b[7minverse\x1b[27m \x1b[2mdim\x1b[22m \x1b[3;4mitalic under\x1b[0m\r\n\
+         \x1b[38;5;200mindexed \x1b[38;2;10;20;30;48;2;200;100;50mrgb\x1b[0m\r\n\
+         \x1b[93;104mbright\x1b[0m\r\n\
+         \x1b[43m   \x1b[0m  gap  \x1b[46m\x1b[K\x1b[0m\r\n\
+         abcdefghijklmnopqrstuvwxyz",
+    ),
+    (
+        B,
+        "中文字符 wide\r\n\
+         e\u{301}a\u{308} combining 한국어\r\n\
+         \x1b[32m日本語\x1b[0mテキストです。改行されます",
+    ),
+    (
+        C,
+        "\x1b[45m\x1b[K\x1b[0mmagenta erase\r\n\
+         \x1b[1;7m bold inverse \x1b[0m\r\n$ prompt",
+    ),
+];
 
 struct Client {
     parser: vt100::Parser,
@@ -257,13 +267,27 @@ fn only_the_changed_cells_are_sent() {
     let mut panes = BTreeMap::from([(A, vt100::Parser::new(WINDOW.rows, WINDOW.cols, 0))]);
     panes.get_mut(&A).unwrap().process(b"hello world");
     let mut client = Client::new(WINDOW);
-    client.show(&compose(&layout, WINDOW, A, &panes, &Settings::default()));
+    client.show(&compose(
+        &layout,
+        WINDOW,
+        A,
+        &panes,
+        &Settings::default(),
+        Viewer::text(),
+    ));
 
     panes
         .get_mut(&A)
         .unwrap()
         .process(b"\x1b[1;1HH\x1b[1;7HW\x1b[1;12H");
-    let frame = compose(&layout, WINDOW, A, &panes, &Settings::default());
+    let frame = compose(
+        &layout,
+        WINDOW,
+        A,
+        &panes,
+        &Settings::default(),
+        Viewer::text(),
+    );
     assert_eq!(
         client.show(&frame),
         b"\x1b[?25l\x1b[1HH\x1b[5CW\x1b[4C\x1b[?25h"
@@ -271,7 +295,14 @@ fn only_the_changed_cells_are_sent() {
     client.assert_shows(&frame);
 
     panes.get_mut(&A).unwrap().process(b"\x1b[1;7H\x1b[31;1mw");
-    let frame = compose(&layout, WINDOW, A, &panes, &Settings::default());
+    let frame = compose(
+        &layout,
+        WINDOW,
+        A,
+        &panes,
+        &Settings::default(),
+        Viewer::text(),
+    );
     assert_eq!(
         client.show(&frame),
         b"\x1b[?25l\x1b[1;7H\x1b[1;31mw\x1b[0m\x1b[?25h"
@@ -548,7 +579,14 @@ fn moving_an_image_row_repaints_only_what_changed() {
         cols: WINDOW.cols,
     };
     let with_image = |span: ImageSpan| {
-        let mut frame = compose(&layout, WINDOW, A, &panes, &Settings::default());
+        let mut frame = compose(
+            &layout,
+            WINDOW,
+            A,
+            &panes,
+            &Settings::default(),
+            Viewer::text(),
+        );
         frame.grid.paint_image(&span, whole);
         frame
     };
@@ -732,6 +770,52 @@ fn random_images_always_reproduce_the_frame() {
         }
         client.show(&frame);
         client.assert_shows(&frame);
+    }
+}
+
+#[test]
+fn panes_without_images_send_every_client_the_same_bytes() {
+    let mut window = Window::three_panes();
+    window.fill();
+    let plain = window.frame();
+    let store = Arc::new(ImageStore::new(1 << 20));
+    let with_images: BTreeMap<PaneId, GraphicsParser> = window
+        .layout
+        .rects(WINDOW)
+        .into_iter()
+        .map(|(pane, rect)| {
+            let callbacks = PaneCallbacks::new(mpsc::channel().0, Some(store.open_pane()));
+            let mut parser =
+                vt100::Parser::new_with_callbacks(rect.rows, rect.cols, 100, callbacks);
+            for (filled, input) in FILL {
+                if filled == pane {
+                    parser.process(input.as_bytes());
+                }
+            }
+            (pane, Mutex::new(parser))
+        })
+        .collect();
+    let hidden = BTreeSet::new();
+    let shows_images = Viewer {
+        graphics: true,
+        hidden: &hidden,
+    };
+
+    for viewer in [Viewer::text(), shows_images] {
+        let frame = compose(
+            &window.layout,
+            WINDOW,
+            window.active,
+            &with_images,
+            &Settings::default(),
+            viewer,
+        );
+        assert_eq!(frame, plain);
+        assert!(frame.images.is_empty());
+        assert_eq!(
+            GridDiffer::new(WINDOW).diff(&frame),
+            GridDiffer::new(WINDOW).diff(&plain)
+        );
     }
 }
 

@@ -15,7 +15,7 @@ use super::layout::PaneId;
 use super::lua_host::{HookEvent, HookSink};
 use super::mouse::InputEvent;
 use super::pane::{Pane, PaneObserver, PaneSpec};
-use super::render::Frame;
+use super::render::{Frame, Viewer};
 use super::window::Window;
 use crate::project::ProjectId;
 use crate::protocol::{
@@ -245,11 +245,15 @@ impl Session {
         windows.redraw();
     }
 
-    pub fn frame(&self) -> Option<Frame> {
+    pub fn frame(&self, viewer: Viewer<'_>) -> Option<Frame> {
         let settings = self.settings();
         let windows = self.state();
         windows.signals.as_ref()?;
-        Some(windows.active_window()?.compose(windows.size, &settings))
+        Some(
+            windows
+                .active_window()?
+                .compose(windows.size, &settings, viewer),
+        )
     }
 
     pub fn input(&self, event: InputEvent) {

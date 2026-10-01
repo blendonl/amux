@@ -11,6 +11,7 @@ mod render;
 mod replies;
 mod session;
 mod status;
+mod upload;
 mod window;
 
 use std::collections::BTreeMap;
@@ -316,6 +317,10 @@ impl Server {
 
     fn incarnation(&self) -> Incarnation {
         self.identity.incarnation
+    }
+
+    fn images(&self) -> &Arc<ImageStore> {
+        &self.images
     }
 
     async fn create_session(self: &Arc<Self>, request: &NewSession) -> Result<Arc<Session>> {

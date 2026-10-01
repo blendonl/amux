@@ -365,6 +365,7 @@
 ---@class amux.opt.images
 ---@field client "auto"|"on"|"off" Whether this terminal shows images, auto to ask it
 ---@field memory_mb integer How much image data the server keeps before evicting the oldest
+---@field client_memory_mb integer How much decoded image data each client keeps
 
 ---@class amux.opt.pane
 ---@field shell? string[] The command a new pane runs, your login shell by default

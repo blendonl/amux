@@ -12,6 +12,7 @@ use portable_pty::{
     native_pty_system, Child, ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtySize,
 };
 
+use super::graphics::place::Placements;
 use super::graphics::store::{ImageStore, PaneImages};
 use super::graphics::PaneGraphics;
 use super::layout::PaneId;
@@ -105,6 +106,11 @@ impl Pane {
 
     pub fn with_screen<R>(&self, read: impl FnOnce(&vt100::Screen) -> R) -> R {
         read(lock(&self.parser).screen())
+    }
+
+    pub fn with_pane<R>(&self, read: impl FnOnce(&vt100::Screen, Option<&Placements>) -> R) -> R {
+        let parser = lock(&self.parser);
+        read(parser.screen(), parser.callbacks().placements())
     }
 
     pub fn write_input(&self, bytes: Vec<u8>) -> Result<()> {

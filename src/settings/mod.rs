@@ -125,6 +125,10 @@ impl Settings {
             ("search.project_depth", u64::from(self.search.project_depth)),
             ("reload.interval_ms", self.reload.interval_ms),
             ("images.memory_mb", u64::from(self.images.memory_mb)),
+            (
+                "images.client_memory_mb",
+                u64::from(self.images.client_memory_mb),
+            ),
         ];
         if let Some((option, _)) = positive.iter().find(|(_, value)| *value == 0) {
             return Err(format!("amux.opt.{option} must be a positive number"));
@@ -260,6 +264,17 @@ mod tests {
     }
 
     #[test]
+    fn each_client_may_hold_256_mib_of_decoded_images() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.images.client_memory_mb, 256);
+        assert_eq!(defaults.images.client_memory_bytes(), 256 * 1024 * 1024);
+
+        let settings: Settings = toml::from_str("[images]\nclient_memory_mb = 32").unwrap();
+        assert_eq!(settings.images.client_memory_bytes(), 32 * 1024 * 1024);
+        assert_eq!(settings.images.memory_mb, 320);
+    }
+
+    #[test]
     fn host_settings_are_read_from_their_own_tables() {
         let settings: Settings = toml::from_str(
             "[pane]\nterm = \"tmux-256color\"\n\n\
@@ -352,6 +367,10 @@ mod tests {
         assert_eq!(
             rejected(|settings| settings.images.memory_mb = 0),
             "amux.opt.images.memory_mb must be a positive number"
+        );
+        assert_eq!(
+            rejected(|settings| settings.images.client_memory_mb = 0),
+            "amux.opt.images.client_memory_mb must be a positive number"
         );
 
         let named = Settings {

@@ -24,7 +24,6 @@ impl PaneCallbacks {
         }
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn placements(&self) -> Option<&Placements> {
         self.placements.as_ref()
     }

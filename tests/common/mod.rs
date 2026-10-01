@@ -1200,6 +1200,7 @@ pub struct TerminalClient {
     exited: bool,
     input: Box<dyn Write + Send>,
     output: std_mpsc::Receiver<Vec<u8>>,
+    raw: Vec<u8>,
     screen: vt100::Parser,
     master: Box<dyn MasterPty + Send>,
     modes_unchanged: ModesCheck,
@@ -1254,6 +1255,7 @@ impl TerminalClient {
             exited: false,
             input,
             output,
+            raw: Vec::new(),
             screen: vt100::Parser::new(SIZE.rows, SIZE.cols, 0),
             master: pair.master,
             modes_unchanged: Box::new(move |master| master.get_termios().as_ref() == Some(&modes)),
@@ -1298,14 +1300,26 @@ impl TerminalClient {
     }
 
     pub fn wait_for_screen(&mut self, what: &str, done: impl Fn(&vt100::Screen) -> bool) {
+        self.wait_until(what, |terminal| done(terminal.screen.screen()));
+    }
+
+    pub fn wait_for_raw(&mut self, what: &str, done: impl Fn(&[u8]) -> bool) -> &[u8] {
+        self.wait_until(what, |terminal| done(&terminal.raw));
+        &self.raw
+    }
+
+    fn wait_until(&mut self, what: &str, done: impl Fn(&Self) -> bool) {
         let deadline = Instant::now() + TIMEOUT;
         loop {
-            if done(self.screen.screen()) {
+            if done(self) {
                 return;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             match self.output.recv_timeout(remaining) {
-                Ok(bytes) => self.screen.process(&bytes),
+                Ok(bytes) => {
+                    self.raw.extend_from_slice(&bytes);
+                    self.screen.process(&bytes);
+                }
                 Err(_) => panic!("timed out waiting for {what}; screen:\n{}", self.contents()),
             }
         }
