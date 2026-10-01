@@ -561,12 +561,31 @@ In portrait, a row of keys sits above the soft keyboard:
 | `←` `↓` `↑` `→` | The arrow keys                                                                                                               |
 | `Prefix`        | `Ctrl-b`, whatever `amux.opt.prefix` is set to                                                                               |
 
-In landscape, the soft keyboard stays hidden. The app's keyboard is split into two halves that each take the full height of the screen, with the terminal between them: left half, terminal, right half. Each half takes 25% of the screen's width, which [`amux.opt.android.keyboard`](#the-landscape-keyboard) can change. With a hardware keyboard attached, landscape works like portrait.
+In landscape, the soft keyboard stays hidden. The app's keyboard is split into two halves that each take the full height of the screen, with the terminal between them: left half, terminal, right half. Each half takes 21% of the screen's width, which [`amux.opt.android.keyboard`](#the-landscape-keyboard) can change. With a hardware keyboard attached, landscape works like portrait.
 
-- The keyboard is QWERTY split down the middle, with a number row on top and a thumb row at the bottom. The left half has `Esc`, `Tab`, `Ctrl` and `⇧` down its outer edge and `Prefix`, `Alt`, `nav`, `sym` and `Space` along the bottom. The right half has `⌫`, `'`, `⏎` and `⇧` down its outer edge and `Space`, `sym`, `nav`, `Ctrl` and `Alt` along the bottom.
-- `sym` is a layer of symbols. `nav` is a layer with `F1` to `F12`, `Home`, `End`, `PgUp` and `PgDn`, the arrows on the `h` `j` `k` `l` keys, `Ins`, `Del`, `Paste` and `Hide`. A layer keeps the base layer's keys where it has none of its own, so the modifiers and layer keys stay in place.
-- `Ctrl`, `Alt`, `⇧`, `sym` and `nav` all work the same way. A tap applies to the next key only, and shows the key's label in green meanwhile. A second tap locks it on and fills the key green, and a third tap turns it off. Holding the key applies it to every key you press until you let go, so one thumb can hold `nav` while the other taps arrows.
-- With `⇧`, a key types what it would on a US keyboard: `Q` for `q`, `!` for `1`, `"` for `'`.
+The keyboard is made for two thumbs, and no key is on it twice. Each half is five keys wide: a top row, three rows of QWERTY and a thumb row.
+
+```
+Esc   Tab   '     -                             Ctrl  Alt   Paste ⏎
+q     w     e     r     t                 y     u     i     o     p
+a     s     d     f     g                 h     j     k     l     ;
+z     x     c     v     b                 n     m     ,     .     /
+[  ⇧  ][ nav ][Prefix]                    [ Space ][ ⌫ ][sym][num]
+```
+
+A layer key held by one thumb changes the other half, where the other thumb is free, and leaves its own half as it is:
+
+- `sym`, on the right thumb, turns the left half into every symbol the base layer lacks: `! @ # $ %` and `^ & * ( )` on the top two rows, then `[`, `]`, `=`, `\` and `` ` `` above `{`, `}`, `+`, `|` and `~`.
+- `num`, on the right thumb, turns the left half into a phone keypad, `1` to `9` with `0` under `8`, plus `F11` and `F12`. Holding a digit sends `F1` to `F10`, which its corner shows.
+- `nav`, on the left thumb, turns the right half into the arrows on `h` `j` `k` `l`, with `Home`, `PgDn`, `PgUp` and `End` under them, `Del` and `Ins`. The top row stays, so `Ctrl` then `←` still works.
+- `Prefix`, on the left thumb, sends `Ctrl-b`, whatever `amux.opt.prefix` is set to, when tapped. Held, it turns the right half into amux's prefix keys: new, previous, next, rename and kill window, split left-right and top-bottom, next and kill pane, help, the project, worktree and cluster pickers, reload, detach, rename session, and `Hide`.
+
+The keys:
+
+- A tap on a letter types it. Holding it for a moment opens a popup above it with its capital and its `Ctrl` and `Alt` forms, such as `F`, `^F` and `M-f` for `f`. Slide to one and let go to type it, or let go without sliding for the first. `i` and `m` have no `Ctrl` form, since those are `Tab` and `⏎`.
+- A key that can be held types when you let go of it, unless you press another key first: then it types at once, so fast typing with both thumbs keeps its order.
+- `Ctrl`, `Alt`, `⇧`, `sym`, `num` and `nav` all work the same way. A tap applies to the next key only, and shows the key's label in green meanwhile. A second tap locks it on and fills the key green, and a third tap turns it off. Holding the key applies it to every key you press until you let go, so one thumb can hold `nav` while the other taps arrows. While `Ctrl` or `Alt` is on, the letters show what they will send, such as `^C`.
+- With `⇧`, a letter types its capital, and `'`, `-`, `;`, `,`, `.` and `/` type `"`, `_`, `:`, `<`, `>` and `?`. Digits and the keys on `sym` stay as they are.
 - `⌫`, `Del`, the arrows, `PgUp` and `PgDn` repeat while held.
 - `Paste` pastes the clipboard, as bracketed paste when the pane asks for it.
 - `Hide` hides the keyboard so the terminal takes the whole width, and a tap on the terminal brings it back.
@@ -583,6 +602,12 @@ The landscape keyboard is `amux.opt.android.keyboard` in `init.lua`, next to the
 
 A mistake in the keyboard is a config error like any other: `amux config check` names it on any machine, and it stops `amux` and the server. When the config doesn't load, the app shows the error, such as `init.lua: amux.opt.android.keyboard.width.left must be between 5 and 45 percent of the screen, not 60`, and keeps the keyboard it had, or the built-in one when it has none yet.
 
+On the phone, change it in a pane with nano, and the keyboard changes as soon as you save:
+
+```sh
+nano "$(amux config path)"
+```
+
 To give each half 30% of the screen:
 
 ```lua
@@ -593,9 +618,11 @@ amux.opt.android.keyboard.width.right = 30
 | Setting                                     | Is                                                                                                                                                                                    |
 | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `width.left`, `width.right`                 | Each half's share of the screen's width, in percent, from 5 to 45. The terminal gets the rest                                                                                         |
+| `hold_ms`                                   | How long a key is held before its `hold` happens, 300 unless set, from 50 to 2000                                                                                                     |
+| `taps_ms`                                   | How long a key with `taps` waits for another tap, 250 unless set, from 50 to 2000                                                                                                     |
 | `layers.<name>.left`, `layers.<name>.right` | One half of a layer, as a list of rows from top to bottom. A row is a list of keys from left to right. The rows share the half's height equally, and the keys share their row's width |
 
-`layers` works like `amux.opt.servers`: setting one layer, one half or one row keeps everything else, as `amux.opt.android.keyboard.layers.nav.right[1] = { … }` does. A new name adds a layer, which needs both halves, `amux.opt.android.keyboard.layers.sym = nil` removes one, and setting all of `layers` replaces every layer. The keyboard starts on the `base` layer, which every layout needs. Rows and keys count from 1, as Lua does, so an error names a key as `layers.base.left[2][3]`.
+`layers` works like `amux.opt.servers`: setting one layer, one half or one row keeps everything else, as `amux.opt.android.keyboard.layers.nav.right[2] = { … }` does. A new name adds a layer, `amux.opt.android.keyboard.layers.sym = nil` removes one, and setting all of `layers` replaces every layer. The keyboard starts on the `base` layer, which every layout needs with both halves. Any other layer can have just `left` or just `right`: the half it leaves out keeps showing the `base` layer, and when two layers are on, each half shows the one turned on last that has that half. Rows and keys count from 1, as Lua does, so an error names a key as `layers.base.left[2][3]`.
 
 A key is one of these:
 
@@ -603,39 +630,58 @@ A key is one of these:
 | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | One character, such as `"q"`, `"{"` or `"é"`                                                                                                                                                                                                       | Types it, and with `Shift` its US-keyboard shifted form or its capital                                       |
 | A key named as [`amux.keymap`](docs/lua.md#keys) names it: `"Escape"`, `"Tab"`, `"Enter"`, `"Backspace"`, `"Delete"`, `"Insert"`, `"Home"`, `"End"`, `"PageUp"`, `"PageDown"`, `"Up"`, `"Down"`, `"Left"`, `"Right"`, `"F1"` to `"F12"`, `"Space"` | That key. tmux's spellings such as `"Esc"`, `"BSpace"` and `"PgUp"` work too, in any case                    |
+| One of those, or a character, after `C-`, `M-` or `S-`, such as `"C-c"`, `"M-Left"` or `"C-M-x"`                                                                                                                                                   | That key with `Ctrl`, `Alt` or `Shift`. `"C-c"` shows as `^C`                                                |
 | `"Ctrl"`, `"Alt"`, `"Shift"`                                                                                                                                                                                                                       | That modifier                                                                                                |
 | `"layer:<name>"`                                                                                                                                                                                                                                   | That layer, shown with the layer's name                                                                      |
-| `"Prefix"`                                                                                                                                                                                                                                         | Sends `Ctrl-b`                                                                                               |
+| `"Prefix"`                                                                                                                                                                                                                                         | Sends amux's prefix, `Ctrl-b` unless `amux.opt.prefix` changes it                                            |
 | `"Paste"`, `"Hide"`                                                                                                                                                                                                                                | Pastes the clipboard, or hides the keyboard                                                                  |
 | `""`                                                                                                                                                                                                                                               | Nothing: an empty gap                                                                                        |
 | `false`                                                                                                                                                                                                                                            | The key at the same place in the `base` layer. The `base` layer can't use it. A whole row can be `false` too |
 | A table                                                                                                                                                                                                                                            | A key with more settings                                                                                     |
 
-A key with modifiers, such as `"C-c"`, is an error: use `Ctrl`, or a `send` key.
+A table has exactly one of `key`, `text`, `send` and `prefix`, and any of the others:
 
-A table has exactly one of `key`, `text` and `send`, and any of the others:
+| Field     | Is                                                                                                                                                                                                                                                                                         |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `key`     | A key as in the table above                                                                                                                                                                                                                                                                |
+| `text`    | Text the key types, such as `"git status\r"`. `Ctrl` and `Alt` apply to each of its characters                                                                                                                                                                                             |
+| `send`    | Characters the key sends to the terminal as they are, without modifiers, such as `"\27[A"`. It shows them as `^[[A`                                                                                                                                                                        |
+| `prefix`  | Keys to send after amux's prefix, such as `"c"` for a new window or `"s p"` for the project picker. It shows them unless `label` is set                                                                                                                                                    |
+| `label`   | What the key shows instead                                                                                                                                                                                                                                                                 |
+| `shift`   | What the key types with `Shift`                                                                                                                                                                                                                                                            |
+| `width`   | The key's share of its row, 1 unless set. `"Space"` is 2 wide in the built-in layout                                                                                                                                                                                                       |
+| `repeats` | `true` to repeat the key while it is held. A key with a `hold` can't repeat                                                                                                                                                                                                                |
+| `hold`    | What holding the key does. A key, such as `"F1"`, is sent once the key has been held for `hold_ms`, and shows in the key's corner. `"Ctrl"`, `"Alt"`, `"Shift"` or `"layer:<name>"` stays on while the key is held, and a quick tap still sends the key. A list of keys opens a popup to pick one from |
+| `taps`    | What quick taps send instead: the first key for two taps, the next for three, and so on. The key waits `taps_ms` after each tap before it sends anything                                                                                                                                  |
 
-| Field     | Is                                                                                                                              |
-| --------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `key`     | A key as in the table above                                                                                                     |
-| `text`    | Text the key types, such as `"git status\r"`. `Ctrl` and `Alt` apply to each of its characters                                  |
-| `send`    | Characters the key sends to the terminal as they are, without modifiers, such as `"\2c"` for `Ctrl-b c`. It shows them as `^Bc` |
-| `label`   | What the key shows instead                                                                                                      |
-| `shift`   | What the key types with `Shift`                                                                                                 |
-| `width`   | The key's share of its row, 1 unless set. `"Space"` is 2 wide in the built-in layout                                            |
-| `repeats` | `true` to repeat the key while it is held                                                                                       |
+`Ctrl`, `Alt`, `Shift` and layer keys can't have `hold` or `taps`, since they already stay on while held and lock on a second tap. The keys in a `hold` or `taps` list can't have their own `hold`, `taps`, `width` or `repeats`, and only a single `hold` can be a modifier or a layer.
 
-This keeps the built-in keyboard but puts amux's window keys on the top row of `nav`'s right half:
+This keeps the built-in keyboard, but gives `e` accents to pick, a double tap on `Esc` that sends `Ctrl-c`, and word jumps in the empty row of `nav`:
 
 ```lua
-amux.opt.android.keyboard.layers.nav.right[1] = {
-  { send = "\2c", label = "new" },
-  { send = "\2p", label = "prev" },
-  { send = "\2n", label = "next" },
-  { send = "\2%", label = "split" },
+local keyboard = amux.opt.android.keyboard
+keyboard.layers.base.left[2][3] = { key = "e", hold = { "E", "é", "è", "ë" } }
+keyboard.layers.base.left[1][1] = { key = "Escape", taps = { "C-c" } }
+keyboard.layers.nav.right[2] = {
+  { key = "M-b", label = "◂word" },
+  { key = "M-f", label = "word▸" },
   "",
-  false,
+  "",
+  "",
 }
+```
+
+To type Space with the left thumb instead, swap the thumb rows around:
+
+```lua
+local layers = amux.opt.android.keyboard.layers
+layers.base.left[5] = {
+  "Shift",
+  "layer:nav",
+  { key = "Space", width = 2 },
+  { key = "Prefix", hold = "layer:amux" },
+}
+layers.base.right[5] = { "Backspace", "layer:sym", "layer:num" }
 ```
 
 #### zsh, git and ssh
