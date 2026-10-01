@@ -147,6 +147,36 @@ fn update_replaces_the_binary_with_the_latest_release() {
 }
 
 #[test]
+fn an_update_refreshes_lua_types_that_config_lsp_wrote() {
+    let server = TestServer::builder().prepare();
+    let types = server.home().join(".local/share/amux/lua/amux.lua");
+    fs::create_dir_all(types.parent().unwrap()).unwrap();
+    fs::write(&types, "---@meta amux\n").unwrap();
+    let ran = server.home().join("ran");
+    let releases = FakeReleases::new();
+    releases
+        .publish_binary(
+            NEWER,
+            &format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = config ]; then echo \"$@\" > \"$HOME/ran\"; exit 0; fi\n\
+                 echo 'amux {NEWER} (protocol {})'\n",
+                compatible()
+            ),
+        )
+        .set_latest(NEWER);
+    let amux = InstalledAmux::new();
+
+    let stdout = succeeded(&amux.update(&server, &releases, &[]));
+
+    assert!(
+        stdout.ends_with(&format!("updated the Lua types in {}\n", types.display())),
+        "{stdout}"
+    );
+    assert_eq!(fs::read_to_string(ran).unwrap(), "config lsp\n");
+}
+
+#[test]
 fn the_latest_release_leaves_this_build_alone() {
     let server = TestServer::builder().prepare();
     let releases = FakeReleases::new();

@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-pub use android::{AndroidSettings, KeyboardSettings};
+pub use android::{AndroidSettings, KeyTable, KeyboardLayer, KeyboardSettings};
 pub use callback::{CallbackId, CALLBACK_SLOT};
 pub use client::{SearchSettings, StatusSettings, TreeSettings, WhichKeySettings};
 pub use cluster::{ClusterSettings, DiscoverySettings, LanSettings, ServerConfig, SshSettings};

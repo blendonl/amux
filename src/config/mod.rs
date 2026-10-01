@@ -1,11 +1,13 @@
 mod servers;
 mod watch;
 
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
-use crate::lua::{self, emit, ConfigPaths, Process};
+use crate::lua::{self, emit, ConfigPaths, Process, MODULE_DIR, MODULE_PATTERNS};
 use crate::paths;
 use crate::settings::Settings;
 
@@ -15,6 +17,8 @@ pub use watch::Watch;
 const OPT: &str = "amux.opt";
 const NO_INIT: &str = "none (defaults)";
 const NO_SERVERS: &str = "none";
+const LUARC_FILE: &str = ".luarc.json";
+const LUA_VERSION: &str = "Lua 5.4";
 
 pub fn check(given: Option<&Path>) -> Result<String> {
     let paths = paths::config_paths(given)?;
@@ -37,6 +41,54 @@ pub fn keyboard(given: Option<&Path>) -> Result<String> {
     let settings = lua::load(&paths, Process::Client)?.settings;
     let keyboard = settings.android.keyboard.resolved(settings.prefix);
     Ok(serde_json::to_string(&keyboard)?)
+}
+
+pub fn lsp(given: Option<&Path>) -> Result<String> {
+    write_lua_types(&paths::lua_types_file()?, &paths::config_dir(given)?)
+}
+
+fn write_lua_types(types: &Path, config_dir: &Path) -> Result<String> {
+    let library = types
+        .parent()
+        .with_context(|| format!("{} is not in a directory", types.display()))?;
+    fs::create_dir_all(library).with_context(|| format!("creating {}", library.display()))?;
+    fs::write(types, lua::STUBS).with_context(|| format!("writing {}", types.display()))?;
+    let luarc = config_dir.join(LUARC_FILE);
+    let library = library.display().to_string();
+    let luarc_line = match fs::read_to_string(&luarc) {
+        Ok(existing) if existing.contains(&library) => luarc.display().to_string(),
+        Ok(_) => format!(
+            "{} is yours, so add \"{library}\" to its workspace.library",
+            luarc.display()
+        ),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(config_dir)
+                .with_context(|| format!("creating {}", config_dir.display()))?;
+            fs::write(&luarc, luarc_json(&library)?)
+                .with_context(|| format!("writing {}", luarc.display()))?;
+            luarc.display().to_string()
+        }
+        Err(err) => return Err(err).with_context(|| format!("reading {}", luarc.display())),
+    };
+    Ok(format!(
+        "types    {}\nluarc    {luarc_line}\n",
+        types.display()
+    ))
+}
+
+fn luarc_json(library: &str) -> Result<String> {
+    let modules: Vec<String> = MODULE_PATTERNS
+        .iter()
+        .map(|pattern| format!("{MODULE_DIR}/{pattern}"))
+        .collect();
+    let mut json = serde_json::to_string_pretty(&serde_json::json!({
+        "runtime.version": LUA_VERSION,
+        "runtime.path": modules,
+        "workspace.library": [library],
+        "workspace.checkThirdParty": false,
+    }))?;
+    json.push('\n');
+    Ok(json)
 }
 
 fn report(paths: &ConfigPaths) -> String {
@@ -190,6 +242,59 @@ mod tests {
         fs::write(&init, "amux.opt.android.keyboard.layers.sym = nil").unwrap();
         let error = keyboard(Some(&init)).unwrap_err().to_string();
         assert!(error.contains("uses the unknown layer \"sym\""), "{error}");
+    }
+
+    #[test]
+    fn lsp_writes_the_types_and_a_luarc_that_points_at_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join("share/amux/lua");
+        let types = library.join("amux.lua");
+        let config = dir.path().join("config/amux");
+        let luarc = config.join(LUARC_FILE);
+        assert_eq!(
+            write_lua_types(&types, &config).unwrap(),
+            format!(
+                "types    {}\nluarc    {}\n",
+                types.display(),
+                luarc.display()
+            )
+        );
+        assert_eq!(fs::read_to_string(&types).unwrap(), lua::STUBS);
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&luarc).unwrap()).unwrap();
+        assert_eq!(
+            written,
+            serde_json::json!({
+                "runtime.version": "Lua 5.4",
+                "runtime.path": ["lua/?.lua", "lua/?/init.lua"],
+                "workspace.library": [library.display().to_string()],
+                "workspace.checkThirdParty": false,
+            })
+        );
+
+        fs::write(&types, "stale").unwrap();
+        assert_eq!(
+            write_lua_types(&types, &config).unwrap(),
+            format!(
+                "types    {}\nluarc    {}\n",
+                types.display(),
+                luarc.display()
+            )
+        );
+        assert_eq!(fs::read_to_string(&types).unwrap(), lua::STUBS);
+
+        let own = "{ \"runtime.version\": \"Lua 5.4\" }\n";
+        fs::write(&luarc, own).unwrap();
+        let printed = write_lua_types(&types, &config).unwrap();
+        assert!(
+            printed.ends_with(&format!(
+                "luarc    {} is yours, so add \"{}\" to its workspace.library\n",
+                luarc.display(),
+                library.display()
+            )),
+            "{printed}"
+        );
+        assert_eq!(fs::read_to_string(&luarc).unwrap(), own);
     }
 
     #[test]

@@ -11,6 +11,8 @@ use crate::lua::{ConfigPaths, INIT_FILE, SYSTEM_INIT};
 
 const PRIVATE_DIR_MODE: u32 = 0o700;
 const CONFIG_DIR: &str = "amux";
+const LUA_TYPES_DIR: &str = "lua";
+const LUA_TYPES_FILE: &str = "amux.lua";
 
 pub fn default_socket(name: &str) -> Result<PathBuf> {
     Ok(runtime_dir()?.join(name))
@@ -46,6 +48,13 @@ pub fn config_paths(given: Option<&Path>) -> Result<ConfigPaths> {
         given,
         Path::new(SYSTEM_INIT),
     ))
+}
+
+pub fn lua_types_file() -> Result<PathBuf> {
+    Ok(xdg_dir("XDG_DATA_HOME", ".local/share")?
+        .join(CONFIG_DIR)
+        .join(LUA_TYPES_DIR)
+        .join(LUA_TYPES_FILE))
 }
 
 pub fn user_init(given: Option<&Path>) -> Result<PathBuf> {

@@ -5,6 +5,7 @@ pub mod emit;
 mod opt;
 mod runtime;
 mod server;
+mod stubs;
 
 use std::fmt::{self, Write as _};
 use std::path::Path;
@@ -24,6 +25,7 @@ pub use runtime::{
     MODULE_PATTERNS, SERVERS_FILE, SYSTEM_INIT,
 };
 pub use server::{HookRun, LuaHooks};
+pub use stubs::STUBS;
 
 const TRACEBACK: &str = "\nstack traceback:";
 const SHORTENED: &str = "...";
