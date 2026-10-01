@@ -38,6 +38,7 @@ impl PaneGraphics {
         for segment in self.scanner.split(output) {
             match segment {
                 Segment::Text(text) => lock(parser).process(text),
+                Segment::Unwrapped(text) => lock(parser).process(&text),
                 Segment::Graphics(body) => self.kitty.handle(&body, parser),
             }
         }

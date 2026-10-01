@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::mem;
 
 use memchr::{memchr, memchr3};
@@ -8,16 +9,29 @@ const ESC: u8 = 0x1b;
 const CAN: u8 = 0x18;
 const SUB: u8 = 0x1a;
 const APC: u8 = b'_';
+const DCS: u8 = b'P';
 const KITTY: u8 = b'G';
 const ST: u8 = b'\\';
 const ESCAPE: &[u8] = b"\x1b";
 const OPEN: &[u8] = b"\x1b_";
 const CLOSE: &[u8] = b"\x1b\\";
+const TMUX: &[u8] = b"\x1bPtmux;";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Segment<'a> {
     Text(&'a [u8]),
+    Unwrapped(Vec<u8>),
     Graphics(Vec<u8>),
+}
+
+impl Segment<'_> {
+    fn into_owned(self) -> Segment<'static> {
+        match self {
+            Segment::Text(text) => Segment::Unwrapped(text.to_vec()),
+            Segment::Unwrapped(text) => Segment::Unwrapped(text),
+            Segment::Graphics(body) => Segment::Graphics(body),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -29,18 +43,50 @@ enum State {
     Body,
     BodyEscape,
     Closing,
+    Wrapper(usize),
+    Passthrough,
+    PassthroughEscape,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ApcScanner {
     state: State,
     body: Vec<u8>,
-    overflowed: bool,
+    discarding: bool,
+    passthrough: Option<Box<Passthrough>>,
+}
+
+#[derive(Debug)]
+struct Passthrough {
+    scanner: ApcScanner,
+    unwrapped: VecDeque<Segment<'static>>,
+}
+
+impl Passthrough {
+    fn rescan(&mut self, body: &[u8]) {
+        self.unwrapped
+            .extend(self.scanner.split(body).map(Segment::into_owned));
+    }
 }
 
 impl ApcScanner {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            passthrough: Some(Box::new(Passthrough {
+                scanner: Self::nested(),
+                unwrapped: VecDeque::new(),
+            })),
+            ..Self::nested()
+        }
+    }
+
+    fn nested() -> Self {
+        Self {
+            state: State::Ground,
+            body: Vec::new(),
+            discarding: false,
+            passthrough: None,
+        }
     }
 
     pub fn split<'s, 'a>(&'s mut self, chunk: &'a [u8]) -> Segments<'s, 'a> {
@@ -51,18 +97,23 @@ impl ApcScanner {
         }
     }
 
-    fn open(&mut self) {
-        self.state = State::Body;
+    fn open(&mut self, state: State) {
+        self.state = state;
         self.body.clear();
-        self.overflowed = false;
+        self.discarding = false;
+    }
+
+    fn wrap(&mut self) {
+        self.open(State::Passthrough);
+        self.discarding = self.passthrough.is_none();
     }
 
     fn push(&mut self, bytes: &[u8]) {
-        if self.overflowed {
+        if self.discarding {
             return;
         }
         if self.body.len() + bytes.len() > MAX_BODY_LEN {
-            self.overflowed = true;
+            self.discarding = true;
             self.body = Vec::new();
             return;
         }
@@ -72,13 +123,25 @@ impl ApcScanner {
     fn abort(&mut self, state: State) {
         self.state = state;
         self.body = Vec::new();
-        self.overflowed = false;
+        self.discarding = false;
     }
 
     fn finish(&mut self, state: State) -> Option<Vec<u8>> {
         self.state = state;
         let body = mem::take(&mut self.body);
-        (!mem::take(&mut self.overflowed)).then_some(body)
+        (!mem::take(&mut self.discarding)).then_some(body)
+    }
+
+    fn unwrap_passthrough(&mut self) {
+        if let (Some(body), Some(passthrough)) =
+            (self.finish(State::Ground), self.passthrough.as_deref_mut())
+        {
+            passthrough.rescan(&body);
+        }
+    }
+
+    fn next_unwrapped(&mut self) -> Option<Segment<'static>> {
+        self.passthrough.as_deref_mut()?.unwrapped.pop_front()
     }
 }
 
@@ -98,6 +161,7 @@ impl<'a> Segments<'_, 'a> {
                 self.scanner.state = State::Introducer;
                 None
             }
+            State::Escape if byte == DCS => self.wrapper(ESCAPE.len()),
             State::Escape => {
                 self.scanner.state = State::Ground;
                 Some(Segment::Text(ESCAPE))
@@ -105,7 +169,7 @@ impl<'a> Segments<'_, 'a> {
             State::Introducer => {
                 if byte == KITTY {
                     self.position += 1;
-                    self.scanner.open();
+                    self.scanner.open(State::Body);
                 } else {
                     self.scanner.state = State::Ground;
                 }
@@ -130,7 +194,38 @@ impl<'a> Segments<'_, 'a> {
                 self.scanner.state = State::Ground;
                 Some(Segment::Text(CLOSE))
             }
+            State::Wrapper(matched) => self.wrapper(matched),
+            State::Passthrough => self.passthrough(),
+            State::PassthroughEscape if byte == ESC => {
+                self.position += 1;
+                self.scanner.push(ESCAPE);
+                self.scanner.state = State::Passthrough;
+                None
+            }
+            State::PassthroughEscape if byte == ST => {
+                self.position += 1;
+                self.scanner.unwrap_passthrough();
+                self.scanner.next_unwrapped()
+            }
+            State::PassthroughEscape => {
+                self.scanner.abort(State::Escape);
+                None
+            }
         }
+    }
+
+    fn wrapper(&mut self, matched: usize) -> Option<Segment<'a>> {
+        if self.chunk[self.position] != TMUX[matched] {
+            self.scanner.state = State::Ground;
+            return Some(Segment::Text(&TMUX[..matched]));
+        }
+        self.position += 1;
+        if matched + 1 == TMUX.len() {
+            self.scanner.wrap();
+        } else {
+            self.scanner.state = State::Wrapper(matched + 1);
+        }
+        None
     }
 
     fn ground(&mut self) -> Option<Segment<'a>> {
@@ -145,7 +240,7 @@ impl<'a> Segments<'_, 'a> {
             let held = match (self.chunk.get(escape + 1), self.chunk.get(escape + 2)) {
                 (Some(&APC), Some(&KITTY)) => {
                     self.position = escape + 3;
-                    self.scanner.open();
+                    self.scanner.open(State::Body);
                     return Some(Segment::Text(&self.chunk[start..escape + 2]));
                 }
                 (Some(&APC), Some(_)) => {
@@ -153,6 +248,20 @@ impl<'a> Segments<'_, 'a> {
                     continue;
                 }
                 (Some(&APC), None) => State::Introducer,
+                (Some(&DCS), _) => {
+                    let end = self.chunk.len().min(escape + TMUX.len());
+                    let wrapper = &self.chunk[escape..end];
+                    if !TMUX.starts_with(wrapper) {
+                        search = escape + 2;
+                        continue;
+                    }
+                    if wrapper.len() == TMUX.len() {
+                        self.position = end;
+                        self.scanner.wrap();
+                        return (escape > start).then(|| Segment::Text(&self.chunk[start..escape]));
+                    }
+                    State::Wrapper(wrapper.len())
+                }
                 (Some(_), _) => {
                     search = escape + 1;
                     continue;
@@ -196,12 +305,34 @@ impl<'a> Segments<'_, 'a> {
             }
         }
     }
+
+    fn passthrough(&mut self) -> Option<Segment<'a>> {
+        let rest = &self.chunk[self.position..];
+        let Some(found) = memchr3(ESC, CAN, SUB, rest) else {
+            self.scanner.push(rest);
+            self.position = self.chunk.len();
+            return None;
+        };
+        self.scanner.push(&rest[..found]);
+        let at = self.position + found;
+        if rest[found] == ESC {
+            self.scanner.state = State::PassthroughEscape;
+            self.position = at + 1;
+        } else {
+            self.scanner.abort(State::Ground);
+            self.position = at;
+        }
+        None
+    }
 }
 
 impl<'a> Iterator for Segments<'_, 'a> {
     type Item = Segment<'a>;
 
     fn next(&mut self) -> Option<Segment<'a>> {
+        if let Some(segment) = self.scanner.next_unwrapped() {
+            return Some(segment);
+        }
         if self.scanner.state == State::Closing {
             self.scanner.state = State::Ground;
             return Some(Segment::Text(CLOSE));
@@ -233,11 +364,27 @@ mod tests {
         Event::Graphics(bytes.to_vec())
     }
 
+    fn wrap(sequence: &[u8]) -> Vec<u8> {
+        let mut wrapped = TMUX.to_vec();
+        for &byte in sequence {
+            if byte == ESC {
+                wrapped.push(ESC);
+            }
+            wrapped.push(byte);
+        }
+        wrapped.extend_from_slice(CLOSE);
+        wrapped
+    }
+
     fn record(scanner: &mut ApcScanner, chunk: &[u8], events: &mut Vec<Event>) {
         for segment in scanner.split(chunk) {
             match (segment, events.last_mut()) {
                 (Segment::Text(bytes), Some(Event::Text(last))) => last.extend_from_slice(bytes),
+                (Segment::Unwrapped(bytes), Some(Event::Text(last))) => {
+                    last.extend_from_slice(&bytes);
+                }
                 (Segment::Text(bytes), _) => events.push(text(bytes)),
+                (Segment::Unwrapped(bytes), _) => events.push(Event::Text(bytes)),
                 (Segment::Graphics(body), _) => events.push(Event::Graphics(body)),
             }
         }
@@ -424,6 +571,7 @@ mod tests {
         for chunk in [
             b"hello world".as_slice(),
             b"\x1b[31mred\x1b[0m\x1b]0;title\x07\r\n",
+            b"\x1bPq#0;2;0;0;0#0~~-\x1b\\\x1bP$qm\x1b\\\x1bPtmux\x1b\\",
         ] {
             let segments: Vec<Segment<'_>> = scanner.split(chunk).collect();
             assert_eq!(segments.len(), 1);
@@ -449,5 +597,206 @@ mod tests {
         };
         assert!(std::ptr::eq(text, chunk.as_slice()));
         assert_eq!(segments.next(), None);
+    }
+
+    #[test]
+    fn a_wrapped_kitty_command_comes_out_as_if_it_were_sent_unwrapped() {
+        let command = b"\x1b_Ga=T,f=100,i=1;iVBORw0K\x1b\\";
+        let wrapped = b"ab\x1bPtmux;\x1b\x1b_Ga=T,f=100,i=1;iVBORw0K\x1b\x1b\\\x1b\\cd";
+        assert_eq!(
+            wrapped.as_slice(),
+            [b"ab".as_slice(), &wrap(command), b"cd"].concat()
+        );
+        let expected = [
+            text(b"ab\x1b_"),
+            graphics(b"a=T,f=100,i=1;iVBORw0K"),
+            text(b"\x1b\\cd"),
+        ];
+        assert_eq!(
+            scan(&[&[b"ab".as_slice(), command, b"cd"].concat()]),
+            expected
+        );
+        assert_every_split(wrapped, &expected);
+    }
+
+    #[test]
+    fn unwrapped_text_comes_back_owned_between_the_borrowed_slices() {
+        let mut scanner = ApcScanner::new();
+        let segments: Vec<Segment<'_>> = scanner.split(b"a\x1bPtmux;\x1b\x1b[1mb\x1b\\c").collect();
+        assert_eq!(
+            segments,
+            [
+                Segment::Text(b"a"),
+                Segment::Unwrapped(b"\x1b[1mb".to_vec()),
+                Segment::Text(b"c"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wrapped_sixel_reaches_vt100_as_the_unwrapped_dcs() {
+        let sixel = b"\x1bPq\"1;1;2;6#0;2;100;0;0#0~~-\x1b\\";
+        assert_every_split(
+            &[b"a".as_slice(), &wrap(sixel), b"b"].concat(),
+            &[text(&[b"a".as_slice(), sixel, b"b"].concat())],
+        );
+    }
+
+    #[test]
+    fn commands_are_unwrapped_however_they_are_spread_over_passthroughs() {
+        let expected = [
+            text(b"\x1b_"),
+            graphics(b"a=T,i=1,m=1;AAAA"),
+            text(b"\x1b\\\x1b_"),
+            graphics(b"m=0;BBBB"),
+            text(b"\x1b\\"),
+        ];
+        let first = b"\x1b_Ga=T,i=1,m=1;AAAA\x1b\\";
+        let second = b"\x1b_Gm=0;BBBB\x1b\\";
+        assert_every_split(&[wrap(first), wrap(second)].concat(), &expected);
+        assert_every_split(&wrap(&[first.as_slice(), second].concat()), &expected);
+        assert_every_split(
+            &[
+                wrap(b"\x1b_Ga=T,i=1,m=1;AA"),
+                wrap(b"AA\x1b\\\x1b_Gm=0;BBBB\x1b"),
+                wrap(b"\\"),
+            ]
+            .concat(),
+            &expected,
+        );
+    }
+
+    #[test]
+    fn text_around_a_passthrough_keeps_its_bytes_and_order() {
+        let stream = [
+            b"one\x1b[1m".as_slice(),
+            &wrap(b"two\x1b[0m"),
+            b"three",
+            &wrap(b"\x1b_Gi=5\x1b\\"),
+            b"\x1b[2Jfour",
+        ]
+        .concat();
+        assert_every_split(
+            &stream,
+            &[
+                text(b"one\x1b[1mtwo\x1b[0mthree\x1b_"),
+                graphics(b"i=5"),
+                text(b"\x1b\\\x1b[2Jfour"),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_dcs_that_is_not_a_passthrough_passes_through_untouched() {
+        for stream in [
+            b"a\x1bPq#0;2;0;0;0#0~~-\x1b\\b".as_slice(),
+            b"a\x1bP$qm\x1b\\b",
+            b"a\x1bPtmux\x1b\\b",
+            b"a\x1bPtmuxx;\x1b\\b",
+            b"a\x1bPtm\x1bPtmux\x1b\\b",
+        ] {
+            assert_every_split(stream, &[text(stream)]);
+        }
+    }
+
+    #[test]
+    fn can_and_sub_abort_the_passthrough_and_reach_vt100() {
+        for abort in [b'\x18', b'\x1a'] {
+            let stream = [b"a\x1bPtmux;\x1b\x1b_Ga=t;AA".as_slice(), &[abort], b"b"].concat();
+            let expected = [b"a".as_slice(), &[abort], b"b"].concat();
+            assert_every_split(&stream, &[text(&expected)]);
+        }
+    }
+
+    #[test]
+    fn an_escape_that_is_not_doubled_aborts_the_passthrough_and_starts_a_new_sequence() {
+        assert_every_split(b"a\x1bPtmux;\x1b\x1b_Gi=1\x1b[1mb", &[text(b"a\x1b[1mb")]);
+        assert_every_split(
+            b"\x1bPtmux;x\x1b_Gi=2\x1b\\",
+            &[text(b"\x1b_"), graphics(b"i=2"), text(b"\x1b\\")],
+        );
+        assert_every_split(
+            &[b"\x1bPtmux;x".as_slice(), &wrap(b"\x1b_Gi=3\x1b\\")].concat(),
+            &[text(b"\x1b_"), graphics(b"i=3"), text(b"\x1b\\")],
+        );
+    }
+
+    #[test]
+    fn a_passthrough_inside_a_passthrough_is_dropped() {
+        let nested = wrap(b"\x1b_Gi=1\x1b\\");
+        assert_every_split(
+            &[
+                b"a".as_slice(),
+                &wrap(&[b"b".as_slice(), &nested, b"c"].concat()),
+                b"d",
+            ]
+            .concat(),
+            &[text(b"abcd")],
+        );
+        assert_every_split(
+            &wrap(&[nested.as_slice(), b"\x1b_Gi=2\x1b\\"].concat()),
+            &[text(b"\x1b_"), graphics(b"i=2"), text(b"\x1b\\")],
+        );
+    }
+
+    #[test]
+    fn a_passthrough_over_the_cap_is_discarded_up_to_its_terminator() {
+        let fits = wrap(&vec![b'A'; MAX_BODY_LEN]);
+        let events = scan(&[&fits]);
+        assert!(matches!(&events[..], [Event::Text(body)] if body.len() == MAX_BODY_LEN));
+
+        let after = [b"x".as_slice(), &wrap(b"\x1b_Gi=1\x1b\\")].concat();
+        let stream = [wrap(&vec![b'A'; MAX_BODY_LEN + 1]), after.clone()].concat();
+        let expected = [text(b"x\x1b_"), graphics(b"i=1"), text(b"\x1b\\")];
+        let tail = stream.len() - after.len();
+        for split in [
+            0,
+            1,
+            3,
+            7,
+            8,
+            MAX_BODY_LEN,
+            tail - 2,
+            tail - 1,
+            tail,
+            tail + 1,
+            tail + 2,
+        ] {
+            let (head, rest) = stream.split_at(split);
+            assert_eq!(scan(&[head, rest]), expected, "split at {split}");
+        }
+        let pieces: Vec<&[u8]> = stream.chunks(64 * 1024 + 1).collect();
+        assert_eq!(scan(&pieces), expected);
+    }
+
+    #[test]
+    fn vt100_ends_up_with_the_screen_the_unwrapped_bytes_draw() {
+        let cases: [(&[u8], &[u8], &[u8]); 4] = [
+            (b"a", b"\x1b[31mred\x1b[0m", b"b"),
+            (b"\x1b[2;3H", b"\x1b_Gi=1;x\x1b\\x\x1b_Xy\x1b\\", b"z"),
+            (b"a", b"\x1bPq#0~-\x1b\\b", b"\x1b[1mc"),
+            (b"\x1b]0;title", b"\x1b[3Cx", b"y"),
+        ];
+        for (before, inner, after) in cases {
+            let mut original = vt100::Parser::new(4, 20, 0);
+            original.process(&[before, inner, after].concat());
+            let stream = [before, &wrap(inner), after].concat();
+            let mut scanned = vt100::Parser::new(4, 20, 0);
+            let mut scanner = ApcScanner::new();
+            for piece in stream.chunks(2) {
+                for segment in scanner.split(piece) {
+                    match segment {
+                        Segment::Text(text) => scanned.process(text),
+                        Segment::Unwrapped(text) => scanned.process(&text),
+                        Segment::Graphics(_) => {}
+                    }
+                }
+            }
+            assert_eq!(
+                scanned.screen().contents_formatted(),
+                original.screen().contents_formatted(),
+                "{stream:?}"
+            );
+        }
     }
 }
