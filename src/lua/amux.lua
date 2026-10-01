@@ -364,6 +364,7 @@
 
 ---@class amux.opt.images
 ---@field client "auto"|"on"|"off" Whether this terminal shows images, auto to ask it
+---@field memory_mb integer How much image data the server keeps before evicting the oldest
 
 ---@class amux.opt.pane
 ---@field shell? string[] The command a new pane runs, your login shell by default
@@ -371,6 +372,7 @@
 ---@field scrollback integer Lines of scrollback per pane
 ---@field env table<string, string> Variables set in new panes
 ---@field strip_env string[] Prefixes of variables removed from new panes
+---@field images boolean Whether programs in new panes can show images
 
 ---@class amux.opt.window
 ---@field base_index integer The number of the first window

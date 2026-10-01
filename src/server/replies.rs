@@ -1,34 +1,9 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc};
 
-use crate::protocol::RELEASE;
+use crate::protocol::{CellPixels, RELEASE};
 
 const DEVICE_ATTRIBUTES: &[u16] = &[62, 22];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CellPixels {
-    pub width: u16,
-    pub height: u16,
-}
-
-impl CellPixels {
-    fn pack(pixels: Option<Self>) -> u32 {
-        pixels
-            .filter(|pixels| pixels.width != 0 && pixels.height != 0)
-            .map_or(0, |pixels| {
-                (u32::from(pixels.width) << 16) | u32::from(pixels.height)
-            })
-    }
-
-    fn unpack(packed: u32) -> Option<Self> {
-        let [width_high, width_low, height_high, height_low] = packed.to_be_bytes();
-        let pixels = Self {
-            width: u16::from_be_bytes([width_high, width_low]),
-            height: u16::from_be_bytes([height_high, height_low]),
-        };
-        (pixels.width != 0 && pixels.height != 0).then_some(pixels)
-    }
-}
 
 #[derive(Clone)]
 pub struct PaneCallbacks {
@@ -47,21 +22,24 @@ impl PaneCallbacks {
     }
 
     pub fn cell_pixels(&self) -> Option<CellPixels> {
-        CellPixels::unpack(self.cell_pixels.load(Ordering::Relaxed))
+        unpack_cell_pixels(self.cell_pixels.load(Ordering::Relaxed))
     }
 
     pub fn set_cell_pixels(&self, pixels: Option<CellPixels>) -> bool {
-        let packed = CellPixels::pack(pixels);
+        let packed = pack_cell_pixels(pixels);
         self.cell_pixels.swap(packed, Ordering::Relaxed) != packed
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn graphics(&self) -> bool {
         self.graphics.load(Ordering::Relaxed)
     }
 
     pub fn set_graphics(&self, graphics: bool) {
         self.graphics.store(graphics, Ordering::Relaxed);
+    }
+
+    pub fn reply(&self, bytes: Vec<u8>) {
+        let _ = self.input.send(bytes);
     }
 
     fn answer(
@@ -119,9 +97,26 @@ impl vt100::Callbacks for PaneCallbacks {
             .copied()
             .unwrap_or(0);
         if let Some(reply) = self.answer(screen, i1, param, c) {
-            let _ = self.input.send(reply.into_bytes());
+            self.reply(reply.into_bytes());
         }
     }
+}
+
+fn pack_cell_pixels(pixels: Option<CellPixels>) -> u32 {
+    pixels
+        .filter(|pixels| pixels.width != 0 && pixels.height != 0)
+        .map_or(0, |pixels| {
+            (u32::from(pixels.width) << 16) | u32::from(pixels.height)
+        })
+}
+
+fn unpack_cell_pixels(packed: u32) -> Option<CellPixels> {
+    let [width_high, width_low, height_high, height_low] = packed.to_be_bytes();
+    let pixels = CellPixels {
+        width: u16::from_be_bytes([width_high, width_low]),
+        height: u16::from_be_bytes([height_high, height_low]),
+    };
+    (pixels.width != 0 && pixels.height != 0).then_some(pixels)
 }
 
 fn primary_device_attributes(attributes: &[u16]) -> String {

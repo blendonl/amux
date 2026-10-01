@@ -54,6 +54,7 @@ impl Server {
             }
         }
         notices.extend(self.reconfigure_servers(&settings.servers));
+        self.images.set_quota(settings.images.memory_bytes());
         self.settings.send_replace(Arc::new(settings));
         let sessions: Vec<Arc<Session>> = self.state().sessions.values().cloned().collect();
         for session in sessions {

@@ -20,8 +20,10 @@ getrandom = "0.3.4"
 hmac = "0.12.1"
 if-addrs = "0.15.0"
 mdns-sd = { version = "0.21.4", default-features = false, features = ["async"] }
+memchr = "2.8.3"
+miniz_oxide = "0.9.1"
 mlua = { version = "0.11.5", features = ["lua54", "vendored", "serialize", "anyhow"] }
-nix = { version = "0.31.3", features = ["hostname", "process", "signal", "user"] }
+nix = { version = "0.31.3", features = ["fs", "hostname", "mman", "process", "signal", "user"] }
 portable-pty = "0.9.0"
 postcard = { version = "1.1.3", features = ["use-std"] }
 semver = "1.0.28"

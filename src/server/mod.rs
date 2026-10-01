@@ -47,6 +47,7 @@ use crate::settings::{SessionSettings, Settings};
 use crate::target::{self, Candidate, Target};
 use connection::Origin;
 use forward::{Host, RemoteSession};
+use graphics::store::ImageStore;
 use lua_host::{HookEvent, HookSink, LuaHost};
 use projects::{blocking, Projects, REGISTRY_FILE};
 use session::{Binding, Session, SessionHost};
@@ -188,6 +189,7 @@ pub struct Server {
     state: Mutex<LocalState>,
     events: broadcast::Sender<Event>,
     hooks: HookSink,
+    images: Arc<ImageStore>,
     cluster: Arc<Cluster>,
     lan: LanListener,
     discovery: Discovery,
@@ -238,6 +240,7 @@ impl Server {
             state_dir: discovery.state_dir.clone(),
         };
         let config_watch = Mutex::new(config::Watch::new(&config));
+        let images = Arc::new(ImageStore::new(settings.images.memory_bytes()));
         Arc::new_cyclic(|server: &Weak<Self>| {
             let source: Weak<dyn StateSource> = server.clone();
             let cluster = Cluster::new(options, source);
@@ -250,6 +253,7 @@ impl Server {
                 state: Mutex::new(state),
                 events: broadcast::channel(EVENT_CAPACITY).0,
                 hooks: HookSink::default(),
+                images,
                 discovery: Discovery::new(Arc::clone(&cluster), discovery, lan.watch()),
                 cluster,
                 lan,
@@ -363,6 +367,7 @@ impl Server {
             SessionHost {
                 settings: self.watch_settings(),
                 hooks: self.hooks.clone(),
+                images: Arc::clone(&self.images),
             },
         )?;
         state.sessions.insert(name.clone(), Arc::clone(&session));

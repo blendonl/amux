@@ -10,6 +10,7 @@ use tokio::sync::{watch, Notify};
 use tracing::info;
 
 use super::connection::Origin;
+use super::graphics::store::ImageStore;
 use super::layout::PaneId;
 use super::lua_host::{HookEvent, HookSink};
 use super::mouse::InputEvent;
@@ -41,6 +42,7 @@ impl Binding {
 pub struct SessionHost {
     pub settings: watch::Receiver<Arc<Settings>>,
     pub hooks: HookSink,
+    pub images: Arc<ImageStore>,
 }
 
 pub struct Session {
@@ -54,6 +56,7 @@ pub struct Session {
     binding: Option<Binding>,
     settings: watch::Receiver<Arc<Settings>>,
     hooks: HookSink,
+    images: Arc<ImageStore>,
     terminals: Mutex<Terminals>,
     terminal: watch::Sender<Option<ClientTerminal>>,
     windows: Mutex<Windows>,
@@ -69,7 +72,11 @@ impl Session {
         binding: Option<Binding>,
         host: SessionHost,
     ) -> Result<Arc<Self>> {
-        let SessionHost { settings, hooks } = host;
+        let SessionHost {
+            settings,
+            hooks,
+            images,
+        } = host;
         let session = Arc::new(Self {
             id,
             name: Mutex::new(name),
@@ -81,6 +88,7 @@ impl Session {
             binding,
             settings,
             hooks,
+            images,
             terminals: Mutex::new(Terminals::default()),
             terminal: watch::channel(None).0,
             windows: Mutex::new(Windows::new(size.clamped())),
@@ -198,7 +206,6 @@ impl Session {
         TrackedTerminal { session: self, id }
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn client_terminal(&self) -> Option<ClientTerminal> {
         *self.terminal.borrow()
     }
@@ -217,6 +224,9 @@ impl Session {
         });
         drop(terminals);
         if let Some(terminal) = changed {
+            for window in &self.state().list {
+                window.set_client_terminal(terminal);
+            }
             info!(session = %self.name(), ?terminal, "client terminal changed");
         }
         result
@@ -450,6 +460,8 @@ impl Session {
             env: &self.env,
             settings: &self.settings().pane,
             observer,
+            store: &self.images,
+            terminal: self.client_terminal(),
         })
     }
 
@@ -790,6 +802,7 @@ mod tests {
             SessionHost {
                 settings: watch::channel(Arc::new(settings)).1,
                 hooks: HookSink::default(),
+                images: Arc::new(ImageStore::new(1 << 20)),
             },
         )
         .unwrap()
