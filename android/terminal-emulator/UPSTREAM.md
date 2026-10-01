@@ -15,4 +15,17 @@ This library is Termux's `terminal-emulator`, vendored from [termux/termux-app](
 
 Each modified file starts with a `Modified by amux:` line that says what changed.
 
-None yet.
+- `src/main/java/com/termux/terminal/TerminalEmulator.java`: buffers kitty graphics APC commands (`ESC _ G … ESC \`, at most 1 MiB each) and hands them to `KittyGraphics`, answers XTVERSION (`CSI > q`) with `amux-android(1)`, clears the image store on RIS, and exposes `getImages()`, `getCellWidthPixels()` and `getCellHeightPixels()`.
+- `src/main/java/com/termux/terminal/TerminalSession.java`: the two process queues and the receive buffer grow from 4 KiB to 64 KiB.
+
+## New files
+
+These are amux's own files, not upstream's.
+
+- `src/main/java/com/termux/terminal/ApcBuffer.java`: collects the body of a kitty graphics APC up to the cap.
+- `src/main/java/com/termux/terminal/KittyCommand.java`: parses a kitty graphics command's keys and payload.
+- `src/main/java/com/termux/terminal/KittyGraphics.java`: chunked direct transmissions, virtual placements, deletes, queries and replies.
+- `src/main/java/com/termux/terminal/ImageStore.java`: stored images and their virtual placements, with a 48 MiB LRU cap.
+- `src/test/java/com/termux/terminal/KittyCommandTest.java`
+- `src/test/java/com/termux/terminal/KittyGraphicsTest.java`
+- `src/test/java/com/termux/terminal/ImageStoreTest.java`
