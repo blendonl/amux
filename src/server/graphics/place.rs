@@ -10,7 +10,7 @@ use crate::protocol::CellPixels;
 use crate::server::render::placeholder::MAX_IMAGE_CELLS;
 use crate::server::render::ImageUse;
 
-const ASSUMED_CELL_PIXELS: CellPixels = CellPixels {
+pub const ASSUMED_CELL_PIXELS: CellPixels = CellPixels {
     width: 10,
     height: 20,
 };
@@ -28,6 +28,12 @@ impl PlacementId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementKind {
+    Kitty,
+    Sixel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneSpan {
     pub key: ImageKey,
     pub placement: PlacementId,
@@ -39,6 +45,7 @@ pub struct PaneSpan {
     pub cols: u16,
     pub z: i32,
     pub under_text: bool,
+    pub kind: PlacementKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -53,6 +60,15 @@ pub struct SourceRect {
 pub struct CellOffset {
     pub x: u32,
     pub y: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Marked {
+    pub buffer: Buffer,
+    pub anchors: Vec<(u64, u16)>,
+    pub col: u16,
+    pub cols: u16,
+    pub rows: u16,
 }
 
 #[derive(Debug)]
@@ -85,6 +101,7 @@ struct Placement {
     #[cfg_attr(not(test), expect(dead_code))]
     offset: CellOffset,
     position: Position,
+    kind: PlacementKind,
 }
 
 impl Placement {
@@ -204,6 +221,7 @@ impl Placements {
             source,
             offset,
             position,
+            kind: PlacementKind::Kitty,
         };
         let list = self.list_mut(buffer);
         let old = replaced.map(|at| list.remove(at));
@@ -212,6 +230,59 @@ impl Placements {
         if let Some(old) = old.filter(|old| old.display != display) {
             self.images.release_display(old.display);
         }
+        Ok(())
+    }
+
+    pub fn place_sixel(
+        &mut self,
+        screen: &vt100::Screen,
+        image: Stored,
+        marked: Marked,
+    ) -> Result<(), Failure> {
+        let display = self.images.mint_display()?;
+        if !self.images.add_placement(image.key) {
+            self.images.release_display(display);
+            return Err(Failure::new(Code::Enoent, "the image is no longer stored"));
+        }
+        let Marked {
+            buffer,
+            anchors,
+            col,
+            cols,
+            rows,
+        } = marked;
+        let placement = Placement {
+            serial: PlacementId::next(),
+            display,
+            key: image.key,
+            image: image.id,
+            id: 0,
+            col,
+            cols,
+            rows,
+            z: 0,
+            source: SourceRect {
+                x: 0,
+                y: 0,
+                width: image.width,
+                height: image.height,
+            },
+            offset: CellOffset::default(),
+            position: Position::Rows {
+                anchors,
+                pending_tail: rows..rows,
+            },
+            kind: PlacementKind::Sixel,
+        };
+        let covered = if buffer == active_buffer(screen) {
+            covered_sixels(self.list(buffer), &placement, screen)
+        } else {
+            Vec::new()
+        };
+        let list = self.list_mut(buffer);
+        let at = list.partition_point(|other| other.paints_before(&placement));
+        list.insert(at, placement);
+        self.remove(buffer, covered, false);
         Ok(())
     }
 
@@ -258,6 +329,14 @@ impl Placements {
             },
             _ => return,
         };
+        let selected = selected
+            .into_iter()
+            .filter(|serial| {
+                list.iter().any(|placement| {
+                    placement.serial == *serial && placement.kind == PlacementKind::Kitty
+                })
+            })
+            .collect();
         self.remove(buffer, selected, command.delete.is_ascii_uppercase());
     }
 
@@ -295,7 +374,11 @@ impl Placements {
                 continue;
             };
             adopt(anchors, pending_tail, &rows, screen);
-            if !anchors.iter().any(|&(id, _)| rows.row(id).is_some()) {
+            let shown = match placement.kind {
+                PlacementKind::Kitty => anchors.iter().any(|&(id, _)| rows.row(id).is_some()),
+                PlacementKind::Sixel => marks(&rows, placement, screen).next().is_some(),
+            };
+            if !shown {
                 dead.push(placement.serial);
             }
         }
@@ -618,6 +701,45 @@ fn span(
         cols,
         z: placement.z,
         under_text: placement.z < 0,
+        kind: placement.kind,
+    })
+}
+
+fn marks<'a>(
+    rows: &'a RowMap,
+    placement: &'a Placement,
+    screen: &'a vt100::Screen,
+) -> impl Iterator<Item = (u16, u16)> + 'a {
+    let anchors: &[(u64, u16)] = match &placement.position {
+        Position::Rows { anchors, .. } => anchors,
+        Position::Relative { .. } | Position::Virtual => &[],
+    };
+    let cols = placement.col..placement.col.saturating_add(placement.cols);
+    anchors
+        .iter()
+        .filter_map(|&(id, _)| rows.row(id))
+        .flat_map(move |row| {
+            cols.clone()
+                .filter(move |&col| screen.cell(row, col).is_some_and(vt100::Cell::is_graphic))
+                .map(move |col| (row, col))
+        })
+}
+
+fn covered_sixels(
+    list: &[Placement],
+    newer: &Placement,
+    screen: &vt100::Screen,
+) -> Vec<PlacementId> {
+    let rows = RowMap::new(screen);
+    let Position::Rows { anchors, .. } = &newer.position else {
+        return Vec::new();
+    };
+    let covered_rows: Vec<u16> = anchors.iter().filter_map(|&(id, _)| rows.row(id)).collect();
+    let covered_cols = newer.col..newer.col.saturating_add(newer.cols);
+    select(list, |older| {
+        older.kind == PlacementKind::Sixel
+            && marks(&rows, older, screen)
+                .all(|(row, col)| covered_rows.contains(&row) && covered_cols.contains(&col))
     })
 }
 
