@@ -4,6 +4,7 @@ mod client;
 mod cluster;
 mod host;
 mod keymap;
+mod reload;
 mod style;
 pub mod template;
 mod theme;
@@ -26,6 +27,7 @@ pub use keymap::{
     Binding, Keymap, PickerAction, PromptAction, Table, TreeAction, PICKER_TABLE, PREFIX_TABLE,
     PROMPT_TABLE, ROOT_TABLE, SEARCH_TABLE, TREE_TABLE,
 };
+pub use reload::ReloadSettings;
 pub use style::{Color, StyleSpec};
 pub use theme::Theme;
 
@@ -58,6 +60,7 @@ pub struct Settings {
     pub discovery: DiscoverySettings,
     pub lan: LanSettings,
     pub worktrees: WorktreeSettings,
+    pub reload: ReloadSettings,
     pub android: AndroidSettings,
 }
 
@@ -117,6 +120,7 @@ impl Settings {
                 self.worktrees.fetch_timeout_ms,
             ),
             ("search.project_depth", u64::from(self.search.project_depth)),
+            ("reload.interval_ms", self.reload.interval_ms),
         ];
         if let Some((option, _)) = positive.iter().find(|(_, value)| *value == 0) {
             return Err(format!("amux.opt.{option} must be a positive number"));
@@ -162,6 +166,7 @@ impl Default for Settings {
             discovery: DiscoverySettings::default(),
             lan: LanSettings::default(),
             worktrees: WorktreeSettings::default(),
+            reload: ReloadSettings::default(),
             android: AndroidSettings::default(),
         }
     }

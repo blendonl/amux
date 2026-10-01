@@ -20,8 +20,8 @@ use serde_path_to_error::Segment;
 pub use api::{Callbacks, Hooks, EVENTS};
 pub use client::LuaScripting;
 pub use runtime::{
-    find_init, load, load_servers, ConfigPaths, Loaded, Process, INIT_FILE, SERVERS_FILE,
-    SYSTEM_INIT,
+    find_init, load, load_servers, ConfigPaths, Loaded, Process, INIT_FILE, MODULE_DIR,
+    MODULE_PATTERNS, SERVERS_FILE, SYSTEM_INIT,
 };
 pub use server::{HookRun, LuaHooks};
 

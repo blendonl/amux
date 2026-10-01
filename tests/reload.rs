@@ -35,23 +35,27 @@ fn reload(server: &TestServer, trigger: Trigger) -> Result<String, String> {
         Trigger::Hangup => {
             let before = reload_lines(&server.log()).len();
             kill(server.pid(), Signal::SIGHUP).expect("sending SIGHUP");
-            let deadline = Instant::now() + TIMEOUT;
-            loop {
-                let log = server.log();
-                if let Some(line) = reload_lines(&log).get(before) {
-                    return if line.contains(RELOADED) {
-                        Ok((*line).to_owned())
-                    } else {
-                        Err((*line).to_owned())
-                    };
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "timed out waiting for the reload in the server log:\n{log}"
-                );
-                thread::sleep(POLL);
-            }
+            wait_for_reload(server, before)
         }
+    }
+}
+
+fn wait_for_reload(server: &TestServer, before: usize) -> Result<String, String> {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let log = server.log();
+        if let Some(line) = reload_lines(&log).get(before) {
+            return if line.contains(RELOADED) {
+                Ok((*line).to_owned())
+            } else {
+                Err((*line).to_owned())
+            };
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the reload in the server log:\n{log}"
+        );
+        thread::sleep(POLL);
     }
 }
 
@@ -321,4 +325,95 @@ fn ctrl_b_r_reloads_the_attached_client_and_keeps_it_when_the_config_breaks() {
     terminal.wait_for_status("the error to expire", |line| line.starts_with("<s> "));
     terminal.type_text("\x02g");
     terminal.wait_for_status("the kept binding", |line| line == "from the new binding");
+}
+
+#[tokio::test]
+async fn saving_the_config_reloads_the_server_on_its_own() {
+    let server = TestServer::builder().watch_config().start();
+    let mut client = server.client().await;
+    client.new_session(Some("s")).await;
+    client.wait_for_text("$").await;
+
+    let before = reload_lines(&server.log()).len();
+    append(&server, "amux.opt.pane.term = \"tmux-256color\"");
+    let reloaded = wait_for_reload(&server, before).unwrap();
+    assert!(reloaded.contains(RELOADED), "{reloaded}");
+
+    client.command(SessionCommand::NewWindow).await;
+    server
+        .wait_for_windows("s", &[window_summary(0, 1), window_summary(1, 1)])
+        .await;
+    client.type_text("echo \"[$TERM]\"\r").await;
+    client.wait_for_text("[tmux-256color]").await;
+}
+
+#[tokio::test]
+async fn a_broken_module_keeps_the_running_config_until_it_is_saved_again() {
+    let mut server = TestServer::builder()
+        .config("amux.opt.window.name = require(\"names\").window")
+        .watch_config()
+        .prepare();
+    let modules = server.config_path().with_file_name("lua");
+    fs::create_dir_all(&modules).unwrap();
+    let names = modules.join("names.lua");
+    fs::write(&names, "return { window = \"first\" }").unwrap();
+    server.start_process();
+
+    let before = reload_lines(&server.log()).len();
+    fs::write(&names, "return { window = }").unwrap();
+    let error = wait_for_reload(&server, before).unwrap_err();
+    assert!(error.contains(NOT_RELOADED), "{error}");
+    server.client().await.new_session(Some("kept")).await;
+    server
+        .wait_for_windows("kept", &[named_window(0, "first")])
+        .await;
+
+    fs::write(&names, "return { window = \"second\" }").unwrap();
+    wait_for_reload(&server, before + 1).unwrap();
+    server.client().await.new_session(Some("fixed")).await;
+    server
+        .wait_for_windows("fixed", &[named_window(0, "second")])
+        .await;
+}
+
+#[test]
+fn a_saved_config_is_left_alone_without_watch() {
+    let server = TestServer::start();
+    let before = reload_lines(&server.log()).len();
+    append(&server, "amux.opt.pane.term = \"tmux-256color\"");
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        reload_lines(&server.log()).len(),
+        before,
+        "{}",
+        server.log()
+    );
+}
+
+#[test]
+fn saving_the_config_reloads_the_attached_client() {
+    let server = TestServer::builder().watch_config().start();
+    let mut terminal = server.terminal(&["new", "-s", "s"]);
+    terminal.wait_for_text("$");
+    terminal.wait_for_status("the built-in status", |line| {
+        line.starts_with(&format!("[s@{}] 0:sh", server.name()))
+    });
+
+    append(
+        &server,
+        "amux.opt.notice_ms = 500\namux.opt.status.session_format = \"<{session}>\"",
+    );
+    terminal.wait_for_status("the reload notice", |line| line == RELOADED);
+    terminal.wait_for_status("the new session format", |line| {
+        line.starts_with("<s> 0:sh")
+    });
+
+    append(&server, "local = 1");
+    let line = fs::read_to_string(server.config_path())
+        .unwrap()
+        .lines()
+        .count();
+    let error = terminal.wait_for_status("the reload error", |line| line.contains("init.lua:"));
+    assert!(error.contains(&format!("init.lua:{line}: ")), "{error}");
+    terminal.wait_for_status("the error to expire", |line| line.starts_with("<s> "));
 }

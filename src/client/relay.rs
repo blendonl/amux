@@ -19,12 +19,13 @@ use super::search::{self, Found, Job, JobId, Opening};
 use super::terminal;
 use super::tree::Loading;
 use super::{ClientConfig, Endpoint};
+use crate::config::Watch;
 use crate::paths;
 use crate::protocol::{
     AttachedSession, ClientMessage, ClusterStatus, NewSession, ServerMessage, ServerView,
     SessionState, Size,
 };
-use crate::settings::{CallbackId, Keymap, Settings};
+use crate::settings::{CallbackId, Keymap, ReloadSettings, Settings};
 use crate::target::Target;
 
 pub const RELOADED: &str = "config reloaded";
@@ -300,6 +301,17 @@ impl Relay {
     pub fn server_reloaded(&mut self, server: Result<Option<String>, String>) {
         let client = self.reloading.take().unwrap_or(Ok(()));
         self.notify(reload_notice(client, server));
+    }
+
+    pub fn config_changed(&mut self, config: Result<ClientConfig, String>) {
+        match config.map(|config| self.reconfigure(config)) {
+            Ok(()) => self.notify(RELOADED.to_owned()),
+            Err(error) => self.notify(error),
+        }
+    }
+
+    pub fn reload_settings(&self) -> &ReloadSettings {
+        &self.settings.reload
     }
 
     fn reconfigure(&mut self, config: ClientConfig) {
@@ -885,6 +897,9 @@ pub async fn run(
     let mut stdin_open = true;
     let (reloaded, mut reloads) = mpsc::channel(1);
     let (finished, mut finished_jobs) = mpsc::channel(8);
+    let config_paths = super::config_paths(endpoint)?;
+    let mut config_watch = Watch::new(&config_paths);
+    let mut next_check = Instant::now() + relay.reload_settings().interval();
 
     loop {
         let output = relay.take_output();
@@ -895,6 +910,7 @@ pub async fn run(
             return end.map_err(|message| anyhow!(message));
         }
         if relay.take_reload() {
+            config_watch.reset(&config_paths);
             relay.client_reloaded(
                 ClientConfig::load(endpoint).map_err(|error| format!("{error:#}")),
             );
@@ -924,6 +940,7 @@ pub async fn run(
         let which_key = relay.which_key_deadline();
         let notice = relay.notice_deadline();
         let status = relay.status_deadline();
+        let reload = relay.reload_settings().clone();
         tokio::select! {
             message = incoming.recv() => {
                 relay.server_message(message);
@@ -958,6 +975,14 @@ pub async fn run(
             }
             () = sleep_until(status.unwrap_or_else(Instant::now)), if status.is_some() => {
                 relay.status_due();
+            }
+            () = sleep_until(next_check), if reload.watch => {
+                next_check = Instant::now() + reload.interval();
+                if config_watch.changed(&config_paths) {
+                    relay.config_changed(
+                        ClientConfig::load(endpoint).map_err(|error| format!("{error:#}")),
+                    );
+                }
             }
         }
     }
@@ -2438,6 +2463,24 @@ mod tests {
             relay.input(b"\x02g");
             assert_eq!(bottom(&mut relay, &mut parser), "kept");
             assert_eq!(relay.take_messages(), Vec::new());
+        }
+
+        #[test]
+        fn a_changed_config_reloads_the_client_without_asking_the_server() {
+            let (mut relay, mut parser) =
+                scripted("amux.keymap.set('prefix', 'g', function() amux.notify('kept') end)");
+            relay.server_message(Some(state("work", 1)));
+            relay.config_changed(Err("init.lua:1: boom".into()));
+            assert_eq!(bottom(&mut relay, &mut parser), "init.lua:1: boom");
+            relay.input(b"\x02g");
+            assert_eq!(bottom(&mut relay, &mut parser), "kept");
+
+            relay.config_changed(Ok(config("amux.opt.prefix = 'C-a'")));
+            assert_eq!(bottom(&mut relay, &mut parser), RELOADED);
+            assert!(!relay.take_reload());
+            assert_eq!(relay.take_messages(), Vec::new());
+            relay.input(b"\x01r");
+            assert!(relay.take_reload());
         }
 
         #[test]

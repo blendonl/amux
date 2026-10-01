@@ -1,4 +1,5 @@
 mod servers;
+mod watch;
 
 use std::path::{Path, PathBuf};
 
@@ -9,6 +10,7 @@ use crate::paths;
 use crate::settings::Settings;
 
 pub use servers::{add_server, forget_servers, init_name, remove_server};
+pub use watch::Watch;
 
 const OPT: &str = "amux.opt";
 const NO_INIT: &str = "none (defaults)";

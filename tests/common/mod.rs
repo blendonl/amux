@@ -38,6 +38,7 @@ const SOCKET_NAME: &str = "amux.sock";
 const INIT_FILE: &str = "init.lua";
 const SERVERS_FILE: &str = "servers.lua";
 const LAN_PORT_FILE: &str = "lan-port";
+const WATCH_INTERVAL_MS: u64 = 50;
 const FAST_DISCOVERY_MS: &str = "100";
 const REMOTE_PATH: &str = "PATH=/usr/bin:/bin";
 pub const DISCOVERY_OFF: &str =
@@ -96,6 +97,7 @@ pub struct TestServerBuilder {
     lan: bool,
     tailscale_tags: Vec<String>,
     tailscale_port: Option<u16>,
+    watch_config: bool,
 }
 
 impl TestServerBuilder {
@@ -137,6 +139,11 @@ impl TestServerBuilder {
 
     pub fn tailscale_port(mut self, port: u16) -> Self {
         self.tailscale_port = Some(port);
+        self
+    }
+
+    pub fn watch_config(mut self) -> Self {
+        self.watch_config = true;
         self
     }
 
@@ -191,6 +198,10 @@ impl TestServerBuilder {
         discovery.push_str(&format!(
             "amux.opt.discovery.tailscale = {}\namux.opt.discovery.lan = {}\n",
             self.tailscale, self.lan
+        ));
+        discovery.push_str(&format!(
+            "amux.opt.reload.watch = {}\namux.opt.reload.interval_ms = {WATCH_INTERVAL_MS}\n",
+            self.watch_config
         ));
         fs::write(
             config.join("amux").join(INIT_FILE),
@@ -301,6 +312,7 @@ impl TestServer {
             lan: false,
             tailscale_tags: Vec::new(),
             tailscale_port: None,
+            watch_config: false,
         }
     }
 

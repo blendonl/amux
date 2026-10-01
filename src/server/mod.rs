@@ -115,6 +115,7 @@ pub async fn run(socket: &Path, config: Option<&Path>) -> Result<()> {
     server.cluster.start();
     server.lan.start(&server.cluster);
     server.discovery.start();
+    tokio::spawn(reload::watch_config(Arc::downgrade(&server)));
     info!(socket = %socket.display(), version = %Version::current(), "server started");
     server.hooks.emit(HookEvent::ServerStarted {
         server: server.identity.name.clone(),
@@ -181,6 +182,7 @@ pub struct Server {
     identity: ServerIdentity,
     settings: watch::Sender<Arc<Settings>>,
     config: ConfigPaths,
+    config_watch: Mutex<config::Watch>,
     state: Mutex<LocalState>,
     events: broadcast::Sender<Event>,
     hooks: HookSink,
@@ -233,6 +235,7 @@ impl Server {
             port: discovery.lan.port,
             state_dir: discovery.state_dir.clone(),
         };
+        let config_watch = Mutex::new(config::Watch::new(&config));
         Arc::new_cyclic(|server: &Weak<Self>| {
             let source: Weak<dyn StateSource> = server.clone();
             let cluster = Cluster::new(options, source);
@@ -241,6 +244,7 @@ impl Server {
                 identity,
                 settings: watch::channel(Arc::new(settings)).0,
                 config,
+                config_watch,
                 state: Mutex::new(state),
                 events: broadcast::channel(EVENT_CAPACITY).0,
                 hooks: HookSink::default(),
