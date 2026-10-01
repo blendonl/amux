@@ -2,8 +2,9 @@ mod common;
 
 use std::time::Duration;
 
-use amux::protocol::{ClientMessage, NewSession, ServerMessage};
-use common::{TestServer, SIZE, TIMEOUT};
+use amux::protocol::{ClientMessage, ClientTerminal, NewSession, ServerMessage};
+use common::{terminal_log, TestServer, DETACH, KITTY, PLAIN, SIZE, TIMEOUT};
+use tokio::task::block_in_place;
 
 #[tokio::test]
 async fn reattaching_after_a_detach_redraws_the_whole_screen() {
@@ -123,5 +124,58 @@ async fn a_session_ends_when_its_shell_exits() {
             "the session was never removed"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_takes_the_terminal_its_client_reports_once_attached() {
+    let server = TestServer::start();
+    let mut client = server.client().await;
+    client.send(ClientMessage::Terminal(PLAIN)).await;
+    client.new_session(Some("s")).await;
+    client.send(ClientMessage::Terminal(KITTY)).await;
+
+    let log = block_in_place(|| server.wait_for_log(&terminal_log("s", KITTY)));
+    assert_eq!(log.matches("client terminal changed").count(), 1, "{log}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_latest_active_client_sets_the_session_terminal() {
+    let server = TestServer::start();
+    let mut first = server.client().await;
+    first.new_session(Some("s")).await;
+    first.send(ClientMessage::Terminal(KITTY)).await;
+    block_in_place(|| server.wait_for_log(&terminal_log("s", KITTY)));
+
+    let mut second = server.client().await;
+    second.attach(Some("s")).await;
+    second.send(ClientMessage::Terminal(PLAIN)).await;
+    block_in_place(|| server.wait_for_log(&terminal_log("s", PLAIN)));
+
+    first.type_text("true\r").await;
+    block_in_place(|| server.wait_for_log_count(&terminal_log("s", KITTY), 2));
+
+    first.detach().await;
+    block_in_place(|| server.wait_for_log_count(&terminal_log("s", PLAIN), 2));
+    second.detach().await;
+}
+
+#[test]
+fn the_client_reports_its_terminal_once_the_probe_is_over() {
+    for (images, graphics) in [("auto", false), ("on", true), ("off", false)] {
+        let server = TestServer::builder()
+            .config(&format!("amux.opt.images.client = {images:?}"))
+            .start();
+        let mut terminal = server.terminal(&["new", "-s", "s"]);
+        terminal.type_text("echo typed-$((6*7))\r");
+        terminal.wait_for_text("typed-42");
+
+        let reported = ClientTerminal {
+            graphics,
+            cell_pixels: None,
+        };
+        server.wait_for_log(&terminal_log("s", reported));
+        terminal.type_text(DETACH);
+        terminal.wait_for_exit();
     }
 }

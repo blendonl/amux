@@ -34,6 +34,48 @@ impl Size {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellPixels {
+    pub width: u16,
+    pub height: u16,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientTerminal {
+    pub graphics: bool,
+    pub cell_pixels: Option<CellPixels>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImageFormat {
+    Rgb24,
+    Rgba32,
+    Png,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImageOp {
+    Transmit {
+        key: u32,
+        format: ImageFormat,
+        width: u32,
+        height: u32,
+        compressed: bool,
+        total: u32,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        last: bool,
+    },
+    Place {
+        key: u32,
+        cols: u16,
+        rows: u16,
+    },
+    Delete {
+        key: u32,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub u64);
 
@@ -341,6 +383,7 @@ pub enum ClientMessage {
         verbose: bool,
     },
     ReloadConfig,
+    Terminal(ClientTerminal),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -408,4 +451,5 @@ pub enum ServerMessage {
     },
     PairingStep(String),
     Notice(String),
+    Image(ImageOp),
 }

@@ -11,7 +11,9 @@ use super::status::StatusFeed;
 use super::Server;
 use crate::cluster::{Channel, ChannelEnd};
 use crate::identity::ServerId;
-use crate::protocol::{AttachedSession, ClientMessage, NewSession, ServerMessage, Size};
+use crate::protocol::{
+    AttachedSession, ClientMessage, ClientTerminal, NewSession, ServerMessage, Size,
+};
 use crate::target::Target;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +57,7 @@ pub async fn run(
     host: &Host,
     opening: Opening,
     size: &mut Size,
+    terminal: &mut Option<ClientTerminal>,
 ) -> Result<Outcome> {
     let channel = match open(server, host, opening.request(*size)).await {
         Ok(channel) => channel,
@@ -63,6 +66,7 @@ pub async fn run(
             return Ok(Outcome::Exited);
         }
     };
+    replay(&channel, *terminal).await;
     let mut forward = Forward {
         server,
         host,
@@ -72,8 +76,8 @@ pub async fn run(
     let mut channel = Some(channel);
     loop {
         let step = match channel.as_mut() {
-            Some(open) => forward.relay(client, open, size).await?,
-            None => forward.reconnect(client, size).await?,
+            Some(open) => forward.relay(client, open, size, terminal).await?,
+            None => forward.reconnect(client, size, terminal).await?,
         };
         match step {
             Step::Done(outcome) => return Ok(outcome),
@@ -111,6 +115,7 @@ impl Forward<'_> {
         client: &mut ClientConnection,
         channel: &mut Channel,
         size: &mut Size,
+        terminal: &mut Option<ClientTerminal>,
     ) -> Result<Step> {
         let mut pending: Option<ServerMessage> = None;
         loop {
@@ -173,6 +178,10 @@ impl Forward<'_> {
                         *size = new_size.clamped();
                         let _ = channel.send(ClientMessage::Resize(*size)).await;
                     }
+                    Some(ClientMessage::Terminal(reported)) => {
+                        *terminal = Some(reported);
+                        let _ = channel.send(ClientMessage::Terminal(reported)).await;
+                    }
                     Some(message) => {
                         let _ = channel.send(message).await;
                     }
@@ -208,7 +217,12 @@ impl Forward<'_> {
         Ok(Step::Done(Outcome::Exited))
     }
 
-    async fn reconnect(&mut self, client: &mut ClientConnection, size: &mut Size) -> Result<Step> {
+    async fn reconnect(
+        &mut self,
+        client: &mut ClientConnection,
+        size: &mut Size,
+        terminal: &mut Option<ClientTerminal>,
+    ) -> Result<Step> {
         let cluster = self.server.cluster();
         let Some(attached) = self.attached.clone() else {
             bail!("reconnecting before the session was attached");
@@ -228,6 +242,7 @@ impl Forward<'_> {
                 };
                 if let Ok(channel) = cluster.open_channel(self.host.peer, reattach).await {
                     info!(host = %self.host.name, "reattaching after the link came back");
+                    replay(&channel, *terminal).await;
                     return Ok(Step::Reopened(channel));
                 }
             }
@@ -245,6 +260,7 @@ impl Forward<'_> {
                         return Ok(Step::Done(Outcome::Detached));
                     }
                     Some(ClientMessage::Resize(new_size)) => *size = new_size.clamped(),
+                    Some(ClientMessage::Terminal(reported)) => *terminal = Some(reported),
                     Some(ClientMessage::ListCluster) => {
                         let servers = ServerMessage::Cluster(self.server.cluster_view());
                         send(&client.outgoing, servers).await?;
@@ -268,6 +284,12 @@ impl Forward<'_> {
                 },
             }
         }
+    }
+}
+
+async fn replay(channel: &Channel, terminal: Option<ClientTerminal>) {
+    if let Some(terminal) = terminal {
+        let _ = channel.send(ClientMessage::Terminal(terminal)).await;
     }
 }
 
