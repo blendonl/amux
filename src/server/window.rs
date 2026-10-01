@@ -8,7 +8,7 @@ use super::layout::{Layout, PaneId, Rect, Side, SplitDirection};
 use super::mouse::MouseEvent;
 use super::pane::Pane;
 use super::render::{self, Frame, InputModes, Screens};
-use crate::protocol::{Direction, Size, Split, WindowSummary};
+use crate::protocol::{ClientTerminal, Direction, Size, Split, WindowSummary};
 use crate::settings::Settings;
 
 pub struct Window {
@@ -98,6 +98,15 @@ impl Window {
             if let Err(err) = pane.resize(rect_size(rect)) {
                 warn!(pane = %id, "resizing the pane failed: {err:#}");
             }
+        }
+    }
+
+    pub fn set_client_terminal(&self, terminal: ClientTerminal) {
+        for (id, pane) in &self.panes {
+            if let Err(err) = pane.set_cell_pixels(terminal.cell_pixels) {
+                warn!(pane = %id, "setting the pixel size failed: {err:#}");
+            }
+            pane.set_graphics(terminal.graphics);
         }
     }
 

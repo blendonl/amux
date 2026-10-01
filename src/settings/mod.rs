@@ -120,6 +120,7 @@ impl Settings {
                 self.worktrees.fetch_timeout_ms,
             ),
             ("search.project_depth", u64::from(self.search.project_depth)),
+            ("images.memory_mb", u64::from(self.images.memory_mb)),
         ];
         if let Some((option, _)) = positive.iter().find(|(_, value)| *value == 0) {
             return Err(format!("amux.opt.{option} must be a positive number"));
@@ -240,6 +241,20 @@ mod tests {
     }
 
     #[test]
+    fn images_are_on_in_panes_and_capped_at_320_mib() {
+        let defaults = Settings::default();
+        assert!(defaults.pane.images);
+        assert_eq!(defaults.images.memory_mb, 320);
+        assert_eq!(defaults.images.memory_bytes(), 320 * 1024 * 1024);
+
+        let settings: Settings =
+            toml::from_str("[pane]\nimages = false\n\n[images]\nmemory_mb = 64").unwrap();
+        assert!(!settings.pane.images);
+        assert_eq!(settings.images.memory_mb, 64);
+        assert_eq!(settings.images.client, ClientImages::Auto);
+    }
+
+    #[test]
     fn host_settings_are_read_from_their_own_tables() {
         let settings: Settings = toml::from_str(
             "[pane]\nterm = \"tmux-256color\"\n\n\
@@ -328,6 +343,10 @@ mod tests {
         assert_eq!(
             rejected(|settings| settings.search.project_depth = 0),
             "amux.opt.search.project_depth must be a positive number"
+        );
+        assert_eq!(
+            rejected(|settings| settings.images.memory_mb = 0),
+            "amux.opt.images.memory_mb must be a positive number"
         );
 
         let named = Settings {

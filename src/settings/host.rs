@@ -14,6 +14,7 @@ pub struct PaneSettings {
     pub scrollback: usize,
     pub env: BTreeMap<String, String>,
     pub strip_env: Vec<String>,
+    pub images: bool,
 }
 
 impl PaneSettings {
@@ -32,6 +33,7 @@ impl Default for PaneSettings {
             scrollback: 10_000,
             env: BTreeMap::new(),
             strip_env: vec!["SSH_".into()],
+            images: true,
         }
     }
 }
