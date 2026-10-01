@@ -20,7 +20,8 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl unzip gcc libc6-dev python3 \
  && rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSLo /tmp/cmdline-tools.zip \
+RUN --mount=type=tmpfs,target=/root/.android \
+    curl -fsSLo /tmp/cmdline-tools.zip \
       "https://dl.google.com/android/repository/commandlinetools-linux-${CMDLINE_TOOLS_BUILD}_latest.zip" \
  && mkdir -p "${ANDROID_HOME}/cmdline-tools" \
  && unzip -q /tmp/cmdline-tools.zip -d "${ANDROID_HOME}/cmdline-tools" \
@@ -33,7 +34,7 @@ RUN curl -fsSLo /tmp/cmdline-tools.zip \
       "platform-tools" \
       "ndk;${NDK_VERSION}" \
  && chmod -R go=u-w "${ANDROID_HOME}" \
- && rm -rf /root/.android /tmp/*
+ && rm -rf /tmp/*
 
 RUN curl -fsSL https://sh.rustup.rs \
     | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable \
