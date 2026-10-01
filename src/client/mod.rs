@@ -1,6 +1,6 @@
 mod chrome;
 mod fuzzy;
-mod graphics;
+pub(crate) mod graphics;
 mod listing;
 mod projects;
 mod relay;
