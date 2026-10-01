@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::respond::{Code, Failure};
 use super::transmit::Image;
-use crate::protocol::ImageFormat;
+use crate::protocol::{CellPixels, ImageFormat};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Buffer {
@@ -35,6 +35,12 @@ pub struct ImageData {
     pub decoded_len: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Derived {
+    Image(ImageData),
+    Plain,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stored {
     pub key: ImageKey,
@@ -58,7 +64,27 @@ struct State {
     owners: HashSet<Owner>,
     images: HashMap<ImageKey, Entry>,
     names: HashMap<(Owner, Buffer, Name), ImageKey>,
-    displays: HashMap<u32, Owner>,
+    displays: HashMap<u32, Display>,
+}
+
+struct Display {
+    owner: Owner,
+    derived: Option<Cached>,
+}
+
+struct Cached {
+    cell: CellPixels,
+    derived: Derived,
+    used: u64,
+}
+
+impl Cached {
+    fn len(&self) -> usize {
+        match &self.derived {
+            Derived::Image(data) => data.bytes.len(),
+            Derived::Plain => 0,
+        }
+    }
 }
 
 struct Entry {
@@ -112,6 +138,44 @@ impl ImageStore {
     #[cfg(test)]
     pub fn skip_display_keys(&self, last: u32) {
         self.lock().last_display = last;
+    }
+
+    pub fn derived(&self, display: u32, cell: CellPixels) -> Option<Derived> {
+        let mut state = self.lock();
+        let clock = state.tick();
+        let cached = state
+            .displays
+            .get_mut(&display)?
+            .derived
+            .as_mut()
+            .filter(|cached| cached.cell == cell)?;
+        cached.used = clock;
+        Some(cached.derived.clone())
+    }
+
+    pub fn keep_derived(&self, display: u32, cell: CellPixels, derived: Derived) -> Derived {
+        let mut state = self.lock();
+        let Some(shown) = state.displays.get_mut(&display) else {
+            return Derived::Plain;
+        };
+        let freed = shown.derived.take().map_or(0, |old| old.len());
+        state.used -= freed;
+        let derived = match derived {
+            Derived::Image(data) if state.make_derived_room(data.bytes.len()) => {
+                Derived::Image(data)
+            }
+            Derived::Image(_) | Derived::Plain => Derived::Plain,
+        };
+        let cached = Cached {
+            cell,
+            derived: derived.clone(),
+            used: state.tick(),
+        };
+        state.used += cached.len();
+        if let Some(shown) = state.displays.get_mut(&display) {
+            shown.derived = Some(cached);
+        }
+        derived
     }
 
     pub fn add_placement(&self, key: ImageKey) -> bool {
@@ -223,8 +287,24 @@ impl State {
             .checked_add(1)
             .ok_or_else(|| Failure::new(Code::Efbig, "out of display keys"))?;
         self.last_display = display;
-        self.displays.insert(display, owner);
+        self.displays.insert(
+            display,
+            Display {
+                owner,
+                derived: None,
+            },
+        );
         Ok(display)
+    }
+
+    fn release_display(&mut self, display: u32) {
+        if let Some(cached) = self
+            .displays
+            .remove(&display)
+            .and_then(|shown| shown.derived)
+        {
+            self.used -= cached.len();
+        }
     }
 
     fn free_id(&self, owner: Owner, buffer: Buffer) -> u32 {
@@ -263,6 +343,7 @@ impl State {
     }
 
     fn evict(&mut self, keep: Option<ImageKey>) {
+        self.evict_derived(0);
         while self.used > self.quota {
             let victim = self
                 .images
@@ -277,6 +358,36 @@ impl State {
         }
     }
 
+    fn make_derived_room(&mut self, room: usize) -> bool {
+        let derived: usize = self
+            .displays
+            .values()
+            .filter_map(|shown| shown.derived.as_ref())
+            .map(Cached::len)
+            .sum();
+        (self.used - derived).saturating_add(room) <= self.quota && self.evict_derived(room)
+    }
+
+    fn evict_derived(&mut self, room: usize) -> bool {
+        while self.used.saturating_add(room) > self.quota {
+            let victim = self
+                .displays
+                .values_mut()
+                .filter(|shown| {
+                    shown
+                        .derived
+                        .as_ref()
+                        .is_some_and(|cached| cached.len() > 0)
+                })
+                .min_by_key(|shown| shown.derived.as_ref().map(|cached| cached.used));
+            let Some(cached) = victim.and_then(|shown| shown.derived.take()) else {
+                return false;
+            };
+            self.used -= cached.len();
+        }
+        true
+    }
+
     fn close(&mut self, owner: Owner) {
         self.owners.remove(&owner);
         let mut freed = 0;
@@ -287,9 +398,15 @@ impl State {
             }
             kept
         });
-        self.used -= freed;
         self.names.retain(|(named, _, _), _| *named != owner);
-        self.displays.retain(|_, shown_by| *shown_by != owner);
+        self.displays.retain(|_, shown| {
+            let kept = shown.owner != owner;
+            if !kept {
+                freed += shown.derived.as_ref().map_or(0, Cached::len);
+            }
+            kept
+        });
+        self.used -= freed;
     }
 }
 
@@ -333,7 +450,7 @@ impl PaneImages {
     }
 
     pub fn release_display(&self, display: u32) {
-        self.store.lock().displays.remove(&display);
+        self.store.lock().release_display(display);
     }
 
     pub fn is_stored(&self, key: ImageKey) -> bool {
@@ -638,6 +755,114 @@ mod tests {
         left.close();
         assert!(!store.is_displayed(third));
         assert!(store.is_displayed(second));
+    }
+
+    const CELL: CellPixels = CellPixels {
+        width: 10,
+        height: 20,
+    };
+    const OTHER_CELL: CellPixels = CellPixels {
+        width: 8,
+        height: 16,
+    };
+
+    fn derived_image(len: usize) -> Derived {
+        Derived::Image(ImageData {
+            key: ImageKey(0),
+            width: 1,
+            height: 1,
+            format: ImageFormat::Rgba32,
+            compressed: true,
+            bytes: vec![1; len].into(),
+            decoded_len: 4,
+        })
+    }
+
+    #[test]
+    fn a_derived_image_is_kept_per_display_and_cell_size() {
+        let store = store(1 << 20);
+        let pane = store.open_pane();
+        pane.insert(Buffer::Main, 1, 0, image(5)).unwrap();
+        let display = pane.mint_display().unwrap();
+        assert_eq!(store.derived(display, CELL), None);
+        assert_eq!(
+            store.keep_derived(display, CELL, derived_image(10)),
+            derived_image(10)
+        );
+        assert_eq!(store.derived(display, CELL), Some(derived_image(10)));
+        assert_eq!(store.derived(display, OTHER_CELL), None);
+        assert_eq!(used(&store), 15);
+
+        store.keep_derived(display, OTHER_CELL, derived_image(20));
+        assert_eq!(store.derived(display, CELL), None);
+        assert_eq!(store.derived(display, OTHER_CELL), Some(derived_image(20)));
+        assert_eq!(used(&store), 25);
+        assert_eq!(
+            store.keep_derived(display, CELL, Derived::Plain),
+            Derived::Plain
+        );
+        assert_eq!(store.derived(display, CELL), Some(Derived::Plain));
+        assert_eq!(used(&store), 5);
+
+        store.keep_derived(display, CELL, derived_image(10));
+        pane.release_display(display);
+        assert_eq!(store.derived(display, CELL), None);
+        assert_eq!(used(&store), 5);
+        assert_eq!(
+            store.keep_derived(display, CELL, derived_image(10)),
+            Derived::Plain
+        );
+        assert_eq!(used(&store), 5);
+    }
+
+    #[test]
+    fn derived_images_count_against_the_quota_but_never_push_out_an_image() {
+        let store = store(100);
+        let pane = store.open_pane();
+        let [first, second, third] = [(); 3].map(|()| pane.mint_display().unwrap());
+        let placed = pane.insert(Buffer::Main, 1, 0, image(40)).unwrap().key;
+        assert!(store.add_placement(placed));
+        store.keep_derived(first, CELL, derived_image(30));
+        store.keep_derived(second, CELL, derived_image(30));
+        assert_eq!(used(&store), 100);
+        store.derived(first, CELL);
+        store.keep_derived(third, CELL, derived_image(30));
+        assert_eq!(store.derived(second, CELL), None);
+        assert_eq!(store.derived(first, CELL), Some(derived_image(30)));
+        assert_eq!(used(&store), 100);
+
+        let loose = pane.insert(Buffer::Main, 2, 0, image(20)).unwrap().key;
+        assert_eq!(store.derived(third, CELL), None);
+        assert_eq!(keys(&store), [placed.0, loose.0]);
+        assert_eq!(used(&store), 90);
+
+        assert_eq!(
+            store.keep_derived(second, CELL, derived_image(80)),
+            Derived::Plain
+        );
+        assert_eq!(store.derived(first, CELL), Some(derived_image(30)));
+        assert_eq!(used(&store), 90);
+
+        store.set_quota(60);
+        assert_eq!(store.derived(first, CELL), None);
+        assert_eq!(keys(&store), [placed.0, loose.0]);
+        assert_eq!(used(&store), 60);
+    }
+
+    #[test]
+    fn closing_a_pane_frees_its_derived_images() {
+        let store = store(1 << 20);
+        let closing = store.open_pane();
+        let staying = store.open_pane();
+        let gone = closing.mint_display().unwrap();
+        let kept = staying.mint_display().unwrap();
+        closing.insert(Buffer::Main, 1, 0, image(3)).unwrap();
+        store.keep_derived(gone, CELL, derived_image(10));
+        store.keep_derived(kept, CELL, derived_image(7));
+        closing.close();
+        assert_eq!(used(&store), 7);
+        assert_eq!(store.derived(gone, CELL), None);
+        assert_eq!(store.derived(kept, CELL), Some(derived_image(7)));
     }
 
     #[test]

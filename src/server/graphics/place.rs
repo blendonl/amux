@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 
 use super::command::Command;
+use super::derive::{Look, Sizing};
 use super::respond::{Code, Failure};
 use super::store::{Buffer, ImageKey, Name, PaneImages, Stored};
 use crate::protocol::CellPixels;
@@ -48,7 +49,7 @@ pub struct PaneSpan {
     pub kind: PlacementKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct SourceRect {
     pub x: u32,
     pub y: u32,
@@ -56,7 +57,7 @@ pub struct SourceRect {
     pub height: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct CellOffset {
     pub x: u32,
     pub y: u32,
@@ -96,10 +97,9 @@ struct Placement {
     cols: u16,
     rows: u16,
     z: i32,
-    #[cfg_attr(not(test), expect(dead_code))]
     source: SourceRect,
-    #[cfg_attr(not(test), expect(dead_code))]
     offset: CellOffset,
+    sizing: Sizing,
     position: Position,
     kind: PlacementKind,
 }
@@ -130,6 +130,11 @@ impl Placement {
             image: self.key,
             cols: self.cols,
             rows: self.rows,
+            look: (self.kind == PlacementKind::Kitty && !self.is_virtual()).then_some(Look {
+                source: self.source,
+                offset: self.offset,
+                sizing: self.sizing,
+            }),
         }
     }
 }
@@ -184,10 +189,16 @@ impl Placements {
                 .min(u32::from(cell.height).saturating_sub(1)),
         };
         let (cols, rows) = extent(command, source, offset, cell);
+        let sizing = Sizing::of(command.columns, command.rows);
+        let look = (!command.unicode_placeholder).then_some(Look {
+            source,
+            offset,
+            sizing,
+        });
         let kept = replaced
-            .map(|at| &list[at])
-            .filter(|old| (old.cols, old.rows) == (cols, rows))
-            .map(|old| old.display);
+            .map(|at| list[at].shown())
+            .filter(|old| (old.cols, old.rows, old.look) == (cols, rows, look))
+            .map(|old| old.key);
         let display = match kept {
             Some(display) => display,
             None => self.images.mint_display()?,
@@ -220,6 +231,7 @@ impl Placements {
             z: command.z_index,
             source,
             offset,
+            sizing,
             position,
             kind: PlacementKind::Kitty,
         };
@@ -268,6 +280,7 @@ impl Placements {
                 height: image.height,
             },
             offset: CellOffset::default(),
+            sizing: Sizing::Native,
             position: Position::Rows {
                 anchors,
                 pending_tail: rows..rows,
@@ -1648,6 +1661,57 @@ pub mod tests {
     }
 
     #[test]
+    fn a_new_crop_offset_or_sizing_shows_under_a_new_display_key() {
+        let mut terminal = Terminal::new(6, 20);
+        terminal.set_cell(10, 20);
+        let image = terminal.image(1, 40, 40);
+        let shown = |terminal: &Terminal| terminal.spans()[0].display;
+        terminal
+            .place(image, "a=p,i=1,p=1,C=1,c=2,r=1,w=20,h=20")
+            .unwrap();
+        let first = shown(&terminal);
+        assert_eq!(
+            first.look,
+            Some(Look {
+                source: SourceRect {
+                    x: 0,
+                    y: 0,
+                    width: 20,
+                    height: 20
+                },
+                offset: CellOffset::default(),
+                sizing: Sizing::Stretch,
+            })
+        );
+        terminal.output("\x1b[2;1H");
+        terminal
+            .place(image, "a=p,i=1,p=1,C=1,c=2,r=1,w=20,h=20")
+            .unwrap();
+        assert_eq!(shown(&terminal), first);
+
+        let mut previous = first.key;
+        for keys in [
+            "c=2,r=1,x=20,w=20,h=20",
+            "c=2,r=1,x=20,w=20,h=20,X=3",
+            "c=2,x=20,w=20,h=20",
+        ] {
+            terminal
+                .place(image, &format!("a=p,i=1,p=1,C=1,{keys}"))
+                .unwrap();
+            let display = shown(&terminal);
+            assert_eq!((display.cols, display.rows), (2, 1), "{keys}");
+            assert!(display.key > previous, "{keys}");
+            assert!(!terminal.store.is_displayed(previous), "{keys}");
+            previous = display.key;
+        }
+        let look = shown(&terminal).look.unwrap();
+        assert_eq!(
+            (look.source.x, look.offset, look.sizing),
+            (20, CellOffset::default(), Sizing::Columns)
+        );
+    }
+
+    #[test]
     fn virtual_placements_are_found_by_image_and_placement_id() {
         let mut terminal = Terminal::new(5, 20);
         let image = terminal.image(7, 30, 40);
@@ -1664,6 +1728,7 @@ pub mod tests {
 
         let third = found(&terminal, 7, 3).unwrap();
         assert_eq!((third.image, third.cols, third.rows), (image.key, 3, 2));
+        assert_eq!(third.look, None);
         assert_eq!(found(&terminal, 7, 0), Some(third));
         let fourth = found(&terminal, 7, 4).unwrap();
         assert_eq!((fourth.cols, fourth.rows), (5, 1));
@@ -1671,6 +1736,8 @@ pub mod tests {
         assert_eq!(found(&terminal, 7, 5), None);
         assert_eq!(found(&terminal, 8, 0), None);
         assert_eq!(found(&terminal, 0, 0), None);
+        terminal.place(image, "a=p,i=7,p=3,U=1,x=5,X=2").unwrap();
+        assert_eq!(found(&terminal, 7, 3), Some(third));
 
         terminal.output("\x1b[?47h");
         assert_eq!(found(&terminal, 7, 3), None);

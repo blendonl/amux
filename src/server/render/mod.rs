@@ -16,6 +16,7 @@ use grid::{BorderLook, Grid};
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 use crate::protocol::Size;
+use crate::server::graphics::derive::Look;
 use crate::server::graphics::place::Placements;
 use crate::server::graphics::store::ImageKey;
 use crate::server::layout::{Layout, PaneId, Rect};
@@ -50,6 +51,7 @@ pub struct ImageUse {
     pub image: ImageKey,
     pub cols: u16,
     pub rows: u16,
+    pub look: Option<Look>,
 }
 
 #[derive(Debug, Clone, Copy)]

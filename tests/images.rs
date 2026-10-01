@@ -1,6 +1,7 @@
 mod common;
 
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use amux::protocol::{
@@ -301,6 +302,96 @@ async fn a_sixel_reaches_a_kitty_client_padded_to_whole_cells_and_a_plain_client
         assert!(!cell.has_contents(), "({top}, {col}): {cell:?}");
     }
     plain.detach().await;
+}
+
+fn tiny_png_pixels() -> Vec<[u8; 4]> {
+    let decoder = png::Decoder::new(Cursor::new(fs::read(fixture()).unwrap()));
+    let mut reader = decoder.read_info().unwrap();
+    let mut data = vec![0; reader.output_buffer_size().unwrap()];
+    reader.next_frame(&mut data).unwrap();
+    data.chunks(4)
+        .map(|pixel| pixel.try_into().unwrap())
+        .collect()
+}
+
+fn order(ops: &[ImageOp]) -> Vec<(char, u32, u32, u32)> {
+    ops.iter()
+        .map(|op| match op {
+            ImageOp::Transmit {
+                key, width, height, ..
+            } => ('t', *key, *width, *height),
+            ImageOp::Place { key, cols, rows } => ('p', *key, u32::from(*cols), u32::from(*rows)),
+            ImageOp::Delete { key } => ('d', *key, 0, 0),
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cropped_placement_gets_an_image_derived_for_its_cell() {
+    let server = TestServer::start();
+    let mut client = kitty_session(&server, "s").await;
+    let quoted = shell_words::quote(&fixture().display().to_string()).into_owned();
+    client
+        .type_text(&show(
+            "a=T,f=100,i=1,x=10,y=20,w=10,h=20",
+            &format!("cat {quoted}"),
+        ))
+        .await;
+    let ops = images_until(&mut client, "the derived image", |ops, screen| {
+        uploaded(ops).is_some() && placeholders(screen).len() == 1
+    })
+    .await;
+    let [ImageOp::Transmit {
+        key,
+        format,
+        width,
+        height,
+        compressed,
+        data,
+        last,
+        ..
+    }, ImageOp::Place {
+        key: placed,
+        cols,
+        rows,
+    }] = &ops[..]
+    else {
+        panic!("expected one transmission and a placement, got {ops:?}");
+    };
+    assert_eq!(
+        (*format, *width, *height, *compressed, *last),
+        (ImageFormat::Rgba32, 10, 20, true, true)
+    );
+    assert_eq!((*placed, *cols, *rows), (*key, 1, 1));
+    let png = tiny_png_pixels();
+    let crop: Vec<u8> = (20..40)
+        .flat_map(|y| (10..20).map(move |x| y * 20 + x))
+        .flat_map(|at| match png[at] {
+            [_, _, _, 0] => [0; 4],
+            pixel => pixel,
+        })
+        .collect();
+    assert_eq!(
+        miniz_oxide::inflate::decompress_to_vec_zlib(data).unwrap(),
+        crop
+    );
+
+    let smaller = ClientTerminal {
+        graphics: true,
+        cell_pixels: Some(CellPixels {
+            width: 5,
+            height: 10,
+        }),
+    };
+    client.send(ClientMessage::Terminal(smaller)).await;
+    let ops = images_until(&mut client, "the image derived again", |ops, _| {
+        matches!(ops.last(), Some(ImageOp::Place { .. }))
+    })
+    .await;
+    assert_eq!(
+        order(&ops),
+        [('d', *key, 0, 0), ('t', *key, 5, 10), ('p', *key, 1, 1)]
+    );
 }
 
 fn noise(len: usize) -> Vec<u8> {
