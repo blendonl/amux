@@ -1,5 +1,6 @@
 mod connection;
 mod forward;
+mod graphics;
 mod layout;
 pub mod lua_host;
 mod mouse;
