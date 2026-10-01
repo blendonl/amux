@@ -2,11 +2,12 @@ use std::fmt;
 
 use vt100::Color;
 
+use super::placeholder::{placeholder_cell, ImageSpan, MAX_IMAGE_CELLS};
 use crate::protocol::Size;
 use crate::server::layout::{Border, BorderLine, Rect};
 use crate::settings::{self, BorderSettings, Settings, StyleSpec};
 
-const TEXT_CAPACITY: usize = 22;
+pub const TEXT_CAPACITY: usize = 22;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Style {
@@ -101,7 +102,7 @@ impl Cell {
         }
     }
 
-    fn with_text(text: &str, style: Style) -> Self {
+    pub fn with_text(text: &str, style: Style) -> Self {
         let mut end = text.len().min(TEXT_CAPACITY);
         while !text.is_char_boundary(end) {
             end -= 1;
@@ -180,6 +181,34 @@ impl Grid {
                 self.set(area.row + row, area.col + col, cell.unwrap_or_default());
             }
             self.repair_wide_cells(area.row + row, area.col, area.right());
+        }
+    }
+
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub fn paint_image(&mut self, span: &ImageSpan, clip: Rect) {
+        let area = self.clip(clip);
+        let encodable = MAX_IMAGE_CELLS.saturating_sub(span.image_col);
+        let cols = span.cols.min(encodable);
+        let start = span.col.max(area.col);
+        let end = span.col.saturating_add(cols).min(area.right());
+        if span.image_row >= MAX_IMAGE_CELLS || start >= end || !area.contains(span.row, start) {
+            return;
+        }
+
+        let row = span.row;
+        let first = self.cell(row, start).copied().unwrap_or_default();
+        let last = self.cell(row, end - 1).copied().unwrap_or_default();
+        if start > area.col && first.is_wide_continuation() {
+            self.set(row, start - 1, Cell::blank(self.style_at(row, start - 1)));
+        }
+        if end < area.right() && last.is_wide() {
+            self.set(row, end, Cell::blank(last.style()));
+        }
+        for col in start..end {
+            let image_col = span.image_col + (col - span.col);
+            let background = self.style_at(row, col).bg;
+            let cell = placeholder_cell(span.key, span.image_row, image_col, background);
+            self.set(row, col, cell);
         }
     }
 
@@ -273,6 +302,10 @@ impl Grid {
             self.cells[index] = cell;
         }
     }
+
+    fn style_at(&self, row: u16, col: u16) -> Style {
+        self.cell(row, col).map(Cell::style).unwrap_or_default()
+    }
 }
 
 struct Joins {
@@ -313,6 +346,7 @@ fn touches(rect: Rect, row: u16, col: u16) -> bool {
 mod tests {
     use super::*;
     use crate::server::layout::{Layout, PaneId, SplitDirection};
+    use crate::server::render::placeholder::{DIACRITICS, PLACEHOLDER};
 
     fn size(cols: u16, rows: u16) -> Size {
         Size { rows, cols }
@@ -344,10 +378,33 @@ mod tests {
                 match cell.text() {
                     "" if cell.is_wide_continuation() => "",
                     "" => ".",
+                    text if text.starts_with(PLACEHOLDER) => "#",
                     text => text,
                 }
             })
             .collect()
+    }
+
+    fn image(row: u16, col: u16, cols: u16, image_row: u16, image_col: u16) -> ImageSpan {
+        ImageSpan {
+            key: 0x0102_0304,
+            image_row,
+            image_col,
+            row,
+            col,
+            cols,
+        }
+    }
+
+    fn image_cell(grid: &Grid, row: u16, col: u16) -> Option<(u16, u16)> {
+        let mut chars = grid.cell(row, col)?.text().chars();
+        let index = |mark: Option<char>| {
+            DIACRITICS
+                .iter()
+                .position(|&diacritic| Some(diacritic) == mark)
+                .and_then(|index| u16::try_from(index).ok())
+        };
+        (chars.next()? == PLACEHOLDER).then_some((index(chars.next())?, index(chars.next())?))
     }
 
     #[test]
@@ -580,5 +637,110 @@ mod tests {
     fn long_text_is_cut_at_a_character_boundary() {
         let cell = Cell::with_text(&"é".repeat(12), Style::default());
         assert_eq!(cell.text(), "é".repeat(11));
+    }
+
+    #[test]
+    fn a_cell_stays_thirty_eight_bytes() {
+        assert_eq!(std::mem::size_of::<Cell>(), 38);
+    }
+
+    #[test]
+    fn an_image_span_is_clipped_to_its_pane() {
+        let text = "0123456789\r\nabcdefghij\r\nABCDEFGHIJ\r\nklmnopqrst";
+        let mut grid = Grid::new(size(10, 4));
+        grid.paint(screen(10, 4, text).screen(), rect(0, 0, 4, 10));
+        let untouched = grid.clone();
+
+        let pane = rect(1, 2, 2, 5);
+        grid.paint_image(&image(0, 0, 10, 0, 0), pane);
+        grid.paint_image(&image(1, 0, 10, 4, 0), pane);
+        grid.paint_image(&image(2, 5, 1, 5, 9), pane);
+        grid.paint_image(&image(3, 2, 5, 6, 0), pane);
+        grid.paint_image(&image(2, 7, 3, 5, 0), pane);
+        grid.paint_image(&image(2, u16::MAX, u16::MAX, 5, 0), pane);
+
+        assert_eq!(row_text(&grid, 0), "0123456789");
+        assert_eq!(row_text(&grid, 1), "ab#####hij");
+        assert_eq!(row_text(&grid, 2), "ABCDE#GHIJ");
+        assert_eq!(row_text(&grid, 3), "klmnopqrst");
+        assert_eq!(
+            (2..7)
+                .map(|col| image_cell(&grid, 1, col))
+                .collect::<Vec<_>>(),
+            [2, 3, 4, 5, 6].map(|image_col| Some((4, image_col)))
+        );
+        assert_eq!(image_cell(&grid, 2, 5), Some((5, 9)));
+        for row in 0..4 {
+            for col in 0..10 {
+                if !pane.contains(row, col) {
+                    assert_eq!(grid.cell(row, col), untouched.cell(row, col));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_image_span_is_clipped_to_the_window() {
+        let mut grid = Grid::new(size(4, 2));
+        grid.paint_image(&image(1, 2, 5, 0, 0), rect(0, 0, 10, 10));
+        assert_eq!(row_text(&grid, 0), "....");
+        assert_eq!(row_text(&grid, 1), "..##");
+    }
+
+    #[test]
+    fn an_image_span_keeps_the_background_of_the_cells_it_covers() {
+        let pane = screen(4, 1, "\x1b[44mab\x1b[0mcd");
+        let mut grid = Grid::new(size(4, 1));
+        grid.paint(pane.screen(), rect(0, 0, 1, 4));
+        grid.paint_image(&image(0, 0, 4, 0, 0), rect(0, 0, 1, 4));
+
+        let styles: Vec<Style> = (0..4)
+            .map(|col| grid.cell(0, col).unwrap().style())
+            .collect();
+        let image = Style {
+            fg: Color::Rgb(2, 3, 4),
+            ..Style::default()
+        };
+        let on_blue = Style {
+            bg: Color::Idx(4),
+            ..image
+        };
+        assert_eq!(styles, [on_blue, on_blue, image, image]);
+    }
+
+    #[test]
+    fn an_image_span_cutting_a_wide_character_blanks_its_other_half() {
+        let pane = screen(8, 1, "a\x1b[41m中\x1b[0mb\x1b[42m文\x1b[0mc");
+        let whole = rect(0, 0, 1, 8);
+        let mut grid = Grid::new(size(8, 1));
+        grid.paint(pane.screen(), whole);
+        let untouched = grid.clone();
+
+        grid.paint_image(&image(0, 2, 3, 0, 0), whole);
+        assert_eq!(row_text(&grid, 0), "a.###.c.");
+        let head = grid.cell(0, 1).unwrap();
+        assert!(head.is_erased() && !head.is_wide());
+        assert_eq!(head.style().bg, Color::Idx(1));
+        let tail = grid.cell(0, 5).unwrap();
+        assert!(tail.is_erased() && !tail.is_wide_continuation());
+        assert_eq!(tail.style().bg, Color::Idx(2));
+
+        let mut grid = untouched;
+        grid.paint_image(&image(0, 1, 2, 0, 0), whole);
+        assert_eq!(row_text(&grid, 0), "a##b文c.");
+    }
+
+    #[test]
+    fn image_cells_past_the_last_diacritic_are_not_painted() {
+        let whole = rect(0, 0, 3, 10);
+        let mut grid = Grid::new(size(10, 3));
+        grid.paint_image(&image(0, 0, 10, 296, 290), whole);
+        grid.paint_image(&image(1, 0, 10, 297, 0), whole);
+        grid.paint_image(&image(2, 0, 10, 0, 297), whole);
+
+        assert_eq!(row_text(&grid, 0), "#######...");
+        assert_eq!(image_cell(&grid, 0, 6), Some((296, 296)));
+        assert_eq!(row_text(&grid, 1), "..........");
+        assert_eq!(row_text(&grid, 2), "..........");
     }
 }
