@@ -1,3 +1,4 @@
+// Modified by amux: kitty graphics commands, XTVERSION and an image store
 package com.termux.terminal;
 
 import android.util.Base64;
@@ -178,6 +179,10 @@ public final class TerminalEmulator {
 
     TerminalSessionClient mClient;
 
+    private final ImageStore mImages = new ImageStore();
+    private final ApcBuffer mApc = new ApcBuffer();
+    private final KittyGraphics mGraphics;
+
     /** Keeps track of the current argument of the current escape sequence. Ranges from 0 to MAX_ESCAPE_PARAMETERS-1. */
     private int mArgIndex;
     /** Holds the arguments of the current escape sequence. */
@@ -332,6 +337,7 @@ public final class TerminalEmulator {
         mCellWidthPixels = cellWidthPixels;
         mCellHeightPixels = cellHeightPixels;
         mTabStop = new boolean[mColumns];
+        mGraphics = new KittyGraphics(mImages, session);
         reset();
     }
 
@@ -343,6 +349,18 @@ public final class TerminalEmulator {
 
     public TerminalBuffer getScreen() {
         return mScreen;
+    }
+
+    public ImageStore getImages() {
+        return mImages;
+    }
+
+    public int getCellWidthPixels() {
+        return mCellWidthPixels;
+    }
+
+    public int getCellHeightPixels() {
+        return mCellHeightPixels;
     }
 
     public boolean isAlternateBufferActive() {
@@ -1040,6 +1058,8 @@ public final class TerminalEmulator {
     private void doApc(int b) {
         if (b == 27) {
             continueSequence(ESC_APC_ESCAPE);
+        } else {
+            mApc.append(b);
         }
         // Eat APC sequences silently for now.
     }
@@ -1051,9 +1071,13 @@ public final class TerminalEmulator {
         if (b == '\\') {
             // A String Terminator (ST), ending the APC escape sequence.
             finishSequence();
+            String graphicsCommand = mApc.finishGraphicsCommand();
+            if (graphicsCommand != null) mGraphics.handle(graphicsCommand);
         } else {
             // The Escape character was not the start of a String Terminator (ST),
             // but instead just data inside of the APC escape sequence.
+            mApc.append(27);
+            mApc.append(b);
             continueSequence(ESC_APC);
         }
     }
@@ -1295,6 +1319,9 @@ public final class TerminalEmulator {
                 // The third number is a keyboard identifier not used nowadays.
                 mSession.write("\033[>41;320;0c");
                 break;
+            case 'q':
+                if (getArg0(0) == 0) mSession.write("\033P>|amux-android(1)\033\\");
+                break;
             case 'm':
                 // https://bugs.launchpad.net/gnome-terminal/+bug/96676/comments/25
                 // Depending on the first number parameter, this can set one of the xterm resources
@@ -1438,6 +1465,7 @@ public final class TerminalEmulator {
                 break;
             case 'c': // RIS - Reset to Initial State (http://vt100.net/docs/vt510-rm/RIS).
                 reset();
+                mGraphics.reset();
                 mMainBuffer.clearTranscript();
                 blockClear(0, 0, mColumns, mRows);
                 setCursorPosition(0, 0);
@@ -1486,6 +1514,7 @@ public final class TerminalEmulator {
                 setDecsetinternalBit(DECSET_BIT_APPLICATION_KEYPAD, false);
                 break;
             case '_': // APC - Application Program Command.
+                mApc.start();
                 continueSequence(ESC_APC);
                 break;
             default:
