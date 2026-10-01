@@ -1,8 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use vt100::{Color, MouseProtocolEncoding, MouseProtocolMode};
 
 use super::grid::Cell;
+use super::placeholder::{ImageSpan, DIACRITICS, PLACEHOLDER};
 use super::{compose, Frame, GridDiffer, InputModes};
 use crate::protocol::Size;
 use crate::server::layout::{Layout, PaneId, Rect, SplitDirection};
@@ -427,6 +428,175 @@ fn drawing_hides_the_cursor_and_puts_it_back() {
     client.assert_shows(&window.frame());
 }
 
+fn placeholder_text(key: u32, image_row: u16, image_col: u16) -> String {
+    [
+        PLACEHOLDER,
+        DIACRITICS[usize::from(image_row)],
+        DIACRITICS[usize::from(image_col)],
+        DIACRITICS[usize::from(key.to_be_bytes()[0])],
+    ]
+    .iter()
+    .collect()
+}
+
+#[test]
+fn image_placeholders_survive_a_round_trip() {
+    let mut window = Window::three_panes();
+    window.fill();
+    let text = window.frame();
+    let mut client = Client::new(WINDOW);
+    client.show(&text);
+
+    let (a, b) = (window.rect(A), window.rect(B));
+    let mut frame = text.clone();
+    let mut painted: BTreeMap<(u16, u16), (u32, u16, u16)> = BTreeMap::new();
+    for image_row in 0..3 {
+        frame.grid.paint_image(
+            &ImageSpan {
+                key: 0x2a10_2030,
+                image_row,
+                image_col: 0,
+                row: 2 + image_row,
+                col: 15,
+                cols: 8,
+            },
+            a,
+        );
+        for col in 15..20 {
+            painted.insert((2 + image_row, col), (0x2a10_2030, image_row, col - 15));
+        }
+    }
+    let span = ImageSpan {
+        key: 7,
+        image_row: 0,
+        image_col: 0,
+        row: 0,
+        col: 22,
+        cols: 4,
+    };
+    frame.grid.paint_image(&span, b);
+    frame.grid.paint_image(
+        &ImageSpan {
+            image_row: 1,
+            row: 2,
+            col: 18,
+            cols: 6,
+            ..span
+        },
+        b,
+    );
+    frame.grid.paint_image(
+        &ImageSpan {
+            image_row: 2,
+            row: 6,
+            col: 21,
+            ..span
+        },
+        b,
+    );
+    for col in 22..26 {
+        painted.insert((0, col), (7, 0, col - 22));
+    }
+    for col in 21..24 {
+        painted.insert((2, col), (7, 1, col - 18));
+    }
+    let cut = BTreeSet::from([(0, 21), (0, 26), (2, 24)]);
+
+    client.show(&frame);
+    client.assert_shows(&frame);
+    for row in 0..WINDOW.rows {
+        for col in 0..WINDOW.cols {
+            let shown = client.parser.screen().cell(row, col).unwrap();
+            if let Some(&(key, image_row, image_col)) = painted.get(&(row, col)) {
+                let [_, red, green, blue] = key.to_be_bytes();
+                assert_eq!(
+                    shown.contents(),
+                    placeholder_text(key, image_row, image_col),
+                    "cell ({row}, {col})"
+                );
+                assert_eq!(shown.fgcolor(), Color::Rgb(red, green, blue));
+                assert!(!shown.is_wide() && !shown.is_wide_continuation());
+            } else if cut.contains(&(row, col)) {
+                assert!(client.cell(row, col).is_erased(), "cell ({row}, {col})");
+            } else {
+                assert_eq!(
+                    frame.grid.cell(row, col),
+                    text.grid.cell(row, col),
+                    "cell ({row}, {col})"
+                );
+            }
+        }
+    }
+    for row in 0..6 {
+        assert_eq!(client.cell(row, 20).text(), "│");
+    }
+    assert_eq!(client.cell(6, 21).text(), "─");
+    assert_eq!(client.cell(0, 27).text(), "符");
+    assert_eq!(client.cell(2, 25).text(), "語");
+    client.assert_shows_pane(&window, C);
+}
+
+#[test]
+fn moving_an_image_row_repaints_only_what_changed() {
+    let layout = Layout::new(A);
+    let mut panes = BTreeMap::from([(A, vt100::Parser::new(WINDOW.rows, WINDOW.cols, 0))]);
+    panes.get_mut(&A).unwrap().process(b"hello world");
+    let whole = Rect {
+        row: 0,
+        col: 0,
+        rows: WINDOW.rows,
+        cols: WINDOW.cols,
+    };
+    let with_image = |span: ImageSpan| {
+        let mut frame = compose(&layout, WINDOW, A, &panes, &Settings::default());
+        frame.grid.paint_image(&span, whole);
+        frame
+    };
+    let cells = |image_row| -> String {
+        (0..3)
+            .map(|image_col| placeholder_text(0x0001_0203, image_row, image_col))
+            .collect()
+    };
+    let span = ImageSpan {
+        key: 0x0001_0203,
+        image_row: 0,
+        image_col: 0,
+        row: 2,
+        col: 4,
+        cols: 3,
+    };
+    let mut client = Client::new(WINDOW);
+    client.show(&with_image(span));
+
+    let moved = with_image(ImageSpan { row: 3, ..span });
+    assert_eq!(
+        client.show(&moved),
+        [
+            b"\x1b[?25l\x1b[3;5H\x1b[K\x1b[4;5H\x1b[38;2;1;2;3m".as_slice(),
+            cells(0).as_bytes(),
+            b"\x1b[0m\x1b[1;12H\x1b[?25h",
+        ]
+        .concat()
+    );
+    client.assert_shows(&moved);
+
+    let next_image_row = with_image(ImageSpan {
+        row: 3,
+        image_row: 1,
+        ..span
+    });
+    assert_eq!(
+        client.show(&next_image_row),
+        [
+            b"\x1b[?25l\x1b[4;5H\x1b[38;2;1;2;3m".as_slice(),
+            cells(1).as_bytes(),
+            b"\x1b[0m\x1b[1;12H\x1b[?25h",
+        ]
+        .concat()
+    );
+    client.assert_shows(&next_image_row);
+}
+
 struct Random(u64);
 
 impl Random {
@@ -528,6 +698,39 @@ fn random_updates_always_reproduce_the_frame() {
                 client.assert_shows_pane(&window, pane);
             }
         }
+        client.assert_shows(&frame);
+    }
+}
+
+#[test]
+fn random_images_always_reproduce_the_frame() {
+    let mut random = Random(0x2545_f491_4f6c_dd1d);
+    let mut window = Window::three_panes();
+    let mut client = Client::new(WINDOW);
+
+    for _ in 0..300 {
+        for pane in [A, B, C] {
+            let input = random_input(&mut random, window.rect(pane));
+            window.feed(pane, &input);
+        }
+        if random.below(20) == 0 {
+            client.differ.reset();
+        }
+        let mut frame = window.frame();
+        for pane in [A, B, C] {
+            for _ in 0..random.below(4) {
+                let span = ImageSpan {
+                    key: random.next() as u32,
+                    image_row: random.below(300) as u16,
+                    image_col: random.below(300) as u16,
+                    row: random.below(u64::from(WINDOW.rows)) as u16,
+                    col: random.below(u64::from(WINDOW.cols)) as u16,
+                    cols: random.below(30) as u16,
+                };
+                frame.grid.paint_image(&span, window.rect(pane));
+            }
+        }
+        client.show(&frame);
         client.assert_shows(&frame);
     }
 }

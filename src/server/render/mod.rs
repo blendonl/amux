@@ -1,6 +1,7 @@
 mod differ;
 mod escape;
 mod grid;
+mod placeholder;
 #[cfg(test)]
 mod round_trip;
 
