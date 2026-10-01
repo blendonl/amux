@@ -29,3 +29,7 @@ These are amux's own files, not upstream's.
 - `src/test/java/com/termux/terminal/KittyCommandTest.java`
 - `src/test/java/com/termux/terminal/KittyGraphicsTest.java`
 - `src/test/java/com/termux/terminal/ImageStoreTest.java`
+- `src/main/java/com/termux/terminal/Placeholders.java`: the 297 kitty placeholder diacritics and their lookup.
+- `src/main/java/com/termux/terminal/PlaceholderRowScanner.java`: decodes a row's placeholder cells into image runs.
+- `src/test/java/com/termux/terminal/PlaceholdersTest.java`
+- `src/test/java/com/termux/terminal/PlaceholderRowScannerTest.java`
