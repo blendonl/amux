@@ -5,9 +5,11 @@ amux runs `init.lua` in two places, and each machine uses its own copy (see [Con
 - **The client** runs it when it attaches: `amux`, `amux new` and `amux attach`. It uses the prefix, the key bindings, the status bar, the theme, the tree and the search, which is everything the client draws. A config error stops the client with `init.lua:N` before it takes over the terminal.
 - **The server** runs it when it starts. It uses everything the host does: panes, windows, sessions, borders, the cluster and the hooks.
 
-Both run it again in a new Lua state on a reload: `reload_config()` (`Ctrl-b r`) reloads the client and the server on its machine, and `amux config reload` or `SIGHUP` the server. Nothing carries over from the old state, so a module loaded with `require` is loaded again and every binding and hook is replaced. When the new config fails, the old state keeps running and the error shows with its `init.lua:N`. The [README](../README.md#reloading) lists what a reload changes and what still needs a restart.
+Both run it again in a new Lua state on a reload: `reload_config()` (`Ctrl-b r`) reloads the client and the server on its machine, `amux config reload` or `SIGHUP` the server, and saving `init.lua`, `servers.lua` or a module in `lua/` each of them, unless `amux.opt.reload.watch` is `false`. Nothing carries over from the old state, so a module loaded with `require` is loaded again and every binding and hook is replaced. When the new config fails, the old state keeps running and the error shows with its `init.lua:N`. The [README](../README.md#reloading) lists what a reload changes and what still needs a restart.
 
 `amux.process` is `"client"` or `"server"`, so one file can do different things in each. `amux config check` loads the file both ways. `amux ls`, `kill`, `bridge`, `kill-server` and the other one-shot commands never run it.
+
+`amux config lsp` writes the types of this whole API for lua-language-server, so an editor completes and checks `init.lua` as you type (see [Editor support](../README.md#editor-support)).
 
 | Everywhere             | Does                                                          |
 | ---------------------- | ------------------------------------------------------------- |

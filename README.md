@@ -41,6 +41,7 @@ cargo run -- pair k7-4821-9930 --verbose # print each step of the pairing, to se
 cargo run -- config check                # load init.lua and servers.lua and say which files were read
 cargo run -- config defaults             # every default setting, as Lua for a starting init.lua
 cargo run -- config reload               # make the running server load its config again
+cargo run -- config lsp                  # write the Lua types of the amux API for lua-language-server
 cargo run -- kill-server                 # stop the server and all sessions
 cargo run -- update                      # install the latest release in place of this amux
 cargo run -- update --check              # only say whether a newer release is out
@@ -242,6 +243,7 @@ amux.on("session_created", function(event) amux.log("new session " .. event.sess
 | `amux config path`     | Prints where your `init.lua` is or goes: the `--config` file, or the one in the config dir  |
 | `amux config reload`   | Makes the running server load its config again, and prints what happened                    |
 | `amux config keyboard` | Loads the config as the client and prints the Android app's landscape keyboard as JSON      |
+| `amux config lsp`      | Writes the Lua types of the amux API and a `.luarc.json`, see [Editor support](#editor-support) |
 
 `name` defaults to the hostname and `projects_dir` to `~/projects`. A leading `~` in `projects_dir`, `worktrees_dir` and `search.project_dirs` means your home directory. Each entry under `servers` is a peer to link to. Each entry under `projects` is keyed by project name: `default_server` is where `amux new` puts that project's sessions when you don't pass `--on`, and `worktrees_dir` is where its worktrees go instead of the default `<checkout>/../<project>-worktrees`.
 
@@ -263,15 +265,34 @@ A server's `address` is one of:
 - `tcp://host:port`, which links over Noise to that address. The other server's key must already be trusted, or vouched for by the tailnet. Tailscale discovery uses this form.
 - `lan://<server id>`, the form LAN discovery uses. The IP addresses and port come from mDNS each time amux dials.
 
+#### Editor support
+
+`amux config lsp` gives [lua-language-server](https://luals.github.io) the types of everything under `amux`, so an editor completes `amux.opt.status.` and `amux.on("`, shows what each option is, and warns about `amux.opt.prefx = "C-a"` or `amux.opt.status.interval_ms = "fast"` before amux ever loads the file:
+
+```
+$ amux config lsp
+types    /home/you/.local/share/amux/lua/amux.lua
+luarc    /home/you/.config/amux/.luarc.json
+```
+
+- The types go to `$XDG_DATA_HOME/amux/lua/amux.lua`, usually `~/.local/share/amux/lua/amux.lua`. They come from the amux that writes them, so they always match it, and `amux update` writes them again with the new release once they exist.
+- The `.luarc.json` goes next to `init.lua`. It sets Lua 5.4, the version amux runs, adds the types to `workspace.library`, and sets `runtime.path` so `require` finds the modules in `lua/`. A `.luarc.json` you already have is left alone, and amux prints the directory to add to its `workspace.library` instead.
+- Editors that start lua-language-server for the directory with the `.luarc.json`, such as Neovim with `lua_ls` or VS Code with the Lua extension, pick it up on their own. With `lazydev.nvim`, add `~/.local/share/amux/lua` to its `library` instead.
+
+The types know which functions only the client or only the server has, and `amux.on` knows the fields of each event, so `amux.on("pane_exited", function(event) … end)` completes `event.status`. `amux config check` still has the last word, since the language server can't run the config.
+
 #### Reloading
 
 A change to the config takes effect without a restart:
 
+- Saving `init.lua`, `servers.lua` or a module in `lua/` reloads the config by itself. The client and the server each watch the files of their own machine and reload their own part, and the status bar shows `config reloaded` or the error, as after `Ctrl-b r`. A file that is still being written is read once it has stopped changing, and a save that breaks the config changes nothing until the next save fixes it. `amux.opt.reload.watch = false` turns this off, and `amux.opt.reload.interval_ms` (250) is how often the files are checked.
 - `Ctrl-b r` reloads the client you type in, then asks the server on this machine to reload too. It asks over a connection of its own, so the key never reloads the config of another machine, even while you are attached to a session there. The status bar then shows `config reloaded`, or the error.
 - `amux config reload` asks the running server to reload and prints `config reloaded` or the error. Without a running server it says so and exits with success.
 - `SIGHUP` makes the server reload too, and it writes the result to its log (`<socket>.log`).
 
-The server reloads the file it started with. When it started without one, or with `/etc/amux/init.lua`, it looks again, so an `init.lua` you create later is found.
+The server reloads the file it started with. When it started without one, or with `/etc/amux/init.lua`, it looks again, so an `init.lua` you create later is found, and with `reload.watch` on, creating it reloads the config too.
+
+Every reload runs `init.lua` again from the top, so code in it with side effects, such as `os.execute`, runs on every save while `reload.watch` is on. A server-only error, from code that only runs when `amux.process` is `"server"`, goes to the server log on a save, and `Ctrl-b r` shows it on the status bar.
 
 A config that fails to load changes nothing. The running settings, bindings and hooks stay, and the error names the file and line, as at startup, for example `init.lua:12: unexpected symbol near '='`. A config that loads replaces them all at once, including every hook and every function binding.
 
