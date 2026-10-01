@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
@@ -391,12 +392,22 @@ async fn attach(
         server.settings().images.client_memory_bytes(),
     );
     uploader.set_graphics(terminal.is_some_and(|reported| reported.graphics));
+    let mut session_terminal = session.watch_client_terminal();
+    uploader.set_cell_pixels(
+        session
+            .client_terminal()
+            .and_then(|latest| latest.cell_pixels),
+    );
+    let mut derivations = JoinSet::new();
     let mut mouse = MouseDecoder::new();
     let escape = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(escape);
     let mut dirty = true;
 
     loop {
+        if let Some(job) = uploader.take_job() {
+            derivations.spawn_blocking(move || job.run());
+        }
         tokio::select! {
             permit = client.outgoing.reserve(), if dirty || uploader.has_work() => {
                 let Ok(permit) = permit else {
@@ -428,6 +439,20 @@ async fn attach(
                     send(&client.outgoing, ServerMessage::Exited).await?;
                     return Ok(Outcome::Exited);
                 }
+                dirty = true;
+            }
+            Some(finished) = derivations.join_next(), if !derivations.is_empty() => {
+                match finished {
+                    Ok(finished) => uploader.finish(finished),
+                    Err(err) => {
+                        warn!("deriving an image failed: {err}");
+                        uploader.abandon();
+                    }
+                }
+            }
+            Ok(()) = session_terminal.changed() => {
+                let latest = *session_terminal.borrow_and_update();
+                uploader.set_cell_pixels(latest.and_then(|latest| latest.cell_pixels));
                 dirty = true;
             }
             Ok(()) = status.changed() => {

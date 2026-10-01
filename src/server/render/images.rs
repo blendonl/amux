@@ -272,7 +272,9 @@ mod tests {
     use super::super::{compose, Frame, GraphicsParser};
     use super::*;
     use crate::protocol::Size;
+    use crate::server::graphics::derive::{Look, Sizing};
     use crate::server::graphics::place::tests::allocations;
+    use crate::server::graphics::place::{CellOffset, SourceRect, ASSUMED_CELL_PIXELS};
     use crate::server::graphics::store::ImageStore;
     use crate::server::graphics::PaneGraphics;
     use crate::server::layout::{Layout, PaneId, SplitDirection};
@@ -286,6 +288,7 @@ mod tests {
 
     struct Panes {
         layout: Layout,
+        store: Arc<ImageStore>,
         parsers: BTreeMap<PaneId, GraphicsParser>,
         graphics: BTreeMap<PaneId, PaneGraphics>,
     }
@@ -308,6 +311,7 @@ mod tests {
             }
             Self {
                 layout,
+                store,
                 parsers,
                 graphics,
             }
@@ -478,7 +482,7 @@ mod tests {
         let [shown] = frame.images[..] else {
             panic!("expected one image, got {:?}", frame.images);
         };
-        assert_eq!((shown.cols, shown.rows), (3, 2));
+        assert_eq!((shown.cols, shown.rows, shown.look), (3, 2, None));
         assert_eq!(row_text(&frame, 0), "#x#.......│..........");
         assert_eq!(row_text(&frame, 1), "###.......│..........");
         assert_eq!(image_cell(&frame, 0, 2), Some((shown.key, 0, 2)));
@@ -503,6 +507,32 @@ mod tests {
         assert_eq!(image_cell(&frame, 0, 0), Some((older.key, 0, 0)));
         assert_eq!(image_cell(&frame, 0, 1), Some((newer.key, 0, 0)));
         assert_eq!(image_cell(&frame, 0, 3), Some((newer.key, 0, 2)));
+    }
+
+    #[test]
+    fn composing_a_cropped_placement_reports_its_look_without_deriving_it() {
+        let mut panes = Panes::side_by_side();
+        panes.transmit(LEFT, "i=1,C=1,x=10,w=20,h=20,X=3", 40, 20);
+        let frame = panes.shown();
+
+        let [shown] = frame.images[..] else {
+            panic!("expected one image, got {:?}", frame.images);
+        };
+        assert_eq!(
+            shown.look,
+            Some(Look {
+                source: SourceRect {
+                    x: 10,
+                    y: 0,
+                    width: 20,
+                    height: 20
+                },
+                offset: CellOffset { x: 3, y: 0 },
+                sizing: Sizing::Native,
+            })
+        );
+        assert_eq!(panes.store.derived(shown.key, ASSUMED_CELL_PIXELS), None);
+        assert_eq!(image_cell(&frame, 0, 2), Some((shown.key, 0, 2)));
     }
 
     #[test]

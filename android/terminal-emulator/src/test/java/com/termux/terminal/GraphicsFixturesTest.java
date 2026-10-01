@@ -68,6 +68,19 @@ public class GraphicsFixturesTest extends TerminalTestCase {
         return data;
     }
 
+    private static byte[] stretch(byte[] rgb, int width, int height, int toWidth, int toHeight) {
+        byte[] rgba = new byte[toWidth * toHeight * 4];
+        for (int y = 0; y < toHeight; y++) {
+            for (int x = 0; x < toWidth; x++) {
+                int from = ((y * height / toHeight) * width + x * width / toWidth) * 3;
+                int to = (y * toWidth + x) * 4;
+                System.arraycopy(rgb, from, rgba, to, 3);
+                rgba[to + 3] = (byte) 0xff;
+            }
+        }
+        return rgba;
+    }
+
     private static byte[] inflate(byte[] data) throws DataFormatException {
         Inflater inflater = new Inflater();
         try {
@@ -88,16 +101,16 @@ public class GraphicsFixturesTest extends TerminalTestCase {
     public void testPngUploadPlacementAndPlaceholders() throws IOException {
         withTerminalSized(20, 6);
         replay("png-upload.txt");
-        assertPlacement(assertImage(1, 20, 40, ImageStore.FORMAT_PNG, false), 4, 2);
+        assertPlacement(assertImage(1, 20, 40, ImageStore.FORMAT_PNG, false), 4, 4);
         assertEquals(1, mTerminal.getImages().size());
         assertLineStartsWith(0, 't', 'i', 'n', 'y');
         assertRuns(0);
         assertRuns(1, new Run(0, 4, 1, 0, 0));
         assertRuns(2, new Run(0, 4, 1, 1, 0));
-        assertRuns(3);
-        assertRuns(4);
+        assertRuns(3, new Run(0, 4, 1, 2, 0));
+        assertRuns(4, new Run(0, 4, 1, 3, 0));
         assertRuns(5);
-        assertCursorAt(2, 4);
+        assertCursorAt(4, 4);
     }
 
     public void testRawRgbaArrivesCompressedInSeveralChunks() throws IOException, DataFormatException {
@@ -115,11 +128,16 @@ public class GraphicsFixturesTest extends TerminalTestCase {
         assertCursorAt(3, 8);
     }
 
-    public void testPlaceholdersStopAtTheBorderAndTheWindowEdges() throws IOException {
+    public void testPlaceholdersStopAtTheBorderAndTheWindowEdges() throws IOException, DataFormatException {
         withTerminalSized(21, 6);
         replay("clipped.txt");
-        assertPlacement(assertImage(1, 2, 2, ImageStore.FORMAT_RGB, true), 5, 2);
-        assertPlacement(assertImage(2, 2, 2, ImageStore.FORMAT_RGB, true), 5, 2);
+        byte[] stretched = stretch(noise(2 * 2 * 3), 2, 2, 50, 40);
+        ImageStore.Image left = assertImage(1, 50, 40, ImageStore.FORMAT_RGBA, true);
+        ImageStore.Image right = assertImage(2, 50, 40, ImageStore.FORMAT_RGBA, true);
+        assertPlacement(left, 5, 2);
+        assertPlacement(right, 5, 2);
+        assertTrue(Arrays.equals(stretched, inflate(left.mPayload)));
+        assertTrue(Arrays.equals(stretched, inflate(right.mPayload)));
         assertRuns(0);
         assertRuns(1, new Run(7, 3, 1, 0, 0));
         assertRuns(2, new Run(7, 3, 1, 1, 0));
@@ -131,10 +149,12 @@ public class GraphicsFixturesTest extends TerminalTestCase {
         assertCursorAt(1, 7);
     }
 
-    public void testKeyAboveTwoToTheTwentyFourUsesTheThirdDiacritic() throws IOException {
+    public void testKeyAboveTwoToTheTwentyFourUsesTheThirdDiacritic() throws IOException, DataFormatException {
         withTerminalSized(12, 3);
         replay("high-key.txt");
-        assertPlacement(assertImage(HIGH_KEY, 20, 40, ImageStore.FORMAT_PNG, false), 3, 1);
+        ImageStore.Image image = assertImage(HIGH_KEY, 30, 20, ImageStore.FORMAT_RGBA, true);
+        assertPlacement(image, 3, 1);
+        assertEquals(30 * 20 * 4, inflate(image.mPayload).length);
         assertForegroundColorAt(1, 1, 0xff123456);
         assertRuns(0);
         assertRuns(1, new Run(1, 3, HIGH_KEY, 0, 0));

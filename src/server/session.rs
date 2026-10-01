@@ -210,7 +210,6 @@ impl Session {
         *self.terminal.borrow()
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn watch_client_terminal(&self) -> watch::Receiver<Option<ClientTerminal>> {
         self.terminal.subscribe()
     }

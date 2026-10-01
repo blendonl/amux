@@ -96,7 +96,13 @@ impl Terminal {
         let mut written = Vec::new();
         let mut shown = Vec::new();
         let mut dirty = true;
-        while let Some(turn) = self.uploader.choose(dirty) {
+        loop {
+            while let Some(job) = self.uploader.take_job() {
+                self.uploader.finish(job.run());
+            }
+            let Some(turn) = self.uploader.choose(dirty) else {
+                break;
+            };
             match turn {
                 Turn::Frame => {
                     dirty = false;
@@ -191,13 +197,13 @@ fn fixture_is_current(name: &str, contents: &[u8]) {
 fn a_png_is_uploaded_placed_and_painted_below_the_text() {
     let mut session = Session::single(Size { rows: 6, cols: 20 });
     session.run(LEFT, "tiny\r\n");
-    session.run(LEFT, &transmit("a=T,f=100,i=1,c=4,r=2,q=2", TINY_PNG));
+    session.run(LEFT, &transmit("a=T,f=100,i=1,c=4,r=4,q=2", TINY_PNG));
     let (written, shown) = Terminal::new(&session).show(&session);
 
-    assert_eq!(shown, [(1, 4, 2)]);
+    assert_eq!(shown, [(1, 4, 4)]);
     assert_eq!(
         controls(&written),
-        ["a=t,i=1,f=100,s=20,v=40,q=2,m=0", "a=p,U=1,i=1,c=4,r=2,q=2"]
+        ["a=t,i=1,f=100,s=20,v=40,q=2,m=0", "a=p,U=1,i=1,c=4,r=4,q=2"]
     );
     fixture_is_current("png-upload.txt", &written);
 }
@@ -236,6 +242,15 @@ fn placeholders_stop_at_the_border_and_the_window_edges() {
     let (written, shown) = Terminal::new(&session).show(&session);
 
     assert_eq!(shown, [(1, 5, 2), (2, 5, 2)]);
+    assert_eq!(
+        controls(&written),
+        [
+            "a=t,i=1,f=32,s=50,v=40,o=z,q=2,m=0",
+            "a=p,U=1,i=1,c=5,r=2,q=2",
+            "a=t,i=2,f=32,s=50,v=40,o=z,q=2,m=0",
+            "a=p,U=1,i=2,c=5,r=2,q=2"
+        ]
+    );
     fixture_is_current("clipped.txt", &written);
 }
 
@@ -251,7 +266,7 @@ fn a_key_above_2_24_spells_its_high_byte_in_the_third_diacritic() {
     assert_eq!(
         controls(&written),
         [
-            "a=t,i=705836118,f=100,s=20,v=40,q=2,m=0",
+            "a=t,i=705836118,f=32,s=30,v=20,o=z,q=2,m=0",
             "a=p,U=1,i=705836118,c=3,r=1,q=2"
         ]
     );
