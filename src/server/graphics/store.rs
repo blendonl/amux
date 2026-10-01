@@ -109,6 +109,11 @@ impl ImageStore {
         self.lock().displays.contains_key(&display)
     }
 
+    #[cfg(test)]
+    pub fn skip_display_keys(&self, last: u32) {
+        self.lock().last_display = last;
+    }
+
     pub fn add_placement(&self, key: ImageKey) -> bool {
         let mut state = self.lock();
         let clock = state.tick();

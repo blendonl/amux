@@ -86,7 +86,7 @@ A session holds numbered windows, and each window splits into panes, each runnin
 
 Programs in a pane can show images with the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/): `kitten icat`, yazi, chafa, timg, image.nvim, ratatui-image and the other programs that speak it, including the ones that think they run inside tmux and wrap their commands in tmux passthrough. amux keeps each image on the server and draws it into the frame as kitty's Unicode placeholder cells, so an image scrolls with its text, stays inside its pane and under the status bar and the popups, and comes back when you detach and attach again, on a remote session too.
 
-Images show in terminals that draw those placeholders: kitty 0.28 or later, ghostty, and the amux Android app. In any other terminal you see the text under the image, and blank cells where a program printed placeholders itself.
+Images show in terminals that draw those placeholders: kitty 0.28 or later, ghostty, and the amux Android app (see [Images on the phone](#images-on-the-phone)). In any other terminal you see the text under the image, and blank cells where a program printed placeholders itself.
 
 When it attaches, the client asks the terminal whether it shows images: a kitty graphics query, `XTVERSION`, the cell size in pixels and a device attributes query, answered within 500 ms or not at all. `amux.opt.images.client` decides what to do with the answers. `"auto"`, the default, shows images when the terminal answers the kitty query and names itself kitty 0.28 or later, ghostty or the amux app. `"on"` shows them without asking, and `"off"` never asks and never shows them. A program that asks a pane whether images work is told yes only while the client that typed last shows them, and `amux.opt.pane.images = false` turns images off in new panes.
 
@@ -698,6 +698,25 @@ layers.base.left[5] = {
 layers.base.right[5] = { "Backspace", "layer:sym", "layer:num" }
 ```
 
+#### Images on the phone
+
+The app's terminal draws the images amux sends it, so `kitten icat`, yazi, chafa and the other programs in [Images](#images) show pictures on the phone as they do on the desktop. The terminal answers the client's probe with a kitty graphics OK and the name `amux-android(1)`, so the default `amux.opt.images.client = "auto"` turns images on.
+
+- The terminal takes the kitty graphics commands the amux client writes: PNG, RGB and RGBA images sent in the command itself, compressed with `o=z` or not, virtual placements, deletes and queries. It draws an image only through the Unicode placeholder cells amux paints, never at the cursor, and reads no files or shared memory. Programs in panes can still use all of those, because amux turns them into placeholders.
+- The terminal keeps at most 48 MiB of images, as received, and lets go of the least recently used one past that. The view keeps at most 128 MiB of decoded bitmaps, least recently used out first.
+- The view decodes an image on the UI thread the first time it draws it, scaled down to at most 4096 pixels a side, so a large image can hold up that one frame.
+- Each image is fitted whole into the cells of its placement, keeping its shape and centred, as kitty does.
+
+To try it, run this in a pane. It shows a 2×2 picture of red, green, blue and white pixels across 8 columns and 4 rows:
+
+```sh
+printf '\e_Ga=T,f=24,s=2,v=2,c=8,r=4;%s\e\\' "$(printf '\377\0\0\0\377\0\0\0\377\377\377\377' | base64)"
+```
+
+A small PNG on the phone works the same way with `f=100`: `printf '\e_Ga=T,f=100;%s\e\\' "$(base64 -w0 picture.png)"`.
+
+The emulator's and the view's unit tests cover this, and `GraphicsFixturesTest` replays the exact bytes the amux client writes for an upload, its placement and its placeholder cells, which `cargo test` keeps in `android/terminal-emulator/src/test/resources/graphics/`. Images haven't been tried on a phone or an Android emulator yet.
+
 #### zsh, git and ssh
 
 The APK carries its own userland, built from Termux's package recipes. Panes run zsh, and these are on their `PATH`:
@@ -925,6 +944,8 @@ Set `AMUX_LOG=debug` before the server starts to get more verbose logs.
 Discovery is off in every test server unless the test turns it on, so no test touches the real tailnet or LAN. A fake `tailscale` (`AMUX_TAILSCALE`) serves `status` and `whois` from JSON files the test rewrites, a directory stands in for mDNS (`AMUX_LAN_DIR`), and a fake `ssh` (`AMUX_SSH`) maps host names to test servers. The one test that pairs over real mDNS, on a random service type set with `AMUX_MDNS_SERVICE`, is ignored by default because loopback has no multicast. `cargo test -- --ignored` runs it on a machine with a real network.
 
 The `amux update` and `install.sh` tests serve fake releases from a `file://` directory through `AMUX_RELEASES_URL`, and update a copy of the binary in a temporary directory.
+
+Some unit tests write the fixtures the Android tests read: the keyboard defaults in `android/app/src/test/resources/keyboard/`, and the bytes the client writes for images in `android/terminal-emulator/src/test/resources/graphics/`. They fail when a fixture is out of date, and `AMUX_UPDATE_FIXTURES=1 cargo test` writes them again.
 
 ## Releasing
 
