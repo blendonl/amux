@@ -1,24 +1,36 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
 
+use super::graphics::place::Placements;
+use super::graphics::store::{Buffer, PaneImages};
 use crate::protocol::{CellPixels, RELEASE};
 
 const DEVICE_ATTRIBUTES: &[u16] = &[62, 22];
 
-#[derive(Clone)]
 pub struct PaneCallbacks {
     input: mpsc::Sender<Vec<u8>>,
-    cell_pixels: Arc<AtomicU32>,
-    graphics: Arc<AtomicBool>,
+    cell_pixels: AtomicU32,
+    graphics: AtomicBool,
+    placements: Option<Placements>,
 }
 
 impl PaneCallbacks {
-    pub fn new(input: mpsc::Sender<Vec<u8>>) -> Self {
+    pub fn new(input: mpsc::Sender<Vec<u8>>, images: Option<PaneImages>) -> Self {
         Self {
             input,
-            cell_pixels: Arc::new(AtomicU32::new(0)),
-            graphics: Arc::new(AtomicBool::new(false)),
+            cell_pixels: AtomicU32::new(0),
+            graphics: AtomicBool::new(false),
+            placements: images.map(Placements::new),
         }
+    }
+
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub fn placements(&self) -> Option<&Placements> {
+        self.placements.as_ref()
+    }
+
+    pub fn placements_mut(&mut self) -> Option<&mut Placements> {
+        self.placements.as_mut()
     }
 
     pub fn cell_pixels(&self) -> Option<CellPixels> {
@@ -100,6 +112,27 @@ impl vt100::Callbacks for PaneCallbacks {
             self.reply(reply.into_bytes());
         }
     }
+
+    fn erase_in_display(&mut self, screen: &mut vt100::Screen, mode: u16) {
+        if let Some(placements) = &mut self.placements {
+            placements.erase(screen, mode);
+        }
+    }
+
+    fn reset(&mut self, _: &mut vt100::Screen) {
+        if let Some(placements) = &mut self.placements {
+            placements.reset();
+        }
+    }
+
+    fn alternate_screen(&mut self, _: &mut vt100::Screen, _entered: bool, cleared: bool) {
+        if !cleared {
+            return;
+        }
+        if let Some(placements) = &mut self.placements {
+            placements.clear(Buffer::Alt);
+        }
+    }
 }
 
 fn pack_cell_pixels(pixels: Option<CellPixels>) -> u32 {
@@ -149,7 +182,12 @@ mod tests {
         fn sized(rows: u16, cols: u16) -> Self {
             let (input, replies) = mpsc::channel();
             Self {
-                parser: vt100::Parser::new_with_callbacks(rows, cols, 0, PaneCallbacks::new(input)),
+                parser: vt100::Parser::new_with_callbacks(
+                    rows,
+                    cols,
+                    0,
+                    PaneCallbacks::new(input, None),
+                ),
                 replies,
             }
         }
@@ -246,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn cell_pixels_round_trip_through_the_shared_cell() {
+    fn cell_pixels_round_trip_through_the_packed_cell() {
         let terminal = Terminal::new();
         let callbacks = terminal.parser.callbacks();
         let wide = CellPixels {
@@ -258,7 +296,7 @@ mod tests {
             height: u16::MAX,
         };
         assert!(callbacks.set_cell_pixels(Some(wide)));
-        assert_eq!(callbacks.clone().cell_pixels(), Some(wide));
+        assert_eq!(callbacks.cell_pixels(), Some(wide));
         assert!(!callbacks.set_cell_pixels(Some(wide)));
         assert!(callbacks.set_cell_pixels(Some(tall)));
         assert_eq!(callbacks.cell_pixels(), Some(tall));
@@ -312,17 +350,9 @@ mod tests {
     fn replies_after_the_pane_has_gone_are_dropped() {
         let (input, replies) = mpsc::channel();
         drop(replies);
-        let mut parser = vt100::Parser::new_with_callbacks(2, 4, 0, PaneCallbacks::new(input));
+        let mut parser =
+            vt100::Parser::new_with_callbacks(2, 4, 0, PaneCallbacks::new(input, None));
         parser.process(b"\x1b[6n\x1b[cok");
         assert_eq!(parser.screen().contents(), "ok");
-    }
-
-    #[test]
-    fn the_graphics_flag_is_shared_with_clones() {
-        let terminal = Terminal::new();
-        let callbacks = terminal.parser.callbacks();
-        assert!(!callbacks.graphics());
-        callbacks.clone().set_graphics(true);
-        assert!(callbacks.graphics());
     }
 }

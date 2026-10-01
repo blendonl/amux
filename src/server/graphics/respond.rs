@@ -8,6 +8,9 @@ pub enum Code {
     Enodata,
     Efbig,
     Ebadpng,
+    Enoparent,
+    Ecycle,
+    Etoodeep,
 }
 
 impl Code {
@@ -19,6 +22,9 @@ impl Code {
             Self::Enodata => "ENODATA",
             Self::Efbig => "EFBIG",
             Self::Ebadpng => "EBADPNG",
+            Self::Enoparent => "ENOPARENT",
+            Self::Ecycle => "ECYCLE",
+            Self::Etoodeep => "ETOODEEP",
         }
     }
 }
@@ -128,6 +134,9 @@ mod tests {
             (Code::Enodata, "ENODATA"),
             (Code::Efbig, "EFBIG"),
             (Code::Ebadpng, "EBADPNG"),
+            (Code::Enoparent, "ENOPARENT"),
+            (Code::Ecycle, "ECYCLE"),
+            (Code::Etoodeep, "ETOODEEP"),
         ] {
             let failed = Err(Failure::new(code, "why"));
             assert_eq!(

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::respond::{Code, Failure};
@@ -38,6 +39,8 @@ pub struct ImageData {
 pub struct Stored {
     pub key: ImageKey,
     pub id: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 pub struct ImageStore {
@@ -59,6 +62,8 @@ struct State {
 struct Entry {
     data: ImageData,
     owner: Owner,
+    buffer: Buffer,
+    id: u32,
     used: u64,
     placements: u32,
 }
@@ -99,7 +104,6 @@ impl ImageStore {
         Some(entry.data.clone())
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn add_placement(&self, key: ImageKey) -> bool {
         let mut state = self.lock();
         let clock = state.tick();
@@ -111,10 +115,14 @@ impl ImageStore {
         true
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
-    pub fn remove_placement(&self, key: ImageKey) {
-        if let Some(entry) = self.lock().images.get_mut(&key) {
-            entry.placements = entry.placements.saturating_sub(1);
+    pub fn remove_placement(&self, key: ImageKey, free: bool) {
+        let mut state = self.lock();
+        let Some(entry) = state.images.get_mut(&key) else {
+            return;
+        };
+        entry.placements = entry.placements.saturating_sub(1);
+        if entry.placements == 0 && (free || entry.id == 0) {
+            state.remove(key);
         }
     }
 
@@ -168,10 +176,11 @@ impl State {
                 .insert((owner, buffer, Name::Number(number)), key);
         }
         let used = self.tick();
+        let (width, height) = (image.width, image.height);
         let data = ImageData {
             key,
-            width: image.width,
-            height: image.height,
+            width,
+            height,
             format: image.format,
             compressed: image.compressed,
             bytes: image.bytes.into(),
@@ -182,13 +191,20 @@ impl State {
             Entry {
                 data,
                 owner,
+                buffer,
+                id,
                 used,
                 placements: 0,
             },
         );
         self.used += len;
         self.evict(Some(key));
-        Ok(Stored { key, id })
+        Ok(Stored {
+            key,
+            id,
+            width,
+            height,
+        })
     }
 
     fn free_id(&self, owner: Owner, buffer: Buffer) -> u32 {
@@ -204,6 +220,17 @@ impl State {
             entry.used = clock;
         }
         Some(key)
+    }
+
+    fn find(&mut self, owner: Owner, buffer: Buffer, name: Name) -> Option<Stored> {
+        let key = self.lookup(owner, buffer, name)?;
+        let entry = self.images.get(&key)?;
+        Some(Stored {
+            key,
+            id: entry.id,
+            width: entry.data.width,
+            height: entry.data.height,
+        })
     }
 
     fn remove(&mut self, key: ImageKey) -> bool {
@@ -264,9 +291,20 @@ impl PaneImages {
             .insert(self.owner, buffer, (id, number), image)
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn lookup(&self, buffer: Buffer, name: Name) -> Option<ImageKey> {
         self.store.lock().lookup(self.owner, buffer, name)
+    }
+
+    pub fn find(&self, buffer: Buffer, name: Name) -> Option<Stored> {
+        self.store.lock().find(self.owner, buffer, name)
+    }
+
+    pub fn add_placement(&self, key: ImageKey) -> bool {
+        self.store.add_placement(key)
+    }
+
+    pub fn remove_placement(&self, key: ImageKey, free: bool) {
+        self.store.remove_placement(key, free);
     }
 
     pub fn free(&self, buffer: Buffer, name: Name) -> bool {
@@ -277,8 +315,30 @@ impl PaneImages {
         }
     }
 
+    pub fn free_ids(&self, buffer: Buffer, ids: RangeInclusive<u32>) {
+        self.free_where(buffer, |entry| entry.id != 0 && ids.contains(&entry.id));
+    }
+
+    pub fn free_unplaced(&self, buffer: Buffer) {
+        self.free_where(buffer, |entry| entry.placements == 0);
+    }
+
     pub fn close(&self) {
         self.store.lock().close(self.owner);
+    }
+
+    fn free_where(&self, buffer: Buffer, doomed: impl Fn(&Entry) -> bool) {
+        let mut state = self.store.lock();
+        let keys: Vec<ImageKey> = state
+            .images
+            .iter()
+            .filter(|(_, entry)| entry.owner == self.owner && entry.buffer == buffer)
+            .filter(|(_, entry)| doomed(entry))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in keys {
+            state.remove(key);
+        }
     }
 }
 
@@ -444,7 +504,7 @@ mod tests {
         assert_eq!(keys(&store), [second.0, fifth.0, sixth.0]);
         assert_eq!(pane.lookup(Buffer::Main, Name::Id(4)), None);
 
-        store.remove_placement(second);
+        store.remove_placement(second, false);
         assert!(store.get(fifth).is_some());
         insert(7);
         assert_eq!(keys(&store), [fifth.0, sixth.0, 7]);
@@ -460,6 +520,70 @@ mod tests {
         pane.insert(Buffer::Main, 2, 0, image(100)).unwrap();
         let big = pane.insert(Buffer::Main, 3, 0, image(200)).unwrap().key;
         assert_eq!(keys(&store), [big.0]);
+    }
+
+    #[test]
+    fn find_reports_the_id_and_size_of_a_named_image() {
+        let store = store(1 << 20);
+        let pane = store.open_pane();
+        let numbered = pane.insert(Buffer::Main, 0, 7, image(1)).unwrap();
+        assert_eq!(
+            numbered,
+            Stored {
+                key: numbered.key,
+                id: 1,
+                width: 1,
+                height: 1
+            }
+        );
+        assert_eq!(pane.find(Buffer::Main, Name::Number(7)), Some(numbered));
+        assert_eq!(pane.find(Buffer::Main, Name::Id(1)), Some(numbered));
+        assert_eq!(pane.find(Buffer::Alt, Name::Id(1)), None);
+    }
+
+    #[test]
+    fn the_last_placement_frees_an_anonymous_image_or_one_asked_to_be_freed() {
+        let store = store(1 << 20);
+        let pane = store.open_pane();
+        let named = pane.insert(Buffer::Main, 1, 0, image(1)).unwrap().key;
+        let anonymous = pane.insert(Buffer::Main, 0, 0, image(1)).unwrap().key;
+        for key in [named, anonymous] {
+            assert!(pane.add_placement(key));
+            assert!(pane.add_placement(key));
+            pane.remove_placement(key, false);
+        }
+        assert!(store.get(anonymous).is_some());
+        pane.remove_placement(named, false);
+        pane.remove_placement(anonymous, false);
+        assert!(store.get(named).is_some());
+        assert!(store.get(anonymous).is_none());
+
+        assert!(pane.add_placement(named));
+        pane.remove_placement(named, true);
+        assert!(store.get(named).is_none());
+        assert!(!pane.add_placement(named));
+    }
+
+    #[test]
+    fn freeing_unplaced_images_or_an_id_range_stays_in_its_pane_and_screen() {
+        let store = store(1 << 20);
+        let pane = store.open_pane();
+        let other = store.open_pane();
+        let placed = pane.insert(Buffer::Main, 1, 0, image(1)).unwrap().key;
+        let loose = pane.insert(Buffer::Main, 2, 0, image(1)).unwrap().key;
+        let alt = pane.insert(Buffer::Alt, 3, 0, image(1)).unwrap().key;
+        let elsewhere = other.insert(Buffer::Main, 4, 0, image(1)).unwrap().key;
+        assert!(pane.add_placement(placed));
+
+        pane.free_unplaced(Buffer::Main);
+        assert_eq!(store.get(loose), None);
+        assert_eq!(keys(&store), [placed.0, alt.0, elsewhere.0]);
+        pane.free_ids(Buffer::Main, 2..=4);
+        assert_eq!(keys(&store), [placed.0, alt.0, elsewhere.0]);
+        pane.free_ids(Buffer::Main, 1..=1);
+        assert_eq!(keys(&store), [alt.0, elsewhere.0]);
+        pane.free_ids(Buffer::Alt, 0..=u32::MAX);
+        assert_eq!(keys(&store), [elsewhere.0]);
     }
 
     #[test]
