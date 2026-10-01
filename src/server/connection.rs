@@ -11,6 +11,7 @@ use super::mouse::MouseDecoder;
 use super::render::GridDiffer;
 use super::session::Session;
 use super::status::StatusFeed;
+use super::upload::{Turn, Uploader};
 use super::{target_index, Resolved, Server};
 use crate::pairing;
 use crate::protocol::{
@@ -384,6 +385,12 @@ async fn attach(
     .await?;
     let mut cluster = StatusFeed::new(server, origin);
     let mut differ = GridDiffer::new(*size);
+    let mut uploader = Uploader::new(
+        Arc::clone(server.images()),
+        origin,
+        server.settings().images.client_memory_bytes(),
+    );
+    uploader.set_graphics(terminal.is_some_and(|reported| reported.graphics));
     let mut mouse = MouseDecoder::new();
     let escape = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(escape);
@@ -391,17 +398,29 @@ async fn attach(
 
     loop {
         tokio::select! {
-            permit = client.outgoing.reserve(), if dirty => {
+            permit = client.outgoing.reserve(), if dirty || uploader.has_work() => {
                 let Ok(permit) = permit else {
                     return Ok(Outcome::Detached);
                 };
-                dirty = false;
-                let Some(frame) = session.frame() else {
-                    continue;
-                };
-                let output = differ.diff(&frame);
-                if !output.is_empty() {
-                    permit.send(ServerMessage::Output(output));
+                match uploader.choose(dirty) {
+                    Some(Turn::Frame) => {
+                        dirty = false;
+                        uploader.set_budget(server.settings().images.client_memory_bytes());
+                        let Some(frame) = session.frame(uploader.viewer()) else {
+                            continue;
+                        };
+                        uploader.frame(&frame.images);
+                        let output = differ.diff(&frame);
+                        if !output.is_empty() {
+                            permit.send(ServerMessage::Output(output));
+                        }
+                    }
+                    Some(Turn::Upload) => {
+                        if let Some(op) = uploader.next() {
+                            permit.send(ServerMessage::Image(op));
+                        }
+                    }
+                    None => {}
                 }
             }
             changed = updates.changed() => {
@@ -447,6 +466,8 @@ async fn attach(
                 Some(ClientMessage::Terminal(reported)) => {
                     *terminal = Some(reported);
                     tracked.report(reported);
+                    uploader.set_graphics(reported.graphics);
+                    dirty = true;
                 }
                 Some(ClientMessage::Command(command)) => {
                     resize_to_latest(session, *size);
@@ -464,6 +485,7 @@ async fn attach(
                 }
                 Some(ClientMessage::Redraw) => {
                     differ.reset();
+                    uploader.restart();
                     dirty = true;
                 }
                 Some(ClientMessage::ListCluster) => {

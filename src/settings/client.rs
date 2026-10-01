@@ -127,11 +127,16 @@ pub enum ClientImages {
 pub struct ImagesSettings {
     pub client: ClientImages,
     pub memory_mb: u32,
+    pub client_memory_mb: u32,
 }
 
 impl ImagesSettings {
     pub fn memory_bytes(&self) -> u64 {
         u64::from(self.memory_mb) * 1024 * 1024
+    }
+
+    pub fn client_memory_bytes(&self) -> u64 {
+        u64::from(self.client_memory_mb) * 1024 * 1024
     }
 }
 
@@ -140,6 +145,7 @@ impl Default for ImagesSettings {
         Self {
             client: ClientImages::Auto,
             memory_mb: 320,
+            client_memory_mb: 256,
         }
     }
 }

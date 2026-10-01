@@ -8,6 +8,7 @@ use super::respond::{Code, Failure};
 use super::store::{Buffer, ImageKey, Name, PaneImages, Stored};
 use crate::protocol::CellPixels;
 use crate::server::render::placeholder::MAX_IMAGE_CELLS;
+use crate::server::render::ImageUse;
 
 const ASSUMED_CELL_PIXELS: CellPixels = CellPixels {
     width: 10,
@@ -30,6 +31,7 @@ impl PlacementId {
 pub struct PaneSpan {
     pub key: ImageKey,
     pub placement: PlacementId,
+    pub display: ImageUse,
     pub row: u16,
     pub col: u16,
     pub image_row: u16,
@@ -70,6 +72,7 @@ enum Position {
 #[derive(Debug)]
 struct Placement {
     serial: PlacementId,
+    display: u32,
     key: ImageKey,
     image: u32,
     id: u32,
@@ -102,6 +105,15 @@ impl Placement {
 
     fn paints_before(&self, other: &Self) -> bool {
         (self.z, self.image, self.serial) <= (other.z, other.image, other.serial)
+    }
+
+    fn shown(&self) -> ImageUse {
+        ImageUse {
+            key: self.display,
+            image: self.key,
+            cols: self.cols,
+            rows: self.rows,
+        }
     }
 }
 
@@ -155,7 +167,16 @@ impl Placements {
                 .min(u32::from(cell.height).saturating_sub(1)),
         };
         let (cols, rows) = extent(command, source, offset, cell);
+        let kept = replaced
+            .map(|at| &list[at])
+            .filter(|old| (old.cols, old.rows) == (cols, rows))
+            .map(|old| old.display);
+        let display = match kept {
+            Some(display) => display,
+            None => self.images.mint_display()?,
+        };
         if replaced.is_none() && !self.images.add_placement(image.key) {
+            self.images.release_display(display);
             return Err(Failure::new(Code::Enoent, "the image is no longer stored"));
         }
         let (col, position) = match parent {
@@ -172,6 +193,7 @@ impl Placements {
         };
         let placement = Placement {
             serial,
+            display,
             key: image.key,
             image: image.id,
             id,
@@ -184,11 +206,12 @@ impl Placements {
             position,
         };
         let list = self.list_mut(buffer);
-        if let Some(at) = replaced {
-            list.remove(at);
-        }
+        let old = replaced.map(|at| list.remove(at));
         let at = list.partition_point(|other| other.paints_before(&placement));
         list.insert(at, placement);
+        if let Some(old) = old.filter(|old| old.display != display) {
+            self.images.release_display(old.display);
+        }
         Ok(())
     }
 
@@ -281,12 +304,31 @@ impl Placements {
         }
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn is_empty(&self) -> bool {
         self.main.is_empty() && self.alt.is_empty()
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
+    pub fn virtual_placement(
+        &self,
+        screen: &vt100::Screen,
+        image: u32,
+        placement: u32,
+    ) -> Option<ImageUse> {
+        if image == 0 {
+            return None;
+        }
+        self.list(active_buffer(screen))
+            .iter()
+            .filter(|candidate| candidate.is_virtual() && candidate.image == image)
+            .filter(|candidate| placement == 0 || candidate.id == placement)
+            .min_by_key(|candidate| candidate.serial)
+            .map(Placement::shown)
+    }
+
+    pub fn is_stored(&self, key: ImageKey) -> bool {
+        self.images.is_stored(key)
+    }
+
     pub fn spans(&self, screen: &vt100::Screen) -> impl Iterator<Item = PaneSpan> {
         let list = self.list(active_buffer(screen));
         let mut spans = Vec::new();
@@ -327,6 +369,7 @@ impl Placements {
             list.retain(|placement| {
                 if doomed.contains(&placement.serial) {
                     images.remove_placement(placement.key, free);
+                    images.release_display(placement.display);
                     return false;
                 }
                 if placement
@@ -567,6 +610,7 @@ fn span(
     (cols > 0).then_some(PaneSpan {
         key: placement.key,
         placement: placement.serial,
+        display: placement.shown(),
         row,
         col: start,
         image_row,
@@ -726,7 +770,7 @@ impl Target {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use std::alloc::{GlobalAlloc, Layout as Allocation, System};
     use std::cell::Cell;
     use std::sync::{mpsc, Arc, Mutex};
@@ -758,7 +802,7 @@ mod tests {
     #[global_allocator]
     static ALLOCATOR: Counting = Counting;
 
-    fn allocations() -> usize {
+    pub fn allocations() -> usize {
         ALLOCATIONS.with(Cell::get)
     }
 
@@ -1449,6 +1493,67 @@ mod tests {
                 (high.key, 0, 8, 0, 2, 3, false),
             ]
         );
+    }
+
+    #[test]
+    fn every_placement_shows_under_a_display_key_of_its_own() {
+        let mut terminal = Terminal::new(6, 20);
+        let image = terminal.image(1, 10, 20);
+        terminal.place(image, "a=p,i=1,p=1,C=1").unwrap();
+        terminal.place(image, "a=p,i=1,p=2,C=1").unwrap();
+        let displays = |terminal: &Terminal| -> Vec<ImageUse> {
+            terminal.spans().iter().map(|span| span.display).collect()
+        };
+        let [first, second] = displays(&terminal)[..] else {
+            panic!("expected two spans");
+        };
+        assert_ne!(first.key, second.key);
+        assert_eq!((first.image, first.cols, first.rows), (image.key, 1, 1));
+        assert!(terminal.store.is_displayed(first.key));
+
+        terminal.output("\x1b[3;5H");
+        terminal.place(image, "a=p,i=1,p=1,C=1").unwrap();
+        assert_eq!(displays(&terminal), [first, second]);
+        terminal.place(image, "a=p,i=1,p=1,C=1,c=2").unwrap();
+        let resized = displays(&terminal)[0];
+        assert!(resized.key > second.key);
+        assert_eq!((resized.cols, resized.rows), (2, 2));
+        assert!(!terminal.store.is_displayed(first.key));
+
+        terminal.send("a=d,d=i,i=1,p=2");
+        assert!(!terminal.store.is_displayed(second.key));
+        assert!(terminal.store.is_displayed(resized.key));
+    }
+
+    #[test]
+    fn virtual_placements_are_found_by_image_and_placement_id() {
+        let mut terminal = Terminal::new(5, 20);
+        let image = terminal.image(7, 30, 40);
+        let other = terminal.image(8, 10, 20);
+        terminal.place(image, "a=p,i=7,p=3,U=1").unwrap();
+        terminal.place(image, "a=p,i=7,p=4,U=1,c=5,r=1").unwrap();
+        terminal.place(image, "a=p,i=7,p=5").unwrap();
+        terminal.place(other, "a=p,i=8").unwrap();
+        let found = |terminal: &Terminal, image, placement| {
+            let parser = lock(&terminal.parser);
+            let placements = parser.callbacks().placements().unwrap();
+            placements.virtual_placement(parser.screen(), image, placement)
+        };
+
+        let third = found(&terminal, 7, 3).unwrap();
+        assert_eq!((third.image, third.cols, third.rows), (image.key, 3, 2));
+        assert_eq!(found(&terminal, 7, 0), Some(third));
+        let fourth = found(&terminal, 7, 4).unwrap();
+        assert_eq!((fourth.cols, fourth.rows), (5, 1));
+        assert_ne!(fourth.key, third.key);
+        assert_eq!(found(&terminal, 7, 5), None);
+        assert_eq!(found(&terminal, 8, 0), None);
+        assert_eq!(found(&terminal, 0, 0), None);
+
+        terminal.output("\x1b[?47h");
+        assert_eq!(found(&terminal, 7, 3), None);
+        terminal.output("\x1b[?47l");
+        assert_eq!(found(&terminal, 7, 3), Some(third));
     }
 
     #[test]

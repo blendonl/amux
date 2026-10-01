@@ -4,10 +4,11 @@ use anyhow::{anyhow, Result};
 use tracing::{debug, warn};
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
+use super::graphics::place::Placements;
 use super::layout::{Layout, PaneId, Rect, Side, SplitDirection};
 use super::mouse::MouseEvent;
 use super::pane::Pane;
-use super::render::{self, Frame, InputModes, Screens};
+use super::render::{self, Frame, InputModes, Screens, Viewer};
 use crate::protocol::{ClientTerminal, Direction, Size, Split, WindowSummary};
 use crate::settings::Settings;
 
@@ -110,8 +111,8 @@ impl Window {
         }
     }
 
-    pub fn compose(&self, size: Size, settings: &Settings) -> Frame {
-        let mut frame = render::compose(&self.layout, size, self.active, self, settings);
+    pub fn compose(&self, size: Size, settings: &Settings, viewer: Viewer<'_>) -> Frame {
+        let mut frame = render::compose(&self.layout, size, self.active, self, settings, viewer);
         report_clicks(&mut frame.modes, self.panes.len() > 1);
         frame
     }
@@ -206,8 +207,12 @@ impl Window {
 }
 
 impl Screens for Window {
-    fn with_screen<R>(&self, pane: PaneId, read: impl FnOnce(&vt100::Screen) -> R) -> Option<R> {
-        self.panes.get(&pane).map(|pane| pane.with_screen(read))
+    fn with_pane<R>(
+        &self,
+        pane: PaneId,
+        read: impl FnOnce(&vt100::Screen, Option<&Placements>) -> R,
+    ) -> Option<R> {
+        self.panes.get(&pane).map(|pane| pane.with_pane(read))
     }
 }
 

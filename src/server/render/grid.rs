@@ -184,7 +184,6 @@ impl Grid {
         }
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn paint_image(&mut self, span: &ImageSpan, clip: Rect) {
         let area = self.clip(clip);
         let encodable = MAX_IMAGE_CELLS.saturating_sub(span.image_col);
@@ -297,7 +296,7 @@ impl Grid {
             .then(|| usize::from(row) * usize::from(self.size.cols) + usize::from(col))
     }
 
-    fn set(&mut self, row: u16, col: u16, cell: Cell) {
+    pub fn set(&mut self, row: u16, col: u16, cell: Cell) {
         if let Some(index) = self.index(row, col) {
             self.cells[index] = cell;
         }

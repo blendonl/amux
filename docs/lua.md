@@ -192,6 +192,24 @@ amux.opt.search.project_dirs = { "~/projects", "~/work", "/srv/git" }
 amux.opt.search.project_depth = 2
 ```
 
+## Images
+
+Programs in a pane show images with the kitty graphics protocol, and a client sees them when its terminal can show kitty's Unicode placeholders. The [README](../README.md#images) describes which programs and terminals work.
+
+| Option                    | Default  | Is                                                                                       |
+| ------------------------- | -------- | ---------------------------------------------------------------------------------------- |
+| `images.client`           | `"auto"` | Whether this client shows images: `"auto"` asks the terminal, `"on"` always, `"off"` never and doesn't ask |
+| `images.memory_mb`        | `320`    | How many MiB of images the server keeps, counted as stored. When it's full, the least recently used image without a placement goes first |
+| `images.client_memory_mb` | `256`    | How many MiB of images the server sends to each client's terminal, counted decoded. When it's full, images the client isn't showing are deleted, least recently used first |
+| `pane.images`             | `true`   | Whether new panes accept images. With `false`, a pane ignores kitty graphics commands and never says images work |
+
+They live under `amux.opt`. The client reads `images.client`, and the server the other three.
+
+```lua
+amux.opt.images.client = "off"
+amux.opt.images.client_memory_mb = 64
+```
+
 ## The status bar
 
 | Option                | Default                  | Is                                                                 |

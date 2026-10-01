@@ -1,9 +1,12 @@
 mod differ;
 mod escape;
 mod grid;
+mod images;
 pub mod placeholder;
 #[cfg(test)]
 mod round_trip;
+
+use std::collections::BTreeSet;
 
 pub use differ::GridDiffer;
 use grid::{BorderLook, Grid};
@@ -11,6 +14,8 @@ use grid::{BorderLook, Grid};
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 use crate::protocol::Size;
+use crate::server::graphics::place::Placements;
+use crate::server::graphics::store::ImageKey;
 use crate::server::layout::{Layout, PaneId, Rect};
 use crate::settings::Settings;
 
@@ -37,15 +42,49 @@ impl InputModes {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ImageUse {
+    pub key: u32,
+    pub image: ImageKey,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Viewer<'a> {
+    pub graphics: bool,
+    pub hidden: &'a BTreeSet<u32>,
+}
+
+impl Viewer<'_> {
+    #[cfg(test)]
+    pub fn text() -> Viewer<'static> {
+        static NOTHING_HIDDEN: BTreeSet<u32> = BTreeSet::new();
+        Viewer {
+            graphics: false,
+            hidden: &NOTHING_HIDDEN,
+        }
+    }
+
+    fn shows(&self, display: u32) -> bool {
+        self.graphics && !self.hidden.contains(&display)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub grid: Grid,
     pub cursor: Option<(u16, u16)>,
     pub modes: InputModes,
+    pub images: Vec<ImageUse>,
 }
 
 pub trait Screens {
-    fn with_screen<R>(&self, pane: PaneId, read: impl FnOnce(&vt100::Screen) -> R) -> Option<R>;
+    fn with_pane<R>(
+        &self,
+        pane: PaneId,
+        read: impl FnOnce(&vt100::Screen, Option<&Placements>) -> R,
+    ) -> Option<R>;
 }
 
 pub fn compose(
@@ -54,16 +93,19 @@ pub fn compose(
     active: PaneId,
     screens: &impl Screens,
     settings: &Settings,
+    viewer: Viewer<'_>,
 ) -> Frame {
     let size = layout.fit(size);
     let mut grid = Grid::new(size);
     let mut cursor = None;
     let mut modes = InputModes::default();
     let mut active_rect = None;
+    let mut images = Vec::new();
 
     for (pane, rect) in layout.rects(size) {
-        let focus = screens.with_screen(pane, |screen| {
+        let focus = screens.with_pane(pane, |screen, placements| {
             grid.paint(screen, rect);
+            images::paint(&mut grid, screen, placements, rect, viewer, &mut images);
             (pane == active).then(|| (pane_cursor(screen, rect), InputModes::from_screen(screen)))
         });
         if pane == active {
@@ -79,11 +121,14 @@ pub fn compose(
         active_rect,
         &BorderLook::new(settings),
     );
+    images.sort_unstable();
+    images.dedup();
 
     Frame {
         grid,
         cursor,
         modes,
+        images,
     }
 }
 
@@ -97,8 +142,29 @@ fn pane_cursor(screen: &vt100::Screen, rect: Rect) -> (u16, u16) {
 
 #[cfg(test)]
 impl Screens for std::collections::BTreeMap<PaneId, vt100::Parser> {
-    fn with_screen<R>(&self, pane: PaneId, read: impl FnOnce(&vt100::Screen) -> R) -> Option<R> {
-        self.get(&pane).map(|parser| read(parser.screen()))
+    fn with_pane<R>(
+        &self,
+        pane: PaneId,
+        read: impl FnOnce(&vt100::Screen, Option<&Placements>) -> R,
+    ) -> Option<R> {
+        self.get(&pane).map(|parser| read(parser.screen(), None))
+    }
+}
+
+#[cfg(test)]
+type GraphicsParser = std::sync::Mutex<vt100::Parser<crate::server::replies::PaneCallbacks>>;
+
+#[cfg(test)]
+impl Screens for std::collections::BTreeMap<PaneId, GraphicsParser> {
+    fn with_pane<R>(
+        &self,
+        pane: PaneId,
+        read: impl FnOnce(&vt100::Screen, Option<&Placements>) -> R,
+    ) -> Option<R> {
+        self.get(&pane).map(|parser| {
+            let parser = parser.lock().unwrap();
+            read(parser.screen(), parser.callbacks().placements())
+        })
     }
 }
 
@@ -138,7 +204,14 @@ mod tests {
         panes.get_mut(&LEFT).unwrap().process(b"left");
         panes.get_mut(&RIGHT).unwrap().process(b"righ");
 
-        let frame = compose(&layout, window, RIGHT, &panes, &Settings::default());
+        let frame = compose(
+            &layout,
+            window,
+            RIGHT,
+            &panes,
+            &Settings::default(),
+            Viewer::text(),
+        );
         let row: String = (0..9)
             .map(|col| frame.grid.cell(0, col).unwrap().text().to_owned())
             .collect();
@@ -169,7 +242,7 @@ mod tests {
             ..StyleSpec::EMPTY
         };
 
-        let active = compose(&layout, window, RIGHT, &panes, &settings);
+        let active = compose(&layout, window, RIGHT, &panes, &settings, Viewer::text());
         assert_eq!(active.grid.cell(1, 4).unwrap().text(), "|");
         assert_eq!(
             active.grid.cell(1, 4).unwrap().style(),
@@ -184,7 +257,14 @@ mod tests {
             .split(RIGHT, PaneId(2), SplitDirection::TopBottom, window)
             .unwrap();
         panes.insert(PaneId(2), vt100::Parser::new(1, 4, 0));
-        let frame = compose(&layout, window, PaneId(2), &panes, &settings);
+        let frame = compose(
+            &layout,
+            window,
+            PaneId(2),
+            &panes,
+            &settings,
+            Viewer::text(),
+        );
         assert_eq!(frame.grid.cell(0, 4).unwrap().text(), "|");
         assert_eq!(
             frame.grid.cell(0, 4).unwrap().style(),
@@ -208,7 +288,14 @@ mod tests {
             .unwrap()
             .process(b"\x1b=\x1b[?1000h\x1b[?1006h\x1b[?25l\r\nab");
 
-        let left = compose(&layout, window, LEFT, &panes, &Settings::default());
+        let left = compose(
+            &layout,
+            window,
+            LEFT,
+            &panes,
+            &Settings::default(),
+            Viewer::text(),
+        );
         assert_eq!(left.cursor, Some((1, 2)));
         assert_eq!(
             left.modes,
@@ -219,7 +306,14 @@ mod tests {
             }
         );
 
-        let right = compose(&layout, window, RIGHT, &panes, &Settings::default());
+        let right = compose(
+            &layout,
+            window,
+            RIGHT,
+            &panes,
+            &Settings::default(),
+            Viewer::text(),
+        );
         assert_eq!(right.cursor, Some((1, 7)));
         assert_eq!(
             right.modes,
@@ -240,7 +334,14 @@ mod tests {
         panes.get_mut(&LEFT).unwrap().process(b"abcd");
         assert_eq!(panes[&LEFT].screen().cursor_position(), (0, 4));
 
-        let frame = compose(&layout, window, LEFT, &panes, &Settings::default());
+        let frame = compose(
+            &layout,
+            window,
+            LEFT,
+            &panes,
+            &Settings::default(),
+            Viewer::text(),
+        );
         assert_eq!(frame.cursor, Some((0, 3)));
     }
 
@@ -250,7 +351,14 @@ mod tests {
         let (layout, mut panes) = side_by_side(window);
         panes.remove(&RIGHT);
 
-        let frame = compose(&layout, window, RIGHT, &panes, &Settings::default());
+        let frame = compose(
+            &layout,
+            window,
+            RIGHT,
+            &panes,
+            &Settings::default(),
+            Viewer::text(),
+        );
         assert_eq!(frame.cursor, None);
         assert_eq!(frame.modes, InputModes::default());
         assert!(frame.grid.cell(0, 5).unwrap().is_erased());
@@ -259,7 +367,14 @@ mod tests {
     #[test]
     fn a_window_too_small_for_the_layout_is_composed_at_its_minimum() {
         let (layout, panes) = side_by_side(size(9, 3));
-        let frame = compose(&layout, size(1, 1), LEFT, &panes, &Settings::default());
+        let frame = compose(
+            &layout,
+            size(1, 1),
+            LEFT,
+            &panes,
+            &Settings::default(),
+            Viewer::text(),
+        );
         assert_eq!(frame.grid.size(), size(3, 1));
     }
 }

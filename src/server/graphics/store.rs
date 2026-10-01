@@ -53,10 +53,12 @@ struct State {
     used: usize,
     last_key: u32,
     last_owner: u64,
+    last_display: u32,
     clock: u64,
     owners: HashSet<Owner>,
     images: HashMap<ImageKey, Entry>,
     names: HashMap<(Owner, Buffer, Name), ImageKey>,
+    displays: HashMap<u32, Owner>,
 }
 
 struct Entry {
@@ -95,13 +97,16 @@ impl ImageStore {
         }
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn get(&self, key: ImageKey) -> Option<ImageData> {
         let mut state = self.lock();
         let clock = state.tick();
         let entry = state.images.get_mut(&key)?;
         entry.used = clock;
         Some(entry.data.clone())
+    }
+
+    pub fn is_displayed(&self, display: u32) -> bool {
+        self.lock().displays.contains_key(&display)
     }
 
     pub fn add_placement(&self, key: ImageKey) -> bool {
@@ -207,6 +212,16 @@ impl State {
         })
     }
 
+    fn mint_display(&mut self, owner: Owner) -> Result<u32, Failure> {
+        let display = self
+            .last_display
+            .checked_add(1)
+            .ok_or_else(|| Failure::new(Code::Efbig, "out of display keys"))?;
+        self.last_display = display;
+        self.displays.insert(display, owner);
+        Ok(display)
+    }
+
     fn free_id(&self, owner: Owner, buffer: Buffer) -> u32 {
         (1..=u32::MAX)
             .find(|id| !self.names.contains_key(&(owner, buffer, Name::Id(*id))))
@@ -269,6 +284,7 @@ impl State {
         });
         self.used -= freed;
         self.names.retain(|(named, _, _), _| *named != owner);
+        self.displays.retain(|_, shown_by| *shown_by != owner);
     }
 }
 
@@ -305,6 +321,18 @@ impl PaneImages {
 
     pub fn remove_placement(&self, key: ImageKey, free: bool) {
         self.store.remove_placement(key, free);
+    }
+
+    pub fn mint_display(&self) -> Result<u32, Failure> {
+        self.store.lock().mint_display(self.owner)
+    }
+
+    pub fn release_display(&self, display: u32) {
+        self.store.lock().displays.remove(&display);
+    }
+
+    pub fn is_stored(&self, key: ImageKey) -> bool {
+        self.store.get(key).is_some()
     }
 
     pub fn free(&self, buffer: Buffer, name: Name) -> bool {
@@ -584,6 +612,27 @@ mod tests {
         assert_eq!(keys(&store), [alt.0, elsewhere.0]);
         pane.free_ids(Buffer::Alt, 0..=u32::MAX);
         assert_eq!(keys(&store), [elsewhere.0]);
+    }
+
+    #[test]
+    fn display_keys_count_up_across_panes_and_die_with_their_pane() {
+        let store = store(1 << 20);
+        let left = store.open_pane();
+        let right = store.open_pane();
+        let first = left.mint_display().unwrap();
+        let second = right.mint_display().unwrap();
+        let third = left.mint_display().unwrap();
+        assert_eq!((first, second, third), (1, 2, 3));
+        assert!([first, second, third]
+            .iter()
+            .all(|display| store.is_displayed(*display)));
+
+        left.release_display(first);
+        assert!(!store.is_displayed(first));
+        assert_eq!(right.mint_display().unwrap(), 4);
+        left.close();
+        assert!(!store.is_displayed(third));
+        assert!(store.is_displayed(second));
     }
 
     #[test]
