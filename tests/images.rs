@@ -28,6 +28,10 @@ fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny.png")
 }
 
+fn hi_sixel() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/graphics/fixtures/hi.six")
+}
+
 fn show(keys: &str, payload: &str) -> String {
     format!("printf '\\033_G{keys},q=2;%s\\033\\\\' \"$({payload} | base64 | tr -d '\\n')\"\r")
 }
@@ -228,6 +232,75 @@ async fn switching_sessions_uploads_the_image_again() {
     let (uploaded_key, data, size) = uploaded(&ops).unwrap();
     assert_eq!((uploaded_key, size), (key, (2, 2)));
     assert_eq!(data, fs::read(fixture()).unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sixel_reaches_a_kitty_client_padded_to_whole_cells_and_a_plain_client_as_text() {
+    let server = TestServer::start();
+    let mut kitty = kitty_session(&server, "s").await;
+    let quoted = shell_words::quote(&hi_sixel().display().to_string()).into_owned();
+    kitty
+        .type_text(&format!(
+            "printf '\\033Pq%s\\033\\\\\\n' \"$(cat {quoted})\"\r"
+        ))
+        .await;
+    let ops = images_until(
+        &mut kitty,
+        "the sixel and its placeholders",
+        |ops, screen| uploaded(ops).is_some() && placeholders(screen).len() == 2,
+    )
+    .await;
+    let [ImageOp::Transmit {
+        key,
+        format,
+        width,
+        height,
+        compressed,
+        total,
+        data,
+        last,
+    }, ImageOp::Place {
+        key: placed,
+        cols,
+        rows,
+    }] = &ops[..]
+    else {
+        panic!("expected one transmission and a placement, got {ops:?}");
+    };
+    assert_eq!(
+        (*format, *width, *height, *compressed, *last),
+        (ImageFormat::Rgba32, 20, 20, true, true)
+    );
+    assert_eq!(*total as usize, data.len());
+    assert_eq!((*placed, *cols, *rows), (*key, 2, 1));
+    let rgba = miniz_oxide::inflate::decompress_to_vec_zlib(data).unwrap();
+    assert_eq!(rgba.len(), 20 * 20 * 4);
+    assert_eq!(rgba[..4], [255, 255, 0, 255]);
+    assert_eq!(rgba[14 * 4..15 * 4], [0; 4]);
+    assert_eq!(rgba[7 * 20 * 4..7 * 20 * 4 + 4], [0; 4]);
+
+    let cells = placeholders(kitty.screen());
+    let (top, left, _) = cells[0];
+    assert_eq!(
+        cells,
+        [
+            (top, left, key_colour(*key)),
+            (top, left + 1, key_colour(*key)),
+        ]
+    );
+
+    let mut plain = server.client().await;
+    plain.attach(Some("s")).await;
+    plain.wait_for_text("$").await;
+    plain.type_text("echo plain-$((6*7))\r").await;
+    plain.wait_for_text("plain-42").await;
+    assert!(placeholders(plain.screen()).is_empty());
+    assert!(plain.contents().contains("printf"), "{}", plain.contents());
+    for col in [left, left + 1] {
+        let cell = plain.screen().cell(top, col).unwrap();
+        assert!(!cell.has_contents(), "({top}, {col}): {cell:?}");
+    }
+    plain.detach().await;
 }
 
 fn noise(len: usize) -> Vec<u8> {

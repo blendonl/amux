@@ -15,6 +15,7 @@ pub struct PaneSettings {
     pub env: BTreeMap<String, String>,
     pub strip_env: Vec<String>,
     pub images: bool,
+    pub sixel: bool,
 }
 
 impl PaneSettings {
@@ -34,6 +35,7 @@ impl Default for PaneSettings {
             env: BTreeMap::new(),
             strip_env: vec!["SSH_".into()],
             images: true,
+            sixel: true,
         }
     }
 }

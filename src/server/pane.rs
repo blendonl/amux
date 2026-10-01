@@ -56,7 +56,8 @@ impl Pane {
 
         let input = spawn_input_pump(pair.master.take_writer()?);
         let images = spec.settings.images.then(|| spec.store.open_pane());
-        let callbacks = PaneCallbacks::new(input.clone(), images.clone());
+        let callbacks =
+            PaneCallbacks::new(input.clone(), images.clone()).with_sixel(spec.settings.sixel);
         let terminal = spec.terminal.unwrap_or_default();
         callbacks.set_cell_pixels(terminal.cell_pixels);
         callbacks.set_graphics(terminal.graphics && spec.settings.images);
@@ -523,13 +524,15 @@ mod tests {
         );
         pane.set_graphics(true);
         pane.write_input(b"go\r".to_vec()).unwrap();
-        let echoed = wait_for(&pane, "^[[?62;22c");
-        assert!(echoed.contains("^[_Gi=31;OK^[\\^[[?62;22c"), "{echoed}");
+        let echoed = wait_for(&pane, "^[[?62;4;22c");
+        assert!(echoed.contains("^[_Gi=31;OK^[\\^[[?62;4;22c"), "{echoed}");
     }
 
     #[test]
     fn a_kitty_query_goes_unanswered_while_the_client_shows_no_images() {
-        for (images, graphics) in [(true, false), (false, true)] {
+        for (images, graphics, attributes) in
+            [(true, false, "^[[?62;4;22c"), (false, true, "^[[?62;22c")]
+        {
             let settings = PaneSettings {
                 images,
                 ..with_shell(&["/bin/sh", "-c", QUERY_THEN_DEVICE_ATTRIBUTES])
@@ -537,9 +540,23 @@ mod tests {
             let pane = spawn_pane(&settings, Size { rows: 10, cols: 60 });
             pane.set_graphics(graphics);
             pane.write_input(b"go\r".to_vec()).unwrap();
-            let echoed = wait_for(&pane, "^[[?62;22c");
-            assert!(echoed.contains("go\n^[[?62;22c"), "{echoed}");
+            let echoed = wait_for(&pane, attributes);
+            assert!(echoed.contains(&format!("go\n{attributes}")), "{echoed}");
             assert!(!echoed.contains("OK"), "{echoed}");
+        }
+    }
+
+    #[test]
+    fn a_pane_with_sixel_off_leaves_it_out_of_its_device_attributes() {
+        let script = r#"printf '\033[c'; read -r reply"#;
+        for (sixel, attributes) in [(true, "^[[?62;4;22c"), (false, "^[[?62;22c")] {
+            let settings = PaneSettings {
+                sixel,
+                ..with_shell(&["/bin/sh", "-c", script])
+            };
+            let pane = spawn_pane(&settings, Size { rows: 10, cols: 40 });
+            let echoed = wait_for(&pane, attributes);
+            assert!(echoed.contains(attributes), "{echoed}");
         }
     }
 

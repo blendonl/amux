@@ -2,9 +2,8 @@ pub mod apc;
 pub mod command;
 pub mod place;
 pub mod respond;
-#[cfg_attr(not(test), expect(dead_code))]
 pub mod sixel;
-#[cfg_attr(not(test), expect(dead_code))]
+pub mod sixel_display;
 pub mod sixel_palette;
 pub mod store;
 pub mod transmit;
@@ -16,8 +15,9 @@ use tracing::debug;
 use super::replies::PaneCallbacks;
 use apc::{ApcScanner, Segment};
 use command::{Action, Command};
-use place::active_buffer;
+use place::{active_buffer, Marked};
 use respond::{Code, Failure, Recipient};
+use sixel_display::FinishedSixel;
 use store::{Buffer, Name, PaneImages, Stored};
 use transmit::{Step, Transmission, Transmissions};
 
@@ -26,13 +26,15 @@ type PaneParser = vt100::Parser<PaneCallbacks>;
 pub struct PaneGraphics {
     scanner: ApcScanner,
     kitty: KittyGraphics,
+    images: PaneImages,
 }
 
 impl PaneGraphics {
     pub fn new(images: PaneImages) -> Self {
         Self {
             scanner: ApcScanner::new(),
-            kitty: KittyGraphics::new(images),
+            kitty: KittyGraphics::new(images.clone()),
+            images,
         }
     }
 
@@ -44,15 +46,47 @@ impl PaneGraphics {
                 Segment::Graphics(body) => self.kitty.handle(&body, parser),
             }
         }
-        settle(parser);
+        self.settle(parser);
     }
-}
 
-fn settle(parser: &Mutex<PaneParser>) {
-    let mut parser = lock(parser);
-    let (screen, callbacks) = parser.parts_mut();
-    if let Some(placements) = callbacks.placements_mut() {
-        placements.settle(screen);
+    fn settle(&self, parser: &Mutex<PaneParser>) {
+        let finished = {
+            let mut parser = lock(parser);
+            let (screen, callbacks) = parser.parts_mut();
+            let finished = callbacks.take_sixels();
+            if finished.is_empty() {
+                if let Some(placements) = callbacks.placements_mut() {
+                    placements.settle(screen);
+                }
+                return;
+            }
+            finished
+        };
+        let stored: Vec<(Stored, Marked)> = finished
+            .into_iter()
+            .filter_map(|sixel| self.store_sixel(sixel))
+            .collect();
+        let mut parser = lock(parser);
+        let (screen, callbacks) = parser.parts_mut();
+        if let Some(placements) = callbacks.placements_mut() {
+            for (image, marked) in stored {
+                if let Err(failure) = placements.place_sixel(screen, image, marked) {
+                    debug!(?failure, "dropping a sixel image that can't be placed");
+                }
+            }
+            placements.settle(screen);
+        }
+    }
+
+    fn store_sixel(&self, sixel: FinishedSixel) -> Option<(Stored, Marked)> {
+        let (image, marked) = sixel.into_padded();
+        match self.images.insert(marked.buffer, 0, 0, image.packed()) {
+            Ok(stored) => Some((stored, marked)),
+            Err(failure) => {
+                debug!(?failure, "dropping a sixel image the store refused");
+                None
+            }
+        }
     }
 }
 

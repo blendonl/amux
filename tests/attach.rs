@@ -163,7 +163,7 @@ async fn the_latest_active_client_sets_the_session_terminal() {
 }
 
 const PROBE: &str = "sh -c 'printf \"\\033[16t\\033_Gi=31,s=1,v=1,a=q,f=24;AAAA\\033\\134\\033[c\"; read -r reply'\r";
-const KITTY_REPLIES: &str = "^[[6;21;10t^[_Gi=31;OK^[\\^[[?62;22c";
+const KITTY_REPLIES: &str = "^[[6;21;10t^[_Gi=31;OK^[\\^[[?62;4;22c";
 
 async fn probe(client: &mut TestClient) -> String {
     client.type_text("clear\r").await;
@@ -173,7 +173,7 @@ async fn probe(client: &mut TestClient) -> String {
         })
         .await;
     client.type_text(PROBE).await;
-    let screen = client.wait_for_text("^[[?62;22c").await;
+    let screen = client.wait_for_text("^[[?62;4;22c").await;
     client.type_text("\r").await;
     screen
 }

@@ -3,7 +3,7 @@ use vt100::Color;
 use super::grid::{Cell, Grid, Style};
 use super::placeholder::{placeholder_cell, ImageSpan, DIACRITICS, PLACEHOLDER};
 use super::{ImageUse, Viewer};
-use crate::server::graphics::place::{PaneSpan, PlacementId, Placements};
+use crate::server::graphics::place::{PaneSpan, PlacementId, PlacementKind, Placements};
 use crate::server::layout::Rect;
 
 pub fn paint(
@@ -58,21 +58,31 @@ fn paint_spans(
         if !visible {
             continue;
         }
-        if span.under_text {
-            paint_under_text(grid, screen, &span, rect);
-        } else {
-            grid.paint_image(&window_span(&span, rect, 0, span.cols), rect);
+        match (span.kind, span.under_text) {
+            (PlacementKind::Sixel, _) => paint_where(grid, screen, &span, rect, |cell| {
+                cell.is_some_and(vt100::Cell::is_graphic)
+            }),
+            (PlacementKind::Kitty, true) => {
+                paint_where(grid, screen, &span, rect, |cell| cell.is_none_or(is_blank));
+            }
+            (PlacementKind::Kitty, false) => {
+                grid.paint_image(&window_span(&span, rect, 0, span.cols), rect);
+            }
         }
     }
 }
 
-fn paint_under_text(grid: &mut Grid, screen: &vt100::Screen, span: &PaneSpan, rect: Rect) {
+fn paint_where(
+    grid: &mut Grid,
+    screen: &vt100::Screen,
+    span: &PaneSpan,
+    rect: Rect,
+    shows: impl Fn(Option<&vt100::Cell>) -> bool,
+) {
     let mut start = None;
     for offset in 0..=span.cols {
-        let free = offset < span.cols
-            && screen
-                .cell(span.row, span.col.saturating_add(offset))
-                .is_none_or(is_blank);
+        let free =
+            offset < span.cols && shows(screen.cell(span.row, span.col.saturating_add(offset)));
         match (free, start) {
             (true, None) => start = Some(offset),
             (false, Some(first)) => {
@@ -452,6 +462,47 @@ mod tests {
         });
         assert_eq!(row_text(&frame, 0), "hello.....│..........");
         assert!(frame.images.is_empty());
+    }
+
+    fn sixel(width: u32, height: u32) -> String {
+        format!("\x1bPq\"1;1;{width};{height}#1~\x1b\\")
+    }
+
+    #[test]
+    fn text_printed_over_a_sixel_shows_through_it() {
+        let mut panes = Panes::side_by_side();
+        panes.feed(LEFT, &sixel(30, 40));
+        panes.feed(LEFT, "\x1b[1;2Hx");
+        let frame = panes.shown();
+
+        let [shown] = frame.images[..] else {
+            panic!("expected one image, got {:?}", frame.images);
+        };
+        assert_eq!((shown.cols, shown.rows), (3, 2));
+        assert_eq!(row_text(&frame, 0), "#x#.......│..........");
+        assert_eq!(row_text(&frame, 1), "###.......│..........");
+        assert_eq!(image_cell(&frame, 0, 2), Some((shown.key, 0, 2)));
+        assert_eq!(image_cell(&frame, 1, 0), Some((shown.key, 1, 0)));
+
+        let text = panes.frame(Viewer::text());
+        assert_eq!(row_text(&text, 0), ".x........│..........");
+        assert!(text.images.is_empty());
+    }
+
+    #[test]
+    fn the_newest_sixel_wins_where_two_overlap() {
+        let mut panes = Panes::side_by_side();
+        panes.feed(LEFT, &sixel(30, 20));
+        panes.feed(LEFT, &format!("\x1b[1;2H{}", sixel(30, 20)));
+        let frame = panes.shown();
+
+        let [older, newer] = frame.images[..] else {
+            panic!("expected two images, got {:?}", frame.images);
+        };
+        assert_eq!(row_text(&frame, 0), "####......│..........");
+        assert_eq!(image_cell(&frame, 0, 0), Some((older.key, 0, 0)));
+        assert_eq!(image_cell(&frame, 0, 1), Some((newer.key, 0, 0)));
+        assert_eq!(image_cell(&frame, 0, 3), Some((newer.key, 0, 2)));
     }
 
     #[test]

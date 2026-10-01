@@ -1,17 +1,20 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 
-use super::graphics::place::Placements;
+use super::graphics::place::{active_buffer, Placements, ASSUMED_CELL_PIXELS};
+use super::graphics::sixel_display::{FinishedSixel, SixelDisplay};
 use super::graphics::store::{Buffer, PaneImages};
 use crate::protocol::{CellPixels, RELEASE};
 
 const DEVICE_ATTRIBUTES: &[u16] = &[62, 22];
+const SIXEL_DEVICE_ATTRIBUTES: &[u16] = &[62, 4, 22];
 
 pub struct PaneCallbacks {
     input: mpsc::Sender<Vec<u8>>,
     cell_pixels: AtomicU32,
     graphics: AtomicBool,
     placements: Option<Placements>,
+    sixel: SixelDisplay,
 }
 
 impl PaneCallbacks {
@@ -20,8 +23,18 @@ impl PaneCallbacks {
             input,
             cell_pixels: AtomicU32::new(0),
             graphics: AtomicBool::new(false),
+            sixel: SixelDisplay::new(images.is_some()),
             placements: images.map(Placements::new),
         }
+    }
+
+    pub fn with_sixel(mut self, sixel: bool) -> Self {
+        self.sixel = SixelDisplay::new(sixel && self.placements.is_some());
+        self
+    }
+
+    pub fn take_sixels(&mut self) -> Vec<FinishedSixel> {
+        self.sixel.take_finished()
     }
 
     pub fn placements(&self) -> Option<&Placements> {
@@ -53,6 +66,10 @@ impl PaneCallbacks {
         let _ = self.input.send(bytes);
     }
 
+    fn sixel_cell(&self) -> CellPixels {
+        self.cell_pixels().unwrap_or(ASSUMED_CELL_PIXELS)
+    }
+
     fn answer(
         &self,
         screen: &vt100::Screen,
@@ -61,6 +78,9 @@ impl PaneCallbacks {
         action: char,
     ) -> Option<String> {
         match (private, action, param) {
+            (None, 'c', 0) if self.sixel.is_enabled() => {
+                Some(primary_device_attributes(SIXEL_DEVICE_ATTRIBUTES))
+            }
             (None, 'c', 0) => Some(primary_device_attributes(DEVICE_ATTRIBUTES)),
             (None, 'n', 5) => Some("\x1b[0n".to_owned()),
             (None, 'n', 6) => {
@@ -99,26 +119,44 @@ impl vt100::Callbacks for PaneCallbacks {
         params: &[&[u16]],
         c: char,
     ) {
-        if i2.is_some() {
-            return;
-        }
         let param = params
             .first()
             .and_then(|param| param.first())
             .copied()
             .unwrap_or(0);
-        if let Some(reply) = self.answer(screen, i1, param, c) {
+        let reply = match (i1, i2, c) {
+            (Some(b'?'), None, 'h' | 'l') => {
+                self.sixel.set_modes(params, c == 'h');
+                None
+            }
+            (Some(b'!'), None, 'p') => {
+                self.sixel.soft_reset();
+                None
+            }
+            (Some(b'?'), Some(b'$'), 'p') => self.sixel.report_mode(param),
+            (Some(b'?'), None, 'S') => {
+                let cell = self.sixel_cell();
+                self.sixel.graphics_attribute(screen, params, cell)
+            }
+            (_, Some(_), _) => None,
+            (private, None, action) => self.answer(screen, private, param, action),
+        };
+        if let Some(reply) = reply {
             self.reply(reply.into_bytes());
         }
     }
 
     fn erase_in_display(&mut self, screen: &mut vt100::Screen, mode: u16) {
+        if matches!(mode, 2 | 3) {
+            self.sixel.forget(active_buffer(screen));
+        }
         if let Some(placements) = &mut self.placements {
             placements.erase(screen, mode);
         }
     }
 
     fn reset(&mut self, _: &mut vt100::Screen) {
+        self.sixel.reset();
         if let Some(placements) = &mut self.placements {
             placements.reset();
         }
@@ -128,9 +166,32 @@ impl vt100::Callbacks for PaneCallbacks {
         if !cleared {
             return;
         }
+        self.sixel.forget(Buffer::Alt);
         if let Some(placements) = &mut self.placements {
             placements.clear(Buffer::Alt);
         }
+    }
+
+    fn dcs_hook(
+        &mut self,
+        screen: &mut vt100::Screen,
+        params: &[&[u16]],
+        intermediates: &[u8],
+        ignore: bool,
+        action: char,
+    ) {
+        let cell = self.sixel_cell();
+        self.sixel
+            .hook(screen, params, intermediates, ignore, action, cell);
+    }
+
+    fn dcs_put(&mut self, _: &mut vt100::Screen, byte: u8) {
+        self.sixel.put(byte);
+    }
+
+    fn dcs_unhook(&mut self, screen: &mut vt100::Screen) {
+        let cell = self.sixel_cell();
+        self.sixel.unhook(screen, cell);
     }
 }
 
@@ -164,6 +225,9 @@ fn cursor_report(screen: &vt100::Screen) -> (u16, u16) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use super::super::graphics::store::ImageStore;
     use super::*;
 
     const SIZE: (u16, u16) = (24, 80);
@@ -179,16 +243,44 @@ mod tests {
         }
 
         fn sized(rows: u16, cols: u16) -> Self {
+            Self::with_callbacks(rows, cols, |input| PaneCallbacks::new(input, None))
+        }
+
+        fn with_images(rows: u16, cols: u16, sixel: bool) -> Self {
+            let images = Arc::new(ImageStore::new(1 << 20)).open_pane();
+            Self::with_callbacks(rows, cols, |input| {
+                PaneCallbacks::new(input, Some(images)).with_sixel(sixel)
+            })
+        }
+
+        fn sixel() -> Self {
+            Self::with_images(SIZE.0, SIZE.1, true)
+        }
+
+        fn with_callbacks(
+            rows: u16,
+            cols: u16,
+            callbacks: impl FnOnce(mpsc::Sender<Vec<u8>>) -> PaneCallbacks,
+        ) -> Self {
             let (input, replies) = mpsc::channel();
             Self {
-                parser: vt100::Parser::new_with_callbacks(
-                    rows,
-                    cols,
-                    0,
-                    PaneCallbacks::new(input, None),
-                ),
+                parser: vt100::Parser::new_with_callbacks(rows, cols, 0, callbacks(input)),
                 replies,
             }
+        }
+
+        fn modes(&mut self) -> String {
+            self.reply_to("\x1b[?80$p\x1b[?1070$p\x1b[?8452$p")
+        }
+
+        fn sixel_colours(&mut self, output: &str) -> Vec<[u8; 4]> {
+            self.parser.process(output.as_bytes());
+            self.parser
+                .callbacks_mut()
+                .take_sixels()
+                .into_iter()
+                .map(|sixel| sixel.image.rgba[..4].try_into().unwrap())
+                .collect()
         }
 
         fn replies_to(&mut self, output: &str) -> Vec<String> {
@@ -215,6 +307,138 @@ mod tests {
         let mut terminal = Terminal::new();
         assert_eq!(terminal.reply_to("\x1b[c"), "\x1b[?62;22c");
         assert_eq!(terminal.reply_to("\x1b[0c"), "\x1b[?62;22c");
+    }
+
+    #[test]
+    fn primary_device_attributes_add_sixel_while_the_pane_takes_it() {
+        assert_eq!(Terminal::sixel().reply_to("\x1b[c"), "\x1b[?62;4;22c");
+        let mut without_sixel = Terminal::with_images(SIZE.0, SIZE.1, false);
+        assert_eq!(without_sixel.reply_to("\x1b[c"), "\x1b[?62;22c");
+        let mut without_images = Terminal::with_callbacks(SIZE.0, SIZE.1, |input| {
+            PaneCallbacks::new(input, None).with_sixel(true)
+        });
+        assert_eq!(without_images.reply_to("\x1b[c"), "\x1b[?62;22c");
+    }
+
+    #[test]
+    fn graphics_attributes_report_and_set_the_colour_registers() {
+        let mut terminal = Terminal::sixel();
+        let registers = |count: u32| format!("\x1b[?1;0;{count}S");
+        assert_eq!(terminal.reply_to("\x1b[?1;1S"), registers(1024));
+        assert_eq!(terminal.reply_to("\x1b[?1;4S"), registers(1024));
+        assert_eq!(terminal.reply_to("\x1b[?1;3;256S"), registers(256));
+        assert_eq!(terminal.reply_to("\x1b[?1;1S"), registers(256));
+        assert_eq!(terminal.reply_to("\x1b[?1;4S"), registers(1024));
+        assert_eq!(terminal.reply_to("\x1b[?1;3;1S"), registers(2));
+        assert_eq!(terminal.reply_to("\x1b[?1;3;5000S"), registers(1024));
+        assert_eq!(terminal.reply_to("\x1b[?1;3;16S"), registers(16));
+        assert_eq!(terminal.reply_to("\x1b[?1;3S"), "\x1b[?1;3;0S");
+        assert_eq!(terminal.reply_to("\x1b[?1;1S"), registers(16));
+        assert_eq!(terminal.reply_to("\x1b[?1;2S"), registers(1024));
+        assert_eq!(terminal.reply_to("\x1b[?1;1S"), registers(1024));
+    }
+
+    #[test]
+    fn graphics_attributes_report_and_set_the_sixel_geometry() {
+        let mut terminal = Terminal::sixel();
+        let geometry = |width: u32, height: u32| format!("\x1b[?2;0;{width};{height}S");
+        assert_eq!(terminal.reply_to("\x1b[?2;1S"), geometry(800, 480));
+        terminal.set_cell_pixels(9, 18);
+        assert_eq!(terminal.reply_to("\x1b[?2;1S"), geometry(720, 432));
+        assert_eq!(terminal.reply_to("\x1b[?2;4S"), geometry(4096, 4096));
+        assert_eq!(
+            terminal.reply_to("\x1b[?2;3;640;9999S"),
+            geometry(640, 4096)
+        );
+        assert_eq!(terminal.reply_to("\x1b[?2;1S"), geometry(640, 4096));
+        assert_eq!(terminal.reply_to("\x1b[?2;3;0;7S"), geometry(1, 7));
+        assert_eq!(terminal.reply_to("\x1b[?2;3;640S"), "\x1b[?2;3;0S");
+        assert_eq!(terminal.reply_to("\x1b[?2;2S"), geometry(720, 432));
+        assert_eq!(terminal.reply_to("\x1b[?2;1S"), geometry(720, 432));
+
+        let mut huge = Terminal::with_images(300, 600, true);
+        assert_eq!(huge.reply_to("\x1b[?2;1S"), geometry(4096, 4096));
+    }
+
+    #[test]
+    fn graphics_attributes_name_a_bad_item_or_action() {
+        let mut terminal = Terminal::sixel();
+        assert_eq!(terminal.reply_to("\x1b[?3;1S"), "\x1b[?3;1;0S");
+        assert_eq!(terminal.reply_to("\x1b[?7;4S"), "\x1b[?7;1;0S");
+        assert_eq!(terminal.reply_to("\x1b[?S"), "\x1b[?0;1;0S");
+        assert_eq!(terminal.reply_to("\x1b[?1;5S"), "\x1b[?1;2;0S");
+        assert_eq!(terminal.reply_to("\x1b[?2;0S"), "\x1b[?2;2;0S");
+        assert_eq!(terminal.reply_to("\x1b[?2S"), "\x1b[?2;2;0S");
+
+        let mut without_sixel = Terminal::with_images(SIZE.0, SIZE.1, false);
+        assert_eq!(without_sixel.reply_to("\x1b[?1;1S\x1b[?2;1S\x1b[?3;1S"), "");
+    }
+
+    #[test]
+    fn mode_requests_report_the_sixel_modes() {
+        let mut terminal = Terminal::sixel();
+        assert_eq!(terminal.modes(), "\x1b[?80;2$y\x1b[?1070;1$y\x1b[?8452;2$y");
+        terminal.reply_to("\x1b[?80;8452h\x1b[?1070l");
+        assert_eq!(terminal.modes(), "\x1b[?80;1$y\x1b[?1070;2$y\x1b[?8452;1$y");
+        terminal.reply_to("\x1b[?80;80h\x1b[?2004;80l\x1b[?8452;1049;1070h");
+        assert_eq!(terminal.modes(), "\x1b[?80;2$y\x1b[?1070;1$y\x1b[?8452;1$y");
+        assert!(!terminal.parser.screen().bracketed_paste());
+        assert!(terminal.parser.screen().alternate_screen());
+        assert_eq!(terminal.reply_to("\x1b[?81$p\x1b[80$p\x1b[?$p"), "");
+
+        let mut without_sixel = Terminal::with_images(SIZE.0, SIZE.1, false);
+        without_sixel.reply_to("\x1b[?80h");
+        assert_eq!(without_sixel.modes(), "");
+    }
+
+    #[test]
+    fn resets_restore_the_sixel_modes_and_a_full_reset_the_attributes_too() {
+        let mut terminal = Terminal::sixel();
+        let defaults = "\x1b[?80;2$y\x1b[?1070;1$y\x1b[?8452;2$y";
+        let changed = "\x1b[?80h\x1b[?1070l\x1b[?8452h\x1b[?1;3;16S\x1b[?2;3;64;64S";
+        terminal.reply_to(changed);
+        terminal.reply_to("\x1b[!p");
+        assert_eq!(terminal.modes(), defaults);
+        assert_eq!(terminal.reply_to("\x1b[?1;1S"), "\x1b[?1;0;16S");
+        assert_eq!(terminal.reply_to("\x1b[?2;1S"), "\x1b[?2;0;64;64S");
+
+        terminal.reply_to(changed);
+        terminal.reply_to("\x1bc");
+        assert_eq!(terminal.modes(), defaults);
+        assert_eq!(terminal.reply_to("\x1b[?1;1S"), "\x1b[?1;0;1024S");
+        assert_eq!(terminal.reply_to("\x1b[?2;1S"), "\x1b[?2;0;800;480S");
+    }
+
+    #[test]
+    fn colour_registers_are_shared_between_images_only_while_1070_is_off() {
+        const RED: [u8; 4] = [255, 0, 0, 255];
+        const VT340_CYAN: [u8; 4] = [51, 204, 204, 255];
+        let mut terminal = Terminal::sixel();
+        let reuse = "\x1bPq#5@\x1b\\";
+        assert_eq!(
+            terminal.sixel_colours(&format!("\x1bPq#5;2;100;0;0#5@\x1b\\{reuse}")),
+            [RED, VT340_CYAN]
+        );
+        assert_eq!(
+            terminal.sixel_colours(&format!(
+                "\x1b[?1070l\x1bPq#5;2;100;0;0#5@\x1b\\{reuse}\x1b[?1070h{reuse}\x1b[?1070l{reuse}"
+            )),
+            [RED, RED, VT340_CYAN, RED]
+        );
+        assert_eq!(
+            terminal.sixel_colours(&format!("\x1b[!p\x1b[?1070l{reuse}")),
+            [VT340_CYAN]
+        );
+        terminal.sixel_colours("\x1bPq#5;2;100;0;0#5@\x1b\\");
+        assert_eq!(
+            terminal.sixel_colours(&format!("\x1b[?1;3;8S{reuse}")),
+            [VT340_CYAN]
+        );
+        terminal.sixel_colours("\x1bPq#5;2;100;0;0#5@\x1b\\");
+        assert_eq!(
+            terminal.sixel_colours(&format!("\x1bc\x1b[?1070l{reuse}")),
+            [VT340_CYAN]
+        );
     }
 
     #[test]

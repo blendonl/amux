@@ -264,6 +264,14 @@ mod tests {
     }
 
     #[test]
+    fn sixel_is_on_in_panes_unless_turned_off() {
+        assert!(Settings::default().pane.sixel);
+        let settings: Settings = toml::from_str("[pane]\nsixel = false").unwrap();
+        assert!(!settings.pane.sixel);
+        assert!(settings.pane.images);
+    }
+
+    #[test]
     fn each_client_may_hold_256_mib_of_decoded_images() {
         let defaults = Settings::default();
         assert_eq!(defaults.images.client_memory_mb, 256);

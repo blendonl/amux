@@ -374,6 +374,7 @@
 ---@field env table<string, string> Variables set in new panes
 ---@field strip_env string[] Prefixes of variables removed from new panes
 ---@field images boolean Whether programs in new panes can show images
+---@field sixel boolean Whether programs in new panes can show sixel images
 
 ---@class amux.opt.window
 ---@field base_index integer The number of the first window
