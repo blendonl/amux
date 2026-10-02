@@ -639,6 +639,19 @@ impl Screen {
     }
 
     #[allow(missing_docs)]
+    pub fn visible_rows(
+        &self,
+    ) -> impl Iterator<Item = crate::VisibleRow<'_>> + '_ {
+        self.grid().visible_rows().map(crate::row::Row::visible)
+    }
+
+    #[allow(missing_docs)]
+    #[must_use]
+    pub fn visible_row(&self, row: u16) -> Option<crate::VisibleRow<'_>> {
+        self.grid().visible_row(row).map(crate::row::Row::visible)
+    }
+
+    #[allow(missing_docs)]
     #[must_use]
     pub fn row_has_placeholders(&self, row: u16) -> bool {
         self.grid()
