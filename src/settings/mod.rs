@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 pub use android::{AndroidSettings, KeyboardSettings};
 pub use callback::{CallbackId, CALLBACK_SLOT};
 pub use client::{
-    ClientImages, ImagesSettings, SearchSettings, StatusSettings, TreeSettings, WhichKeySettings,
+    ClientImages, ClipboardSettings, ImagesSettings, SearchSettings, StatusSettings, TreeSettings,
+    WhichKeySettings,
 };
 pub use cluster::{ClusterSettings, DiscoverySettings, LanSettings, ServerConfig, SshSettings};
 pub use host::{
@@ -53,6 +54,7 @@ pub struct Settings {
     pub which_key: WhichKeySettings,
     pub search: SearchSettings,
     pub images: ImagesSettings,
+    pub clipboard: ClipboardSettings,
     pub pane: PaneSettings,
     pub window: WindowSettings,
     pub session: SessionSettings,
@@ -149,6 +151,14 @@ impl Settings {
         if self.worktrees.suffix.is_empty() {
             return Err("amux.opt.worktrees.suffix must not be empty".into());
         }
+        if self
+            .clipboard
+            .command
+            .as_ref()
+            .is_some_and(|command| command.first().is_none_or(String::is_empty))
+        {
+            return Err("amux.opt.clipboard.command must name a program".into());
+        }
         self.android.keyboard.validate()
     }
 }
@@ -169,6 +179,7 @@ impl Default for Settings {
             which_key: WhichKeySettings::default(),
             search: SearchSettings::default(),
             images: ImagesSettings::default(),
+            clipboard: ClipboardSettings::default(),
             pane: PaneSettings::default(),
             window: WindowSettings::default(),
             session: SessionSettings::default(),
@@ -285,6 +296,28 @@ mod tests {
     }
 
     #[test]
+    fn the_clipboard_uses_osc52_and_runs_no_command_by_default() {
+        assert_eq!(
+            Settings::default().clipboard,
+            ClipboardSettings {
+                osc52: true,
+                command: None,
+            }
+        );
+        let settings: Settings =
+            toml::from_str("[clipboard]\nosc52 = false\ncommand = [\"wl-copy\", \"-n\"]").unwrap();
+        assert_eq!(
+            settings.clipboard,
+            ClipboardSettings {
+                osc52: false,
+                command: Some(vec!["wl-copy".into(), "-n".into()]),
+            }
+        );
+        assert_eq!(settings.validate(), Ok(()));
+        assert!(toml::from_str::<Settings>("[clipboard]\nbogus = 1").is_err());
+    }
+
+    #[test]
     fn host_settings_are_read_from_their_own_tables() {
         let settings: Settings = toml::from_str(
             "[pane]\nterm = \"tmux-256color\"\n\n\
@@ -385,6 +418,14 @@ mod tests {
         assert_eq!(
             rejected(|settings| settings.images.client_memory_mb = 0),
             "amux.opt.images.client_memory_mb must be a positive number"
+        );
+        assert_eq!(
+            rejected(|settings| settings.clipboard.command = Some(Vec::new())),
+            "amux.opt.clipboard.command must name a program"
+        );
+        assert_eq!(
+            rejected(|settings| settings.clipboard.command = Some(vec![String::new()])),
+            "amux.opt.clipboard.command must name a program"
         );
 
         let named = Settings {

@@ -22,6 +22,8 @@ use amux::protocol::{
     NewSession, Role, ServerMessage, SessionCommand, SessionInfo, SessionState, Size, Version,
     Welcome, WindowSummary,
 };
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::{getuid, Pid};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
@@ -41,6 +43,8 @@ const SERVERS_FILE: &str = "servers.lua";
 const LAN_PORT_FILE: &str = "lan-port";
 const FAST_DISCOVERY_MS: &str = "100";
 const REMOTE_PATH: &str = "PATH=/usr/bin:/bin";
+const OSC52: &[u8] = b"\x1b]52;c;";
+const BEL: u8 = 0x07;
 pub const KITTY: ClientTerminal = ClientTerminal {
     graphics: true,
     cell_pixels: Some(CellPixels {
@@ -958,6 +962,7 @@ pub struct TestClient {
     screen: vt100::Parser,
     session_state: Option<SessionState>,
     cluster_statuses: Vec<ClusterStatus>,
+    clipboard: Vec<String>,
 }
 
 impl TestClient {
@@ -978,6 +983,7 @@ impl TestClient {
             screen: vt100::Parser::new(SIZE.rows, SIZE.cols, 0),
             session_state: None,
             cluster_statuses: Vec::new(),
+            clipboard: Vec::new(),
         }
     }
 
@@ -1008,6 +1014,10 @@ impl TestClient {
         &self.cluster_statuses
     }
 
+    pub fn clipboard(&self) -> &[String] {
+        &self.clipboard
+    }
+
     pub async fn recv(&mut self) -> Option<ServerMessage> {
         let deadline = tokio::time::Instant::now() + TIMEOUT;
         let message = self
@@ -1036,6 +1046,7 @@ impl TestClient {
         match message {
             Some(ServerMessage::SessionState(state)) => self.session_state = Some(state),
             Some(ServerMessage::ClusterStatus(status)) => self.cluster_statuses.push(status),
+            Some(ServerMessage::Clipboard(text)) => self.clipboard.push(text),
             other => return Some(other),
         }
         None
@@ -1296,6 +1307,19 @@ impl TerminalClient {
         &self.raw
     }
 
+    pub fn clipboard(&self) -> Vec<String> {
+        copied_texts(&self.raw)
+    }
+
+    pub fn wait_for_clipboard(
+        &mut self,
+        what: &str,
+        done: impl Fn(&[String]) -> bool,
+    ) -> Vec<String> {
+        self.wait_until(what, |terminal| done(&terminal.clipboard()));
+        self.clipboard()
+    }
+
     fn wait_until(&mut self, what: &str, done: impl Fn(&Self) -> bool) {
         let deadline = Instant::now() + TIMEOUT;
         loop {
@@ -1328,6 +1352,23 @@ impl TerminalClient {
             thread::sleep(POLL);
         }
     }
+}
+
+fn copied_texts(raw: &[u8]) -> Vec<String> {
+    let mut texts = Vec::new();
+    let mut rest = raw;
+    while let Some(start) = rest.windows(OSC52.len()).position(|bytes| bytes == OSC52) {
+        rest = &rest[start + OSC52.len()..];
+        let Some(end) = rest.iter().position(|&byte| byte == BEL) else {
+            break;
+        };
+        let decoded = STANDARD
+            .decode(&rest[..end])
+            .expect("an OSC 52 payload in base64");
+        texts.push(String::from_utf8(decoded).expect("copied text in UTF-8"));
+        rest = &rest[end + 1..];
+    }
+    texts
 }
 
 impl Drop for TerminalClient {

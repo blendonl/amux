@@ -310,6 +310,12 @@ A server's `address` is one of:
 - `tcp://host:port`, which links over Noise to that address. The other server's key must already be trusted, or vouched for by the tailnet. Tailscale discovery uses this form.
 - `lan://<server id>`, the form LAN discovery uses. The IP addresses and port come from mDNS each time amux dials.
 
+`amux.opt.clipboard` decides where the text you copy goes. With `osc52`, the default, the client that copied writes it to its terminal as an OSC 52 sequence, which puts it on the clipboard of the machine the terminal runs on, through SSH too. `command` runs a program on the client's machine with the text on standard input, for terminals that ignore OSC 52. On Android, the app's terminal takes OSC strings of up to 8,192 characters, so about 6 KB of copied text reaches the phone's clipboard. [docs/lua.md](docs/lua.md#clipboard) has the details.
+
+```lua
+amux.opt.clipboard.command = { "wl-copy" }
+```
+
 #### Reloading
 
 A change to the config takes effect without a restart:
