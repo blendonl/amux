@@ -210,6 +210,17 @@ impl Pairing {
         None
     }
 
+    fn take_window(&self, code: &Code) -> Option<Window> {
+        self.window().take_if(|window| window.code == *code)
+    }
+
+    fn announce_closed(&self) {
+        let window = self.window();
+        if window.is_none() {
+            self.open.send_replace(None);
+        }
+    }
+
     fn attempt(&self) -> Option<Attempt> {
         let mut window = self.window();
         let open = window
@@ -426,12 +437,14 @@ where
             return Err(err);
         }
     };
-    let Some(window) = pairing.close(&attempt.code) else {
+    let Some(window) = pairing.take_window(&attempt.code) else {
         let refusal = "the pairing window closed".to_owned();
         let _ = send(&mut secured.stream, &PairMessage::Refused(refusal)).await;
         bail!("the pairing window closed during the attempt");
     };
-    if let Err(err) = trust(cluster, &peer) {
+    let trusted = trust(cluster, &peer);
+    pairing.announce_closed();
+    if let Err(err) = trusted {
         let refusal = PairMessage::Refused(format!("the other machine refused: {err:#}"));
         let _ = send(&mut secured.stream, &refusal).await;
         let _ = window.host.send(HostEvent::Closed(format!("{err:#}")));
@@ -1288,5 +1301,37 @@ mod tests {
         assert!(pairing.close(&code).is_some());
         assert!(!pairing.is_open());
         assert!(pairing.attempt().is_none());
+    }
+
+    #[test]
+    fn a_taken_window_looks_open_until_it_is_announced_closed() {
+        let pairing = Pairing::default();
+        let code = parsed(CODE);
+        let (events, _happened) = mpsc::unbounded_channel();
+        pairing.open(&code, LIFETIME, events).unwrap();
+
+        assert!(pairing.take_window(&parsed("k7-0000-0000")).is_none());
+        assert!(pairing.take_window(&code).is_some());
+        assert!(pairing.attempt().is_none());
+        assert!(pairing.is_open());
+        pairing.announce_closed();
+        assert!(!pairing.is_open());
+    }
+
+    #[test]
+    fn announcing_a_taken_window_closed_keeps_a_newer_window_open() {
+        let pairing = Pairing::default();
+        let code = parsed(CODE);
+        let (events, _happened) = mpsc::unbounded_channel();
+        pairing.open(&code, LIFETIME, events).unwrap();
+        pairing.take_window(&code).unwrap();
+
+        let (events, _happened) = mpsc::unbounded_channel();
+        pairing
+            .open(&parsed("ab-0000-0000"), LIFETIME, events)
+            .unwrap();
+        pairing.announce_closed();
+
+        assert!(pairing.is_open());
     }
 }
