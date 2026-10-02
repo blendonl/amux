@@ -32,6 +32,7 @@ pub struct Theme {
     pub pane_border: StyleSpec,
     pub pane_border_active: StyleSpec,
     pub copy_position: StyleSpec,
+    pub copy_selection: StyleSpec,
 }
 
 impl Default for Theme {
@@ -76,6 +77,7 @@ impl Default for Theme {
                 ..StyleSpec::EMPTY
             },
             copy_position: StyleSpec::colors(Color::BLACK, Color::YELLOW),
+            copy_selection: StyleSpec::REVERSE,
         }
     }
 }

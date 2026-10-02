@@ -9,10 +9,17 @@ use super::graphics::place::Placements;
 use super::layout::{Layout, PaneId, Rect, Side, SplitDirection};
 use super::mouse::MouseEvent;
 use super::pane::Pane;
+use super::paste;
 use super::render::{self, CopyView, Frame, InputModes, Screens, Viewer};
 use crate::keys::KeyDecoder;
 use crate::protocol::{ClientTerminal, Direction, Size, Split, WindowSummary};
 use crate::settings::{CopyAction, Settings, Table};
+
+#[derive(Debug, Default)]
+pub struct Handled {
+    pub redraw: bool,
+    pub copied: Option<String>,
+}
 
 pub struct Window {
     index: usize,
@@ -156,7 +163,7 @@ impl Window {
         bytes: &[u8],
         timed_out: bool,
         bindings: &Table<CopyAction>,
-    ) -> bool {
+    ) -> Handled {
         let id = self.active;
         let Some(copy) = self.copy.get_mut(&id) else {
             let mut input = keys.take_pending();
@@ -164,15 +171,15 @@ impl Window {
             if !input.is_empty() {
                 self.write_input_to(id, input);
             }
-            return false;
+            return Handled::default();
         };
         keys.push(bytes);
-        let mut redraw = false;
+        let mut handled = Handled::default();
         while let Some(decoded) = keys
             .next_key()
             .or_else(|| timed_out.then(|| keys.time_out()).flatten())
         {
-            redraw = true;
+            handled.redraw = true;
             match copy.press(&decoded, bindings) {
                 Outcome::Stay => {}
                 Outcome::Refresh => {
@@ -180,17 +187,35 @@ impl Window {
                         copy.refresh(Snapshot::new(pane.snapshot()));
                     }
                 }
+                Outcome::Copy(text) => {
+                    handled.copied = Some(text);
+                    self.leave_copy_mode(id, keys);
+                    break;
+                }
                 Outcome::Exit => {
-                    self.copy.remove(&id);
-                    let rest = keys.take_pending();
-                    if !rest.is_empty() {
-                        self.write_input_to(id, rest);
-                    }
+                    self.leave_copy_mode(id, keys);
                     break;
                 }
             }
         }
-        redraw
+        handled
+    }
+
+    fn leave_copy_mode(&mut self, id: PaneId, keys: &mut KeyDecoder) {
+        self.copy.remove(&id);
+        let rest = keys.take_pending();
+        if !rest.is_empty() {
+            self.write_input_to(id, rest);
+        }
+    }
+
+    pub fn paste(&self, text: &str) {
+        let id = self.active;
+        let Some(pane) = self.panes.get(&id) else {
+            return;
+        };
+        let bracketed = pane.with_screen(vt100::Screen::bracketed_paste);
+        self.write_input_to(id, paste::typed(text, bracketed));
     }
 
     pub fn pane_at(&self, index: usize) -> Result<PaneId> {

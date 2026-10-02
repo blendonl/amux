@@ -106,6 +106,7 @@ amux.keymap.set("prefix", "s f", amux.action.search_projects())
 | `which_key(name)`           | Shows the keys of table `name` at once, then reads the next key from it, `Ctrl-b ?` shows the prefix table |
 | `copy_mode()`               | Puts the active pane in [copy mode](#copy-mode), `Ctrl-b [` |
 | `copy_mode_page_up()`       | Puts the active pane in copy mode a page up, or turns a page up in copy mode. It has no key |
+| `paste_buffer()`            | Types the text last copied in copy mode into the active pane, `Ctrl-b ]` |
 
 ## Functions as bindings
 
@@ -155,43 +156,54 @@ end)
 
 The `copy` table holds the keys of [copy mode](../README.md#copy-mode). The server that holds the session reads it from its own config, as it does the pane border colours, and a reload changes it in panes that are already in copy mode. It binds single keys to these actions:
 
-| Action                | Does                                                 | Keys                 |
-| --------------------- | ---------------------------------------------------- | -------------------- |
-| `cursor_left`         | Moves the cursor left                                | `h`, `Left`          |
-| `cursor_down`         | Moves the cursor down                                | `j`, `Down`          |
-| `cursor_up`           | Moves the cursor up                                  | `k`, `Up`            |
-| `cursor_right`        | Moves the cursor right                               | `l`, `Right`         |
-| `next_word`           | Start of the next word                               | `w`                  |
-| `previous_word`       | Start of this or the previous word                   | `b`                  |
-| `next_word_end`       | End of this or the next word                         | `e`                  |
-| `next_space`          | `next_word` for words that only spaces separate      | `W`                  |
-| `previous_space`      | `previous_word` for words that only spaces separate  | `B`                  |
-| `next_space_end`      | `next_word_end` for words that only spaces separate  | `E`                  |
-| `start_of_line`       | First column                                         | `0`, `Home`          |
-| `back_to_indentation` | First character of the line                          | `^`                  |
-| `end_of_line`         | Last character of the line                           | `$`, `End`           |
-| `history_top`         | First line of the history                            | `g`                  |
-| `history_bottom`      | Last line of the screen                              | `G`                  |
-| `top_line`            | Top line of the pane                                 | `H`                  |
-| `middle_line`         | Middle line of the pane                              | `M`                  |
-| `bottom_line`         | Bottom line of the pane                              | `L`                  |
-| `scroll_up`           | Scrolls up a line                                    | `C-y`                |
-| `scroll_down`         | Scrolls down a line                                  | `C-e`                |
-| `halfpage_up`         | Scrolls up half a page                               | `C-u`                |
-| `halfpage_down`       | Scrolls down half a page                             | `C-d`                |
-| `page_up`             | Scrolls up a page                                    | `PageUp`             |
-| `page_down`           | Scrolls down a page                                  | `PageDown`, `C-f`    |
-| `refresh_from_pane`   | Takes a new copy of the pane, as far from the bottom | `r`                  |
-| `cancel`              | Leaves copy mode                                     | `q`, `Escape`, `C-c` |
+| Action                      | Does                                                 | Keys              |
+| --------------------------- | ---------------------------------------------------- | ----------------- |
+| `cursor_left`               | Moves the cursor left                                | `h`, `Left`       |
+| `cursor_down`               | Moves the cursor down                                | `j`, `Down`       |
+| `cursor_up`                 | Moves the cursor up                                  | `k`, `Up`         |
+| `cursor_right`              | Moves the cursor right                               | `l`, `Right`      |
+| `next_word`                 | Start of the next word                               | `w`               |
+| `previous_word`             | Start of this or the previous word                   | `b`               |
+| `next_word_end`             | End of this or the next word                         | `e`               |
+| `next_space`                | `next_word` for words that only spaces separate      | `W`               |
+| `previous_space`            | `previous_word` for words that only spaces separate  | `B`               |
+| `next_space_end`            | `next_word_end` for words that only spaces separate  | `E`               |
+| `start_of_line`             | First column                                         | `0`, `Home`       |
+| `back_to_indentation`       | First character of the line                          | `^`               |
+| `end_of_line`               | Last character of the line                           | `$`, `End`        |
+| `history_top`               | First line of the history                            | `g`               |
+| `history_bottom`            | Last line of the screen                              | `G`               |
+| `top_line`                  | Top line of the pane                                 | `H`               |
+| `middle_line`               | Middle line of the pane                              | `M`               |
+| `bottom_line`               | Bottom line of the pane                              | `L`               |
+| `scroll_up`                 | Scrolls up a line                                    | `C-y`             |
+| `scroll_down`               | Scrolls down a line                                  | `C-e`             |
+| `halfpage_up`               | Scrolls up half a page                               | `C-u`             |
+| `halfpage_down`             | Scrolls down half a page                             | `C-d`             |
+| `page_up`                   | Scrolls up a page                                    | `PageUp`          |
+| `page_down`                 | Scrolls down a page                                  | `PageDown`, `C-f` |
+| `refresh_from_pane`         | Takes a new copy of the pane, as far from the bottom | `r`               |
+| `begin_selection`           | Starts selecting characters at the cursor            | `v`, `Space`      |
+| `select_line`               | Starts selecting whole lines at the cursor           | `V`               |
+| `other_end`                 | Moves the cursor to the other end of the selection   | `o`               |
+| `clear_selection`           | Clears the selection                                 |                   |
+| `copy_selection_and_cancel` | Copies the selection and leaves copy mode            | `y`, `Enter`      |
+| `clear_selection_or_cancel` | Clears the selection, or leaves when there is none   | `Escape`          |
+| `cancel`                    | Leaves copy mode                                     | `q`, `C-c`        |
 
 The digits `1` to `9` start a count that repeats the next action, and `0` adds to a count once one has started. They aren't in the table. A key the table doesn't bind does nothing.
+
+`begin_selection` and `select_line` start a new selection at the cursor, even while one shows, and `refresh_from_pane` clears it. The selection is drawn in the `copy_selection` [theme](#the-theme) slot. `copy_selection_and_cancel` sends the text to the clipboard of the client that pressed the key, as set in [Clipboard](#clipboard), and keeps it in the server's paste buffer, which `paste_buffer()` types into the active pane.
 
 ```lua
 amux.keymap.set("copy", "K", "halfpage_up")
 amux.keymap.set("copy", "J", "halfpage_down")
 amux.keymap.del("copy", "C-c")
+amux.keymap.set("copy", "Escape", "cancel")
 amux.keymap.set("root", "S-PageUp", amux.action.copy_mode_page_up())
+amux.keymap.set("root", "M-p", amux.action.paste_buffer())
 amux.opt.theme.copy_position = { fg = "black", bg = "cyan" }
+amux.opt.theme.copy_selection = { fg = "black", bg = "yellow" }
 ```
 
 ## Which key
@@ -333,6 +345,7 @@ Each slot under `amux.opt.theme` is a style: `fg`, `bg`, `bold`, `dim`, `italic`
 | `pane_border`          | Pane borders, drawn by the host                        | plain                |
 | `pane_border_active`   | The active pane's border, drawn by the host            | green                |
 | `copy_position`        | The `[line/total]` position in copy mode, drawn by the host | black on yellow |
+| `copy_selection`       | The selection in copy mode, drawn by the host          | reverse              |
 
 The pane border and copy mode slots come from the server's config, since the host draws them. Everything else comes from the client's.
 

@@ -50,6 +50,30 @@ async fn seq_100(client: &mut TestClient) {
     wait_for_row(client, SIZE.rows - 1, "$").await;
 }
 
+async fn yank_alpha_and_beta(client: &mut TestClient) {
+    client.type_text("printf 'alpha\\nbeta\\n'\r").await;
+    client
+        .wait_for_screen("the printf output", |screen| {
+            screen.contents().contains("\nalpha\nbeta\n$")
+        })
+        .await;
+    enter_copy_mode(client).await;
+    client.type_text("k0Vky").await;
+    client
+        .wait_until("the yanked lines", |client| !client.clipboard().is_empty())
+        .await;
+    wait_until_live(client).await;
+}
+
+async fn raw_cat(client: &mut TestClient, setup: &str) {
+    client
+        .type_text(&format!(
+            "{setup}stty raw -echo; echo raw-$((6*7)); cat -v\r"
+        ))
+        .await;
+    client.wait_for_text("raw-42").await;
+}
+
 async fn stays_hidden(client: &mut TestClient, text: &str) {
     let deadline = Instant::now() + HIDDEN_FOR;
     while let Ok(message) = tokio::time::timeout_at(deadline, client.recv()).await {
@@ -185,6 +209,73 @@ async fn a_pane_that_exits_while_browsing_closes_cleanly() {
     client.wait_for_text("still-42").await;
 }
 
+#[tokio::test]
+async fn a_line_selection_yanks_whole_lines_to_the_clipboard_and_the_paste_buffer() {
+    let server = TestServer::start();
+    let mut client = session_with_prompt(&server).await;
+    yank_alpha_and_beta(&mut client).await;
+    assert_eq!(client.clipboard(), ["alpha\nbeta"]);
+
+    raw_cat(&mut client, "").await;
+    client.command(SessionCommand::PasteBuffer).await;
+    client.wait_for_text("alpha^Mbeta").await;
+    assert_eq!(client.clipboard(), ["alpha\nbeta"]);
+}
+
+#[tokio::test]
+async fn the_paste_buffer_is_shared_by_every_session_and_bracketed_when_asked() {
+    let server = TestServer::start();
+    let mut yanking = session_with_prompt(&server).await;
+    yank_alpha_and_beta(&mut yanking).await;
+
+    let mut pasting = server.client().await;
+    pasting.new_session(Some("t")).await;
+    pasting.wait_for_text("$").await;
+    raw_cat(&mut pasting, "printf '\\033[?2004h'; ").await;
+    pasting.command(SessionCommand::PasteBuffer).await;
+    pasting.wait_for_text("^[[200~alpha^Mbeta^[[201~").await;
+    assert!(pasting.clipboard().is_empty());
+}
+
+#[tokio::test]
+async fn pasting_an_empty_buffer_is_an_error() {
+    let server = TestServer::start();
+    let mut client = session_with_prompt(&server).await;
+    client.command(SessionCommand::PasteBuffer).await;
+    assert_eq!(
+        client.next_non_output().await,
+        Some(ServerMessage::Error("the paste buffer is empty".into()))
+    );
+    client.type_text("echo still-$((6*7))\r").await;
+    client.wait_for_text("still-42").await;
+}
+
+#[tokio::test]
+async fn escape_clears_the_selection_before_it_leaves_copy_mode() {
+    let server = TestServer::start();
+    let mut client = session_with_prompt(&server).await;
+    seq_100(&mut client).await;
+    enter_copy_mode(&mut client).await;
+    client.type_text("kvk").await;
+    client
+        .wait_for_screen("the selection", |screen| {
+            screen.cell(22, 0).is_some_and(vt100::Cell::inverse)
+        })
+        .await;
+
+    client.type_text("\x1b").await;
+    client
+        .wait_for_screen("the selection to clear", |screen| {
+            !screen.cell(22, 0).is_some_and(vt100::Cell::inverse)
+        })
+        .await;
+    assert!(screen_row(client.screen(), 0).ends_with("[100/102]"));
+
+    client.type_text("\x1b").await;
+    wait_until_live(&mut client).await;
+    assert!(client.clipboard().is_empty());
+}
+
 #[test]
 fn ctrl_b_bracket_enters_copy_mode_and_q_leaves_it() {
     let server = TestServer::start();
@@ -208,6 +299,28 @@ fn ctrl_b_bracket_enters_copy_mode_and_q_leaves_it() {
     });
     terminal.type_text("echo back-$((6*7))\r");
     terminal.wait_for_text("back-42");
+    exit(terminal);
+}
+
+#[test]
+fn a_yank_reaches_the_terminal_clipboard_through_osc_52() {
+    let server = TestServer::start();
+    let mut terminal = server.terminal(&["new", "-s", "s"]);
+    terminal.wait_for_status("the session", |line| line.starts_with("[s@"));
+    terminal.wait_for_text("$");
+    terminal.type_text("echo copy-$((6*7)) done\r");
+    terminal.wait_for_text("copy-42 done");
+
+    terminal.type_text("\x02[");
+    terminal.wait_for_screen("the copy mode position", |screen| {
+        screen_row(screen, 0).ends_with(']')
+    });
+    terminal.type_text("k0vEy");
+    let copied = terminal.wait_for_clipboard("the OSC 52 copy", |texts| !texts.is_empty());
+    assert_eq!(copied, ["copy-42"]);
+    terminal.wait_for_screen("the live pane", |screen| {
+        !screen_row(screen, 0).contains('[')
+    });
     exit(terminal);
 }
 

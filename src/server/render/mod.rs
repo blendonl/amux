@@ -9,6 +9,7 @@ pub mod placeholder;
 mod round_trip;
 
 use std::collections::BTreeSet;
+use std::ops::Range;
 
 pub use differ::GridDiffer;
 use grid::{text_width, BorderLook, Grid};
@@ -97,6 +98,7 @@ pub struct CopyView<'a> {
     pub top: usize,
     pub cursor: (u16, u16),
     pub position: String,
+    pub selection: Vec<(u16, Range<u16>)>,
 }
 
 pub trait Screens {
@@ -173,6 +175,11 @@ fn paint_copy(grid: &mut Grid, view: &CopyView<'_>, rect: Rect, settings: &Setti
             .line_cell(view.top + usize::from(row), col)
             .map(images::text_cell)
     });
+    let selected = settings.theme.copy_selection.into();
+    for (row, cols) in &view.selection {
+        let cols = rect.col.saturating_add(cols.start)..rect.col.saturating_add(cols.end);
+        grid.restyle(rect.row.saturating_add(*row), cols, rect, selected);
+    }
     let position = rect.right().saturating_sub(text_width(&view.position));
     grid.write_text(
         rect.row,
@@ -417,6 +424,7 @@ mod tests {
     struct Browsing {
         panes: BTreeMap<PaneId, vt100::Parser>,
         copy: BTreeMap<PaneId, (vt100::Screen, usize)>,
+        selection: Vec<(u16, Range<u16>)>,
     }
 
     impl Screens for Browsing {
@@ -434,6 +442,7 @@ mod tests {
                 top: *top,
                 cursor: (1, 2),
                 position: "[3/5]".into(),
+                selection: self.selection.clone(),
             })
         }
     }
@@ -447,7 +456,14 @@ mod tests {
         parser.process(b"\r\nlive output\x1b[?25l\x1b[?1000h");
         panes.insert(LEFT, parser);
         let copy = BTreeMap::from([(LEFT, (snapshot, 1))]);
-        (layout, Browsing { panes, copy })
+        (
+            layout,
+            Browsing {
+                panes,
+                copy,
+                selection: Vec::new(),
+            },
+        )
     }
 
     fn text_of(frame: &Frame, row: u16, cols: std::ops::Range<u16>) -> String {
@@ -516,6 +532,47 @@ mod tests {
             Viewer::text(),
         );
         assert_eq!(text_of(&frame, 0, 0..5), "[3/5│");
+    }
+
+    #[test]
+    fn a_copy_pane_draws_its_selection_under_the_position() {
+        let window = size(21, 3);
+        let (layout, mut browsing) = browsing(window, "a\r\nb\r\nx日y\r\nd\r\ne");
+        browsing.selection = vec![(0, 2..10), (1, 0..2)];
+        let frame = compose(
+            &layout,
+            window,
+            RIGHT,
+            &browsing,
+            &Settings::default(),
+            Viewer::text(),
+        );
+        let theme = Settings::default().theme;
+        let styles = |row: u16| -> Vec<Style> {
+            (0..10)
+                .map(|col| frame.grid.cell(row, col).unwrap().style())
+                .collect()
+        };
+        let plain = Style::default();
+        let selected = Style::from(theme.copy_selection);
+        let position = Style::from(theme.copy_position);
+        assert!(selected.inverse);
+        assert_eq!(
+            styles(0),
+            [plain, plain, selected, selected, selected]
+                .into_iter()
+                .chain([position; 5])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            styles(1),
+            [selected; 3]
+                .into_iter()
+                .chain([plain; 7])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(styles(2), [plain; 10]);
+        assert_eq!(text_of(&frame, 1, 0..4), "x日.y");
     }
 
     #[test]

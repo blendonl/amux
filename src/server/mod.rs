@@ -6,6 +6,7 @@ mod layout;
 pub mod lua_host;
 mod mouse;
 mod pane;
+mod paste;
 mod projects;
 mod reload;
 mod render;
@@ -51,6 +52,7 @@ use connection::Origin;
 use forward::{Host, RemoteSession};
 use graphics::store::ImageStore;
 use lua_host::{HookEvent, HookSink, HostConfig, LuaHost};
+use paste::PasteBuffer;
 use projects::{blocking, Projects, REGISTRY_FILE};
 use session::{Binding, Session, SessionHost};
 
@@ -191,6 +193,7 @@ pub struct Server {
     events: broadcast::Sender<Event>,
     hooks: HookSink,
     images: Arc<ImageStore>,
+    paste: Arc<PasteBuffer>,
     cluster: Arc<Cluster>,
     lan: LanListener,
     discovery: Discovery,
@@ -254,6 +257,7 @@ impl Server {
                 events: broadcast::channel(EVENT_CAPACITY).0,
                 hooks: HookSink::default(),
                 images,
+                paste: Arc::default(),
                 discovery: Discovery::new(Arc::clone(&cluster), discovery, lan.watch()),
                 cluster,
                 lan,
@@ -377,6 +381,7 @@ impl Server {
                 keymap: self.watch_keymap(),
                 hooks: self.hooks.clone(),
                 images: Arc::clone(&self.images),
+                paste: Arc::clone(&self.paste),
             },
         )?;
         state.sessions.insert(name.clone(), Arc::clone(&session));

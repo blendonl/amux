@@ -361,6 +361,7 @@ impl KeyRouter {
             Binding::KillWindow => Action::Command(SessionCommand::KillWindow),
             Binding::CopyMode => Action::Command(SessionCommand::CopyMode { page_up: false }),
             Binding::CopyModePageUp => Action::Command(SessionCommand::CopyMode { page_up: true }),
+            Binding::PasteBuffer => Action::Command(SessionCommand::PasteBuffer),
         })
     }
 }
@@ -607,6 +608,7 @@ mod tests {
             (b'x', SessionCommand::KillPane),
             (b'&', SessionCommand::KillWindow),
             (b'[', SessionCommand::CopyMode { page_up: false }),
+            (b']', SessionCommand::PasteBuffer),
         ];
         for (key, bound) in bindings {
             assert_eq!(

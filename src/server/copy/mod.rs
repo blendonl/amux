@@ -1,7 +1,11 @@
 mod motion;
+mod selection;
 mod snapshot;
 
+use std::ops::Range;
+
 use motion::Span;
+use selection::{Kind, Selection};
 pub use snapshot::Snapshot;
 
 use super::render::CopyView;
@@ -17,11 +21,12 @@ pub struct Point {
     pub col: u16,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     Stay,
     Refresh,
     Exit,
+    Copy(String),
 }
 
 pub struct CopyMode {
@@ -31,6 +36,7 @@ pub struct CopyMode {
     cursor: Point,
     count: Option<usize>,
     paste: Scanner,
+    selection: Option<Selection>,
 }
 
 impl CopyMode {
@@ -42,6 +48,7 @@ impl CopyMode {
             top: 0,
             count: None,
             paste: Scanner::default(),
+            selection: None,
         };
         mode.top = mode.bottom();
         mode.clamp();
@@ -52,6 +59,7 @@ impl CopyMode {
         let from_bottom = self.bottom() - self.top;
         let row = self.cursor.line - self.top;
         self.snapshot = snapshot;
+        self.selection = None;
         self.top = self.bottom().saturating_sub(from_bottom);
         self.cursor.line = self.top + row;
         self.clamp();
@@ -94,7 +102,23 @@ impl CopyMode {
                 self.cursor.col,
             ),
             position: format!("[{}/{}]", self.cursor.line + 1, self.snapshot.lines()),
+            selection: self.selected_columns(),
         }
+    }
+
+    fn selected_columns(&self) -> Vec<(u16, Range<u16>)> {
+        let Some(selection) = self.selection else {
+            return Vec::new();
+        };
+        let cols = self.size.cols;
+        (0..self.size.rows)
+            .filter_map(|row| {
+                let line = self.top + usize::from(row);
+                let selected = selection.columns(&self.snapshot, self.cursor, line)?;
+                let visible = selected.start.min(cols)..selected.end.min(cols);
+                (!visible.is_empty()).then_some((row, visible))
+            })
+            .collect()
     }
 
     fn swallows_paste(&mut self, raw: &[u8]) -> bool {
@@ -163,11 +187,47 @@ impl CopyMode {
             CopyAction::HalfpageDown => self.scroll_down(count.saturating_mul(self.half_page())),
             CopyAction::PageUp => self.scroll_up(count.saturating_mul(self.page())),
             CopyAction::PageDown => self.scroll_down(count.saturating_mul(self.page())),
+            CopyAction::BeginSelection => self.select(Kind::Char),
+            CopyAction::SelectLine => self.select(Kind::Line),
+            CopyAction::OtherEnd => self.swap_ends(),
+            CopyAction::ClearSelection => self.selection = None,
+            CopyAction::CopySelectionAndCancel => return self.copy_selection(),
+            CopyAction::ClearSelectionOrCancel => {
+                if self.selection.take().is_none() {
+                    return Outcome::Exit;
+                }
+            }
             CopyAction::Cancel => return Outcome::Exit,
             CopyAction::RefreshFromPane => return Outcome::Refresh,
         }
         self.clamp();
         Outcome::Stay
+    }
+
+    fn select(&mut self, kind: Kind) {
+        self.selection = Some(Selection {
+            anchor: self.cursor,
+            kind,
+        });
+    }
+
+    fn swap_ends(&mut self) {
+        if let Some(selection) = &mut self.selection {
+            std::mem::swap(&mut selection.anchor, &mut self.cursor);
+            self.follow_cursor();
+        }
+    }
+
+    fn copy_selection(&self) -> Outcome {
+        let text = self
+            .selection
+            .map(|selection| selection.text(&self.snapshot, self.cursor))
+            .unwrap_or_default();
+        if text.is_empty() {
+            Outcome::Exit
+        } else {
+            Outcome::Copy(text)
+        }
     }
 
     fn repeat(&mut self, count: usize, motion: impl Fn(&Self, Point) -> Point) {
@@ -298,6 +358,22 @@ mod tests {
             .map(|decoded| mode.press(decoded, &bindings))
             .filter(|outcome| *outcome != Outcome::Stay)
             .collect()
+    }
+
+    fn type_keys_and_pause(mode: &mut CopyMode, input: &[u8]) -> Vec<Outcome> {
+        let bindings = Keymap::default().copy;
+        let mut decoder = KeyDecoder::default();
+        let mut decoded = decoder.feed(input);
+        decoded.extend(decoder.time_out());
+        decoded
+            .iter()
+            .map(|decoded| mode.press(decoded, &bindings))
+            .filter(|outcome| *outcome != Outcome::Stay)
+            .collect()
+    }
+
+    fn copied(text: &str) -> Vec<Outcome> {
+        vec![Outcome::Copy(text.into())]
     }
 
     fn top_and_cursor(mode: &CopyMode) -> (usize, usize, u16) {
@@ -468,12 +544,13 @@ mod tests {
             Snapshot::new(parser.screen().clone()),
             Size { rows: 5, cols: 20 },
         );
-        type_keys(&mut mode, b"\x15k");
+        type_keys(&mut mode, b"\x15kv");
         assert_eq!(top_and_cursor(&mode), (23, 26, 2));
         parser.process(b"\r\n31\r\n32");
         mode.refresh(Snapshot::new(parser.screen().clone()));
         assert_eq!(top_and_cursor(&mode), (25, 28, 2));
         assert_eq!(mode.view().position, "[29/32]");
+        assert!(mode.view().selection.is_empty());
     }
 
     #[test]
@@ -497,5 +574,91 @@ mod tests {
         let mut mode = browsing(5, 20, &numbered(30));
         mode.page_up();
         assert_eq!(top_and_cursor(&mode), (21, 25, 2));
+    }
+
+    #[test]
+    fn v_selects_from_the_cursor_and_y_copies_it_and_leaves() {
+        let mut mode = browsing(5, 20, "one two\r\nthree four\r\n$ ");
+        type_keys(&mut mode, b"kk0wv");
+        assert_eq!(mode.view().selection, [(0, 4..5)]);
+        type_keys(&mut mode, b"je");
+        assert_eq!(top_and_cursor(&mode), (0, 1, 9));
+        assert_eq!(mode.view().selection, [(0, 4..20), (1, 0..10)]);
+        assert_eq!(type_keys(&mut mode, b"y"), copied("two\nthree four"));
+    }
+
+    #[test]
+    fn a_selection_runs_backwards_and_o_swaps_its_ends() {
+        let mut mode = browsing(5, 20, "one two\r\nthree four\r\n$ ");
+        type_keys(&mut mode, b"k$ kb");
+        assert_eq!(top_and_cursor(&mode), (0, 0, 4));
+        assert_eq!(mode.view().selection, [(0, 4..20), (1, 0..10)]);
+        type_keys(&mut mode, b"o");
+        assert_eq!(top_and_cursor(&mode), (0, 1, 9));
+        type_keys(&mut mode, b"h");
+        assert_eq!(type_keys(&mut mode, b"\r"), copied("two\nthree fou"));
+    }
+
+    #[test]
+    fn capital_v_selects_whole_lines_across_the_history() {
+        let mut mode = browsing(5, 20, &numbered(30));
+        type_keys(&mut mode, b"V6k");
+        assert_eq!(top_and_cursor(&mode), (23, 23, 2));
+        assert_eq!(
+            mode.view().selection,
+            (0..5).map(|row| (row, 0..20)).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            type_keys(&mut mode, b"y"),
+            copied("24\n25\n26\n27\n28\n29\n30")
+        );
+    }
+
+    #[test]
+    fn a_selection_takes_wide_characters_whole() {
+        let mut mode = browsing(3, 10, "a日本b\r\n");
+        type_keys(&mut mode, b"glvl");
+        assert_eq!(top_and_cursor(&mode), (0, 0, 3));
+        assert_eq!(mode.view().selection, [(0, 1..5)]);
+        assert_eq!(type_keys(&mut mode, b"y"), copied("日本"));
+    }
+
+    #[test]
+    fn escape_clears_the_selection_and_then_leaves() {
+        let mut mode = browsing(5, 20, "text");
+        assert_eq!(type_keys_and_pause(&mut mode, b"hv\x1b"), []);
+        assert!(mode.view().selection.is_empty());
+        assert_eq!(type_keys_and_pause(&mut mode, b"\x1b"), [Outcome::Exit]);
+        assert_eq!(
+            type_keys(&mut browsing(5, 20, "text"), b"hvq"),
+            [Outcome::Exit]
+        );
+    }
+
+    #[test]
+    fn yanking_nothing_or_blank_cells_leaves_without_copying() {
+        assert_eq!(
+            type_keys(&mut browsing(5, 20, "text"), b"y"),
+            [Outcome::Exit]
+        );
+        assert_eq!(
+            type_keys(&mut browsing(5, 20, "text"), b"vlly"),
+            [Outcome::Exit]
+        );
+    }
+
+    #[test]
+    fn clear_selection_drops_the_selection_and_stays() {
+        let mut mode = browsing(5, 20, "text");
+        let mut bindings = Keymap::default().copy;
+        bindings.insert(Key::char('c'), CopyAction::ClearSelection);
+        let outcomes: Vec<Outcome> = KeyDecoder::default()
+            .feed(b"0v$c")
+            .iter()
+            .map(|decoded| mode.press(decoded, &bindings))
+            .collect();
+        assert!(outcomes.iter().all(|outcome| *outcome == Outcome::Stay));
+        assert!(mode.view().selection.is_empty());
+        assert_eq!(type_keys(&mut mode, b"y"), [Outcome::Exit]);
     }
 }

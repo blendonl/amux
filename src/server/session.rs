@@ -15,6 +15,7 @@ use super::layout::PaneId;
 use super::lua_host::{HookEvent, HookSink};
 use super::mouse::InputEvent;
 use super::pane::{Pane, PaneObserver, PaneSpec};
+use super::paste::PasteBuffer;
 use super::render::{Frame, Viewer};
 use super::window::Window;
 use crate::keys::KeyDecoder;
@@ -45,6 +46,7 @@ pub struct SessionHost {
     pub keymap: watch::Receiver<Arc<Keymap>>,
     pub hooks: HookSink,
     pub images: Arc<ImageStore>,
+    pub paste: Arc<PasteBuffer>,
 }
 
 pub struct Session {
@@ -60,6 +62,7 @@ pub struct Session {
     keymap: watch::Receiver<Arc<Keymap>>,
     hooks: HookSink,
     images: Arc<ImageStore>,
+    paste: Arc<PasteBuffer>,
     terminals: Mutex<Terminals>,
     terminal: watch::Sender<Option<ClientTerminal>>,
     windows: Mutex<Windows>,
@@ -80,6 +83,7 @@ impl Session {
             keymap,
             hooks,
             images,
+            paste,
         } = host;
         let session = Arc::new(Self {
             id,
@@ -94,6 +98,7 @@ impl Session {
             keymap,
             hooks,
             images,
+            paste,
             terminals: Mutex::new(Terminals::default()),
             terminal: watch::channel(None).0,
             windows: Mutex::new(Windows::new(size.clamped())),
@@ -261,18 +266,25 @@ impl Session {
         )
     }
 
-    pub fn input(&self, event: InputEvent, keys: &mut KeyDecoder, timed_out: bool) {
+    pub fn input(
+        &self,
+        event: InputEvent,
+        keys: &mut KeyDecoder,
+        timed_out: bool,
+    ) -> Option<String> {
         let keymap = self.keymap();
         let mut windows = self.state();
         let size = windows.size;
-        match event {
+        let copied = match event {
             InputEvent::Bytes(bytes) => {
-                let redraw = windows
+                let handled = windows
                     .active_window_mut()
-                    .is_some_and(|window| window.keys(keys, &bytes, timed_out, &keymap.copy));
-                if redraw {
+                    .map(|window| window.keys(keys, &bytes, timed_out, &keymap.copy))
+                    .unwrap_or_default();
+                if handled.redraw {
                     windows.redraw();
                 }
+                handled.copied
             }
             InputEvent::Mouse(event) => {
                 let focused = windows
@@ -281,8 +293,14 @@ impl Session {
                 if focused {
                     windows.redraw();
                 }
+                None
             }
+        };
+        drop(windows);
+        if let Some(text) = &copied {
+            self.paste.store(text.clone());
         }
+        copied
     }
 
     pub fn run(self: &Arc<Self>, command: SessionCommand) -> Result<()> {
@@ -329,6 +347,14 @@ impl Session {
                     .ok_or_else(ended)?
                     .copy_mode(size, page_up);
                 windows.redraw();
+                Ok(())
+            }
+            SessionCommand::PasteBuffer => {
+                let text = self.paste.contents();
+                if text.is_empty() {
+                    bail!("the paste buffer is empty");
+                }
+                self.state().active_window().ok_or_else(ended)?.paste(&text);
                 Ok(())
             }
         }
@@ -831,6 +857,7 @@ mod tests {
                 keymap: watch::channel(Arc::new(Keymap::default())).1,
                 hooks: HookSink::default(),
                 images: Arc::new(ImageStore::new(1 << 20)),
+                paste: Arc::default(),
             },
         )
         .unwrap()

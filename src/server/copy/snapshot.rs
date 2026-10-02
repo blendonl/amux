@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use super::Point;
 
 pub struct Snapshot {
@@ -39,6 +41,11 @@ impl Snapshot {
         self.screen.line_wrapped(line)
     }
 
+    pub fn text(&self, line: usize, cols: Range<u16>) -> String {
+        self.screen
+            .line_contents(line, cols.start, cols.end.saturating_sub(cols.start))
+    }
+
     pub fn is_continuation(&self, point: Point) -> bool {
         self.cell(point)
             .is_some_and(vt100::Cell::is_wide_continuation)
@@ -70,6 +77,8 @@ mod tests {
             ["one", "two", "three", "four", "fi"]
         );
         assert_eq!(snapshot.cursor(), Point { line: 4, col: 2 });
+        assert_eq!(snapshot.text(2, 1..4), "hre");
+        assert_eq!(snapshot.text(2, 3..u16::MAX), "ee");
         assert_eq!(
             snapshot.cell(Point { line: 0, col: 1 }).unwrap().contents(),
             "n"
