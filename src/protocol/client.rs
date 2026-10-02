@@ -380,6 +380,7 @@ pub enum SessionCommand {
     KillWindow,
     RenameWindow(String),
     CopyMode { page_up: bool },
+    PasteBuffer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

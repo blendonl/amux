@@ -71,6 +71,7 @@ A session holds numbered windows, and each window splits into panes, each runnin
 | `Ctrl-b ,`              | Rename the active window                               |
 | `Ctrl-b $`              | Rename the session                                     |
 | `Ctrl-b [`              | Browse the active pane's history in copy mode          |
+| `Ctrl-b ]`              | Paste the text last copied in copy mode                |
 | `Ctrl-b s p`            | Find a project in your project directories and open it |
 | `Ctrl-b s w`            | Find a worktree of this session's project and open it  |
 | `Ctrl-b s s`            | Pick a session or window anywhere in the cluster       |
@@ -88,7 +89,7 @@ A session holds numbered windows, and each window splits into panes, each runnin
 
 ### Copy mode
 
-`Ctrl-b [` puts the active pane in copy mode, where you scroll back through its history. The pane holds still while you look: amux shows a copy of it taken when you pressed the keys, the program keeps running underneath, and what it prints meanwhile shows when you leave. The top right corner shows `[line/total]`, the line the cursor is on out of all the lines of history and screen. The keys are vi's:
+`Ctrl-b [` puts the active pane in copy mode, where you scroll back through its history and copy text from it. The pane holds still while you look: amux shows a copy of it taken when you pressed the keys, the program keeps running underneath, and what it prints meanwhile shows when you leave. The top right corner shows `[line/total]`, the line the cursor is on out of all the lines of history and screen. The keys are vi's:
 
 | Keys                             | Action                                                  |
 | -------------------------------- | ------------------------------------------------------- |
@@ -102,11 +103,17 @@ A session holds numbered windows, and each window splits into panes, each runnin
 | `Ctrl-u`, `Ctrl-d`               | Scroll up and down half a page                          |
 | `PageUp`, `PageDown` or `Ctrl-f` | Scroll up and down a page                               |
 | `r`                              | Take a new copy of the pane, keeping your place         |
-| `q`, `Escape`, `Ctrl-c`          | Leave copy mode                                         |
+| `v` or `Space`, `V`              | Start selecting characters, or whole lines              |
+| `o`                              | Move the cursor to the other end of the selection       |
+| `y` or `Enter`                   | Copy the selection and leave copy mode                  |
+| `Escape`                         | Clear the selection, or leave when nothing is selected  |
+| `q`, `Ctrl-c`                    | Leave copy mode                                         |
 
 - A number before a key repeats it: `10k` moves up ten lines. Other keys do nothing, and pasted text is dropped.
+- A selection runs from where you started it to the cursor, both ends included, and a wide character is taken whole. `y` copies it to the clipboard of the client that pressed it (see [Clipboard](docs/lua.md#clipboard)) and to the paste buffer. A line that wrapped at the edge of the pane comes out as one line, the blanks at the end of each line are dropped, and there is no newline after the last line. When the selection holds only blanks, or nothing is selected, `y` just leaves copy mode. `r` clears the selection.
+- `Ctrl-b ]` types the paste buffer into the active pane as if you had pasted it: each newline becomes Enter, other control characters are dropped, and a program that turned on bracketed paste gets the text inside `ESC[200~ … ESC[201~`. The server keeps one paste buffer for all its sessions until it stops, so you can copy in one session and paste in another. A session on another server uses that server's buffer. With nothing copied yet, `Ctrl-b ]` says the paste buffer is empty.
 - Copy mode belongs to the pane, so every client attached to the session sees it. It stays while you switch windows and panes, detach and attach again, or reload the config.
-- The copy keys and the colour of the position come from the config of the server that holds the session, like the pane borders: `amux.keymap.set("copy", "K", "halfpage_up")` binds a key there, and `amux.opt.theme.copy_position` colours the position. [docs/lua.md](docs/lua.md#copy-mode) lists the actions.
+- The copy keys and the colours of the position and the selection come from the config of the server that holds the session, like the pane borders: `amux.keymap.set("copy", "K", "halfpage_up")` binds a key there, and `amux.opt.theme.copy_position` and `amux.opt.theme.copy_selection` colour the position and the selection. [docs/lua.md](docs/lua.md#copy-mode) lists the actions.
 - `amux.action.copy_mode_page_up()` starts copy mode a page up, like tmux's `copy-mode -u`. It has no key, since `PageUp` after `Ctrl-b` turns the pages of the which-key popup. Bind it with `amux.keymap.set("root", "S-PageUp", amux.action.copy_mode_page_up())`.
 - Images are hidden while you browse: the pane shows only its text, and the images come back when you leave copy mode.
 - A program in the alternate screen, such as `vim`, `less` or `htop`, has no history there, so copy mode shows only its screen.

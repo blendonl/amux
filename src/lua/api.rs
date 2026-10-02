@@ -522,6 +522,7 @@ mod tests {
              assert(amux.keymap.get('picker', 'Enter') == 'pick')\n\
              amux.keymap.set('copy', 'C-k', 'halfpage_up')\n\
              amux.keymap.del('copy', 'q')\n\
+             amux.keymap.set('copy', 'C-v', 'clear_selection')\n\
              assert(amux.keymap.get('copy', 'g') == 'history_top')",
         )
         .keymap;
@@ -529,6 +530,10 @@ mod tests {
         assert_eq!(keymap.picker.get(&key("C-u")), None);
         assert_eq!(keymap.copy.get(&key("C-k")), Some(&CopyAction::HalfpageUp));
         assert_eq!(keymap.copy.get(&key("q")), None);
+        assert_eq!(
+            keymap.copy.get(&key("C-v")),
+            Some(&CopyAction::ClearSelection)
+        );
         for (notation, binding) in [
             ("|", Binding::SplitPane(Split::LeftRight)),
             ("D", Binding::Detach),
@@ -580,13 +585,13 @@ mod tests {
              keymap.clear('gone')\n\
              keymap.clear('tree')\n\
              keymap.set('tree', 'j', 'down')\n\
-             assert(keymap.get('copy', 'Escape') == 'cancel')\n\
+             assert(keymap.get('copy', 'Escape') == 'clear_selection_or_cancel')\n\
              keymap.clear('copy')\n\
              assert(keymap.get('copy', 'q') == nil)",
         )
         .keymap;
         assert_eq!(keymap.prefix.get(&key("&")), None);
-        assert_eq!(keymap.prefix.iter().count(), 28);
+        assert_eq!(keymap.prefix.iter().count(), 29);
         assert_eq!(keymap.copy.iter().count(), 0);
         assert_eq!(keymap.prompt.get(&key("C-u")), None);
         assert_eq!(keymap.custom["resize"].iter().count(), 0);
@@ -762,7 +767,7 @@ mod tests {
                  new_window, next_window, previous_window, select_window, split_pane, \
                  next_pane, select_pane, kill_pane, kill_window, rename_window, \
                  rename_session, cluster_tree, search_projects, search_worktrees, switch_table, \
-                 reload_config, which_key, copy_mode, copy_mode_page_up"
+                 reload_config, which_key, copy_mode, copy_mode_page_up, paste_buffer"
             ),
             "{error}"
         );
@@ -868,7 +873,7 @@ mod tests {
     #[test]
     fn every_action_constructor_is_exposed() {
         let names = variants::<Binding>();
-        assert_eq!(names.len(), 21);
+        assert_eq!(names.len(), 22);
         assert!(names.contains(&"switch_table"));
         assert!(!names.contains(&"callback"));
         let loaded = loaded("");

@@ -39,6 +39,7 @@ pub enum Binding {
     WhichKey(String),
     CopyMode,
     CopyModePageUp,
+    PasteBuffer,
     #[serde(skip)]
     Callback(CallbackId),
 }
@@ -68,6 +69,7 @@ impl Binding {
             Self::WhichKey(table) => format!("show {table} keys"),
             Self::CopyMode => "copy mode".into(),
             Self::CopyModePageUp => "copy mode, page up".into(),
+            Self::PasteBuffer => "paste buffer".into(),
             Self::Callback(_) => "lua function".into(),
         }
     }
@@ -164,6 +166,12 @@ pub enum CopyAction {
     HalfpageDown,
     PageUp,
     PageDown,
+    BeginSelection,
+    SelectLine,
+    OtherEnd,
+    ClearSelection,
+    CopySelectionAndCancel,
+    ClearSelectionOrCancel,
     Cancel,
     RefreshFromPane,
 }
@@ -388,6 +396,7 @@ fn prefix_table() -> Table<Binding> {
         (Key::char('r'), Binding::ReloadConfig),
         (Key::char('?'), Binding::WhichKey(PREFIX_TABLE.to_owned())),
         (Key::char('['), Binding::CopyMode),
+        (Key::char(']'), Binding::PasteBuffer),
         (Key::from(KeyCode::Up), Binding::SelectPane(Direction::Up)),
         (
             Key::from(KeyCode::Down),
@@ -476,9 +485,21 @@ fn copy_table() -> Table<CopyAction> {
         (Key::from(KeyCode::PageUp), CopyAction::PageUp),
         (Key::from(KeyCode::PageDown), CopyAction::PageDown),
         (Key::ctrl('f'), CopyAction::PageDown),
+        (Key::char('v'), CopyAction::BeginSelection),
+        (Key::char(' '), CopyAction::BeginSelection),
+        (Key::char('V'), CopyAction::SelectLine),
+        (Key::char('o'), CopyAction::OtherEnd),
+        (Key::char('y'), CopyAction::CopySelectionAndCancel),
+        (
+            Key::from(KeyCode::Enter),
+            CopyAction::CopySelectionAndCancel,
+        ),
         (Key::char('q'), CopyAction::Cancel),
         (Key::ctrl('c'), CopyAction::Cancel),
-        (Key::from(KeyCode::Escape), CopyAction::Cancel),
+        (
+            Key::from(KeyCode::Escape),
+            CopyAction::ClearSelectionOrCancel,
+        ),
         (Key::char('r'), CopyAction::RefreshFromPane),
     ]
     .into_iter()
@@ -546,12 +567,13 @@ mod tests {
             ("r", Binding::ReloadConfig),
             ("?", Binding::WhichKey(PREFIX_TABLE.into())),
             ("[", Binding::CopyMode),
+            ("]", Binding::PasteBuffer),
             ("Up", Binding::SelectPane(Direction::Up)),
             ("Left", Binding::SelectPane(Direction::Left)),
         ] {
             assert_eq!(prefix.get(&key(notation)), Some(&binding), "{notation}");
         }
-        assert_eq!(prefix.iter().count(), 29);
+        assert_eq!(prefix.iter().count(), 30);
         assert_eq!(prefix.get(&key("C-b")), None);
         assert_eq!(Keymap::default().root, Table::default());
     }
@@ -680,6 +702,7 @@ mod tests {
             (Binding::WhichKey(PREFIX_TABLE.into()), "show prefix keys"),
             (Binding::CopyMode, "copy mode"),
             (Binding::CopyModePageUp, "copy mode, page up"),
+            (Binding::PasteBuffer, "paste buffer"),
             (Binding::Callback(CallbackId(4)), "lua function"),
         ] {
             assert_eq!(binding.description(), description);
@@ -743,13 +766,21 @@ mod tests {
             ("C-u", CopyAction::HalfpageUp),
             ("C-f", CopyAction::PageDown),
             ("PageUp", CopyAction::PageUp),
+            ("v", CopyAction::BeginSelection),
+            ("Space", CopyAction::BeginSelection),
+            ("V", CopyAction::SelectLine),
+            ("o", CopyAction::OtherEnd),
+            ("y", CopyAction::CopySelectionAndCancel),
+            ("Enter", CopyAction::CopySelectionAndCancel),
             ("q", CopyAction::Cancel),
-            ("Escape", CopyAction::Cancel),
+            ("C-c", CopyAction::Cancel),
+            ("Escape", CopyAction::ClearSelectionOrCancel),
             ("r", CopyAction::RefreshFromPane),
         ] {
             assert_eq!(keymap.copy.get(&key(notation)), Some(&action), "{notation}");
         }
-        assert_eq!(keymap.copy.iter().count(), 35);
+        assert_eq!(keymap.copy.iter().count(), 41);
+        assert_eq!(keymap.copy.key_for(&CopyAction::ClearSelection), None);
         assert_eq!(keymap.copy.get(&key("C-b")), None);
         assert!(is_panel_table(COPY_TABLE));
         assert_eq!(keymap.table(COPY_TABLE), None);

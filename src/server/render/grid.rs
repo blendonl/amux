@@ -1,4 +1,5 @@
 use std::fmt;
+use std::ops::Range;
 
 use unicode_width::UnicodeWidthChar;
 use vt100::Color;
@@ -217,6 +218,30 @@ impl Grid {
             col = end;
         }
         self.repair_wide_cells(row, area.col, area.right());
+    }
+
+    pub fn restyle(&mut self, row: u16, cols: Range<u16>, clip: Rect, style: Style) {
+        let area = self.clip(clip);
+        let mut start = cols.start.max(area.col);
+        let mut end = cols.end.min(area.right());
+        if !(area.row..area.bottom()).contains(&row) || start >= end {
+            return;
+        }
+        if start > area.col
+            && self
+                .cell(row, start)
+                .is_some_and(Cell::is_wide_continuation)
+        {
+            start -= 1;
+        }
+        if end < area.right() && self.cell(row, end - 1).is_some_and(Cell::is_wide) {
+            end += 1;
+        }
+        for col in start..end {
+            if let Some(index) = self.index(row, col) {
+                self.cells[index].style = style;
+            }
+        }
     }
 
     pub fn paint_image(&mut self, span: &ImageSpan, clip: Rect) {
@@ -504,6 +529,39 @@ mod tests {
         let cut = grid.cell(0, 1).unwrap();
         assert!(cut.is_erased() && !cut.is_wide());
         assert_eq!(cut.style().bg, Color::Idx(2));
+    }
+
+    #[test]
+    fn restyling_covers_both_halves_of_a_wide_character_at_either_edge() {
+        let pane = screen(8, 1, "a中b文c");
+        let whole = rect(0, 0, 1, 8);
+        let mut grid = Grid::new(size(8, 1));
+        grid.paint(pane.screen(), whole);
+        let selected = Style {
+            inverse: true,
+            ..Style::default()
+        };
+        let styled = |grid: &Grid| -> Vec<bool> {
+            (0..8)
+                .map(|col| grid.cell(0, col).unwrap().style() == selected)
+                .collect()
+        };
+
+        grid.restyle(0, 2..5, whole, selected);
+        assert_eq!(
+            styled(&grid),
+            [false, true, true, true, true, true, false, false]
+        );
+        assert_eq!(row_text(&grid, 0), "a中b文c.");
+
+        let mut grid = Grid::new(size(8, 1));
+        grid.paint(pane.screen(), whole);
+        grid.restyle(0, 0..u16::MAX, rect(0, 2, 1, 3), selected);
+        grid.restyle(1, 0..8, whole, selected);
+        assert_eq!(
+            styled(&grid),
+            [false, false, true, true, true, false, false, false]
+        );
     }
 
     #[test]
