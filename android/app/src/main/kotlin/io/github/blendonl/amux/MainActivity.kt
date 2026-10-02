@@ -20,6 +20,7 @@ import com.termux.terminal.TerminalEmulator
 import com.termux.terminal.TerminalSession
 import com.termux.view.TerminalView
 import io.github.blendonl.amux.keyboard.ConfigFileWatcher
+import io.github.blendonl.amux.keyboard.ConfigStamp
 import io.github.blendonl.amux.keyboard.HandlerKeyTimer
 import io.github.blendonl.amux.keyboard.KeyboardHalfView
 import io.github.blendonl.amux.keyboard.KeyboardLayout
@@ -27,6 +28,7 @@ import io.github.blendonl.amux.keyboard.KeyboardLoader
 import io.github.blendonl.amux.keyboard.Side
 import io.github.blendonl.amux.keyboard.SplitKeyboard
 import io.github.blendonl.amux.keyboard.TerminalKeySink
+import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.time.Duration.Companion.seconds
@@ -37,9 +39,11 @@ class MainActivity : Activity() {
     private lateinit var input: InputPanels
     private lateinit var splitKeyboard: SplitKeyboard
     private var keyboardLoader: KeyboardLoader? = null
+    private var keyboardConfigDir: File? = null
     private var keyboardWatcher: ConfigFileWatcher? = null
     private val keyboardLoads = Executors.newSingleThreadExecutor()
     private val keyboardLoadQueued = AtomicBoolean(false)
+    private var keyboardStamp: ConfigStamp? = null
     private var keyboardLoaded = false
     private var keyboardProblem: String? = null
     private lateinit var status: StatusPanel
@@ -48,7 +52,10 @@ class MainActivity : Activity() {
     private var service: AmuxService? = null
     private var bound = false
     private var attachWhenReady = true
+    private var suspended = false
     private var userlandFailureShown = false
+    private val mainThread = Handler(Looper.getMainLooper())
+    private val suspendInBackground = Runnable(::suspendClient)
 
     private val serverObserver: (ServerState) -> Unit = { onServerState(it) }
 
@@ -88,18 +95,31 @@ class MainActivity : Activity() {
         bind()
     }
 
+    override fun onStart() {
+        super.onStart()
+        mainThread.removeCallbacks(suspendInBackground)
+        if (!suspended) return
+        suspended = false
+        reattach()
+    }
+
     override fun onResume() {
         super.onResume()
         reloadKeyboard()
     }
 
+    override fun onStop() {
+        mainThread.postDelayed(suspendInBackground, BACKGROUND_GRACE.inWholeMilliseconds)
+        super.onStop()
+    }
+
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        reloadKeyboard()
         input.configure(newConfig)
     }
 
     override fun onDestroy() {
+        mainThread.removeCallbacks(suspendInBackground)
         keyboardWatcher?.stop()
         keyboardLoads.shutdownNow()
         service?.stopObserving(serverObserver)
@@ -124,17 +144,22 @@ class MainActivity : Activity() {
     private fun loadKeyboardFrom(amux: AmuxEnvironment) {
         if (keyboardLoader != null) return
         val commands = AmuxCommands(amux)
+        keyboardConfigDir = amux.configDir
         keyboardLoader = KeyboardLoader { defaults -> commands.printKeyboard(defaults, KEYBOARD_TIMEOUT) }
-        keyboardWatcher = ConfigFileWatcher(amux.initFile, ::reloadKeyboard).also(ConfigFileWatcher::start)
+        keyboardWatcher = ConfigFileWatcher(amux.configDir, ::reloadKeyboard).also(ConfigFileWatcher::start)
         reloadKeyboard()
     }
 
     private fun reloadKeyboard() {
         val loader = keyboardLoader ?: return
+        val configDir = keyboardConfigDir ?: return
         if (!keyboardLoadQueued.compareAndSet(false, true)) return
         val keepCurrentOnFailure = keyboardLoaded
         keyboardLoads.execute {
             keyboardLoadQueued.set(false)
+            val stamp = ConfigStamp.of(configDir)
+            if (stamp == keyboardStamp) return@execute
+            keyboardStamp = stamp
             val loaded = loader.load(keepCurrentOnFailure)
             runOnUiThread { if (!isDestroyed) applyKeyboard(loaded) }
         }
@@ -165,6 +190,10 @@ class MainActivity : Activity() {
     }
 
     private fun onServerState(state: ServerState) {
+        if (suspended && state == ServerState.Stopped) {
+            suspended = false
+            showDetached(getString(R.string.status_stopped), null)
+        }
         if (!attachWhenReady) return
         when (state) {
             ServerState.Ready -> attachOrWarn()
@@ -216,6 +245,15 @@ class MainActivity : Activity() {
         val exitStatus = finished.exitStatus
         val detail = if (exitStatus == 0) null else getString(R.string.status_client_exited, exitStatus)
         showDetached(getString(R.string.status_detached), detail)
+    }
+
+    private fun suspendClient() {
+        val client = session
+        if (client == null && !attachWhenReady) return
+        session = null
+        attachWhenReady = false
+        suspended = true
+        client?.finishIfRunning()
     }
 
     private fun reattach() {
@@ -275,5 +313,6 @@ class MainActivity : Activity() {
         const val CLIENT_ARGV0 = "amux"
         const val NOTIFICATION_PERMISSION_REQUEST = 1
         val KEYBOARD_TIMEOUT = 10.seconds
+        val BACKGROUND_GRACE = 5.seconds
     }
 }
