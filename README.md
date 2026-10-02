@@ -566,7 +566,7 @@ notes      4b825dc642cb6eb9a060e54bf8d69288fbee4904
 
 The Android app is a terminal that runs the real amux binary on the phone, with zsh, git and ssh in its panes. It opens straight into `amux`, which attaches to the most recent session or creates one, and a foreground service keeps the server running while the app is in the background. The phone then joins the cluster like any other machine (see [Joining the cluster from the phone](#joining-the-cluster-from-the-phone)).
 
-The app needs Android 10 (API 29) or later on arm64 or x86_64, and its zsh, git and ssh only work for the phone's primary user (see [Limits](#limits)). Its build, unit tests and lint run in a container, and its binary and userland run in a Termux container, but it hasn't been tried on a real phone yet.
+The app needs Android 10 (API 29) or later on arm64, or on x86_64 for a debug build, and its zsh, git and ssh only work for the phone's primary user (see [Limits](#limits)). Its build, unit tests and lint run in a container, and its binary and userland run in a Termux container, but it hasn't been tried on a real phone yet.
 
 #### Building and installing
 
@@ -582,19 +582,19 @@ The first run builds the image, which is about 4 GB and takes several minutes, a
 | Command                              | Does                                                                                                           |
 | ------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
 | `./android/build.sh image`           | Builds the `amux-android-build` image when it is missing or `android/docker/Dockerfile` has changed            |
-| `./android/build.sh binary`          | Cross-compiles amux with the NDK and writes the stripped binaries to `android/app/src/main/jniLibs/`           |
+| `./android/build.sh binary`          | Cross-compiles amux with the `dist` profile and writes the stripped binaries to `android/app/src/main/jniLibs` |
 | `./android/build.sh userland`        | Builds the userland for aarch64 and x86_64 in `android/.cache/userland/`, unless it is up to date              |
 | `./android/build.sh userland-check`  | Checks the libraries the userland's programs need, and runs the x86_64 userland in a Termux container          |
 | `./android/build.sh userland-inputs` | Prints the hash of the userland's inputs, which `userland` compares with the last build's to skip it           |
 | `./android/build.sh package`         | Splits each userland into `libu_*.so` files in `jniLibs/` and a zip in `android/app/src/main/assets/userland/` |
 | `./android/build.sh smoke`           | Runs the x86_64 binary and userland in a Termux container, laid out as the app lays them out                   |
 | `./android/build.sh apk`             | Builds the debug APK from those files, runs the JVM unit tests and lint, and prints what the APK holds         |
-| `./android/build.sh release-apk`     | Builds the release APK the same way, signed with the release key, and prints its signing certificate           |
+| `./android/build.sh release-apk`     | Builds the arm64-only release APK the same way, signed with the release key, and prints its certificate        |
 | `./android/build.sh all`             | `image`, `binary`, `userland`, `package`, `smoke` and `apk`, in that order                                     |
 
 Every step but `userland`, `userland-check` and `userland-inputs` builds the image first when it is out of date. A step that needs the output of an earlier one stops when that output is missing and names the step to run, so `apk` without the zips or the `libu_*.so` files says to run `package` first. The cargo and Gradle caches, the termux-packages checkout and the userland live in `android/.cache`, which git ignores.
 
-`release-apk` is the step the release workflow runs (see [Releasing](#releasing)). It needs `AMUX_RELEASE_KEYSTORE`, the path of the keystore, `AMUX_RELEASE_KEYSTORE_PASSWORD` and `AMUX_RELEASE_KEY_ALIAS`, and stops when one is missing. It writes `android/app/build/outputs/apk/release/app-release.apk`, which isn't debuggable.
+`release-apk` is the step the release workflow runs (see [Releasing](#releasing)). It needs `AMUX_RELEASE_KEYSTORE`, the path of the keystore, `AMUX_RELEASE_KEYSTORE_PASSWORD` and `AMUX_RELEASE_KEY_ALIAS`, and stops when one is missing. It writes `android/app/build/outputs/apk/release/app-release.apk`, which isn't debuggable and carries only arm64-v8a: Gradle's `amux.abis` property, which defaults to both ABIs, leaves out x86_64's libraries and userland zip, and the step fails if any x86_64 file is left in the APK.
 
 `userland` builds the packages in `android/userland/packages.txt`, and everything they depend on, with [termux-packages](https://github.com/termux/termux-packages). `android/userland/termux-packages.txt` pins its commit and its `ghcr.io/termux/package-builder` image. The step clones that commit into `android/.cache/termux-packages`, applies the patches in `android/userland/overlay/`, and builds every package from source for aarch64 and x86_64, with the app's package name, `io.github.blendonl.amux`, in place of Termux's. Termux's own packages can't be used, since every path in them points into Termux's data directory. The build runs in a container named `amux-userland-builder`, which stays for the next run. The step then extracts the packages into `android/.cache/userland/<arch>/prefix/`, without headers, static libraries and other build files, and collects their sources (see [Licenses and sources](#licenses-and-sources)).
 
