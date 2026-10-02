@@ -36,6 +36,7 @@ impl fmt::Display for ChannelEnd {
 
 pub(super) struct Channels {
     bulk: mpsc::Sender<PeerMessage>,
+    interactive: mpsc::Sender<PeerMessage>,
     control: mpsc::Sender<PeerMessage>,
     stop: Arc<Notify>,
     table: Mutex<Table>,
@@ -62,11 +63,13 @@ struct Hosted {
 impl Channels {
     pub fn new(
         bulk: mpsc::Sender<PeerMessage>,
+        interactive: mpsc::Sender<PeerMessage>,
         control: mpsc::Sender<PeerMessage>,
         stop: Arc<Notify>,
     ) -> Arc<Self> {
         Arc::new(Self {
             bulk,
+            interactive,
             control,
             stop,
             table: Mutex::default(),
@@ -98,7 +101,7 @@ impl Channels {
             end,
             channels: Arc::clone(self),
         };
-        self.bulk
+        self.interactive
             .send(PeerMessage::ChannelOpen { id, first })
             .await
             .map_err(|_| anyhow!("the link is down"))?;
@@ -307,7 +310,7 @@ impl Channel {
             message,
         };
         self.channels
-            .bulk
+            .interactive
             .send(message)
             .await
             .map_err(|_| anyhow!("the link is down"))

@@ -24,6 +24,7 @@ use crate::settings::ClusterSettings;
 
 const PING_INTERVAL_ENV: &str = "AMUX_PING_INTERVAL_MS";
 const CONTROL_CAPACITY: usize = 64;
+const INTERACTIVE_CAPACITY: usize = 64;
 const BULK_CAPACITY: usize = 16;
 
 pub fn with_env(settings: ClusterSettings) -> Result<ClusterSettings> {
@@ -85,22 +86,33 @@ pub(super) struct LinkHandle {
 
 struct Lanes {
     control: mpsc::Sender<PeerMessage>,
-    control_lane: mpsc::Receiver<PeerMessage>,
     bulk: mpsc::Sender<PeerMessage>,
-    bulk_lane: mpsc::Receiver<PeerMessage>,
+    outbound: Outbound,
     stop: Arc<Notify>,
     finishing: watch::Receiver<bool>,
     stats: Arc<LinkStats>,
     channels: Arc<Channels>,
 }
 
+struct Outbound {
+    control: mpsc::Receiver<PeerMessage>,
+    interactive: mpsc::Receiver<PeerMessage>,
+    bulk: mpsc::Receiver<PeerMessage>,
+}
+
 fn new_lanes() -> (LinkHandle, Lanes) {
     let (control, control_lane) = mpsc::channel(CONTROL_CAPACITY);
+    let (interactive, interactive_lane) = mpsc::channel(INTERACTIVE_CAPACITY);
     let (bulk, bulk_lane) = mpsc::channel(BULK_CAPACITY);
     let (finish, finishing) = watch::channel(false);
     let stop = Arc::new(Notify::new());
     let stats = Arc::new(LinkStats::new());
-    let channels = Channels::new(bulk.clone(), control.clone(), Arc::clone(&stop));
+    let channels = Channels::new(
+        bulk.clone(),
+        interactive,
+        control.clone(),
+        Arc::clone(&stop),
+    );
     let handle = LinkHandle {
         control: control.clone(),
         stop: Arc::clone(&stop),
@@ -110,9 +122,12 @@ fn new_lanes() -> (LinkHandle, Lanes) {
     };
     let lanes = Lanes {
         control,
-        control_lane,
         bulk,
-        bulk_lane,
+        outbound: Outbound {
+            control: control_lane,
+            interactive: interactive_lane,
+            bulk: bulk_lane,
+        },
         stop,
         finishing,
         stats,
@@ -324,9 +339,8 @@ where
     } = link;
     let Lanes {
         control,
-        control_lane,
         bulk,
-        bulk_lane,
+        outbound,
         stop,
         finishing,
         stats,
@@ -334,7 +348,7 @@ where
     } = lanes;
 
     let mut tasks = JoinSet::new();
-    tasks.spawn(write_lanes(writer, control_lane, bulk_lane, finishing));
+    tasks.spawn(write_lanes(writer, outbound, finishing));
     tasks.spawn(read_frames(
         reader,
         Reader {
@@ -367,13 +381,17 @@ where
 
 async fn write_lanes<W>(
     mut writer: W,
-    mut control: mpsc::Receiver<PeerMessage>,
-    mut bulk: mpsc::Receiver<PeerMessage>,
+    outbound: Outbound,
     mut finishing: watch::Receiver<bool>,
 ) -> LinkEnd
 where
     W: AsyncWrite + Unpin,
 {
+    let Outbound {
+        mut control,
+        mut interactive,
+        mut bulk,
+    } = outbound;
     loop {
         let message = tokio::select! {
             biased;
@@ -390,6 +408,7 @@ where
                 let _ = writer.shutdown().await;
                 return LinkEnd::Finished;
             }
+            Some(message) = interactive.recv() => message,
             message = bulk.recv() => match message {
                 Some(message) => message,
                 None => return LinkEnd::ServerGone,
@@ -621,8 +640,9 @@ mod tests {
     };
     use crate::identity::{Incarnation, ServerIdentity};
     use crate::protocol::{
-        ClientMessage, Duplex, Event, ServerMessage, ServerState, ServerStatus, SessionId,
-        SessionInfo, Snapshot, StateEvent, TcpKind, Version, WindowSummary, PROTOCOL_MAJOR,
+        read_message, ChannelId, ClientMessage, Duplex, Event, ServerMessage, ServerState,
+        ServerStatus, SessionId, SessionInfo, Snapshot, StateEvent, TcpKind, Version,
+        WindowSummary, PROTOCOL_MAJOR,
     };
     use crate::settings::DiscoverySettings;
 
@@ -1279,6 +1299,54 @@ mod tests {
             higher.cluster.view()[0].status,
             ServerStatus::Offline { stopped: true, .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn the_writer_sends_control_then_channel_input_then_bulk_messages() {
+        let (control, control_lane) = mpsc::channel(CONTROL_CAPACITY);
+        let (interactive, interactive_lane) = mpsc::channel(INTERACTIVE_CAPACITY);
+        let (bulk, bulk_lane) = mpsc::channel(BULK_CAPACITY);
+        let (_finish, finishing) = watch::channel(false);
+        let id = ChannelId(1);
+        let frame = |index: u8| PeerMessage::ChannelToClient {
+            id,
+            message: ServerMessage::Output(vec![index]),
+        };
+        let input = |index: u8| PeerMessage::ChannelToHost {
+            id,
+            message: ClientMessage::Input(vec![index]),
+        };
+        let credit = |index: u8| PeerMessage::ChannelCredit {
+            id,
+            credit: u32::from(index),
+        };
+        for index in 0..3 {
+            bulk.send(frame(index)).await.unwrap();
+            interactive.send(input(index)).await.unwrap();
+            control.send(credit(index)).await.unwrap();
+        }
+        drop((control, interactive, bulk));
+
+        let mut written = Vec::new();
+        let outbound = Outbound {
+            control: control_lane,
+            interactive: interactive_lane,
+            bulk: bulk_lane,
+        };
+        let end = write_lanes(&mut written, outbound, finishing).await;
+
+        assert!(matches!(end, LinkEnd::ServerGone), "{end}");
+        let mut frames = written.as_slice();
+        let mut sent = Vec::new();
+        while let Some(message) = read_message::<_, PeerMessage>(&mut frames).await.unwrap() {
+            sent.push(message);
+        }
+        let expected: Vec<PeerMessage> = (0..3)
+            .map(credit)
+            .chain((0..3).map(input))
+            .chain((0..3).map(frame))
+            .collect();
+        assert_eq!(sent, expected);
     }
 
     #[tokio::test]
