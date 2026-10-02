@@ -250,6 +250,46 @@ class SplitKeyboardTest {
     }
 
     @Test
+    fun `a repeat notifies no listener`() {
+        val left = key("Left")
+        var changes = 0
+        keyboard.press(left)
+        keyboard.addListener { changes++ }
+        keyboard.repeat(left)
+        keyboard.repeat(left)
+        keyboard.release(left)
+
+        assertEquals(listOf(leftCode, leftCode, leftCode), sink.events)
+        assertEquals(0, changes)
+    }
+
+    @Test
+    fun `a one-shot ctrl notifies once when a key uses it`() {
+        tap(ctrl)
+        var changes = 0
+        keyboard.addListener { changes++ }
+        tapLeft(0)
+        tapLeft(0)
+
+        assertEquals(listOf("C-a", "a"), sink.events)
+        assertEquals(1, changes)
+    }
+
+    @Test
+    fun `a popup notifies when it opens, changes choice and closes`() {
+        var changes = 0
+        keyboard.addListener { changes++ }
+        keyboard.press(f)
+        timer.advance(300)
+        keyboard.select(1)
+        keyboard.select(1)
+        keyboard.release(f)
+
+        assertEquals(listOf("C-f"), sink.events)
+        assertEquals(3, changes)
+    }
+
+    @Test
     fun `reports latch state for drawing`() {
         tap(shift)
 
