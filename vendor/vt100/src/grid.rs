@@ -76,7 +76,7 @@ impl Grid {
 
         self.size = size;
         for row in &mut self.rows {
-            row.resize(size.cols, crate::Cell::new());
+            row.resize(size.cols);
         }
         self.rows.resize_with(usize::from(size.rows), || {
             crate::row::Row::new(size.cols)
@@ -543,7 +543,7 @@ impl Grid {
         for _ in 0..(count.min(size.cols - pos.col)) {
             row.remove(pos.col);
         }
-        row.resize(size.cols, crate::Cell::new());
+        row.resize(size.cols);
     }
 
     pub fn erase_cells(&mut self, count: u16, attrs: crate::attrs::Attrs) {
@@ -555,46 +555,82 @@ impl Grid {
         }
     }
 
+    fn recycle_row(&mut self, from: usize, to: usize) {
+        let mut row = self.rows.remove(from);
+        row.recycle(self.size.cols);
+        self.rows.insert(to, row);
+    }
+
     pub fn insert_lines(&mut self, count: u16) {
         for _ in 0..count {
-            self.rows.remove(usize::from(self.scroll_bottom));
-            self.rows.insert(usize::from(self.pos.row), self.new_row());
+            self.recycle_row(
+                usize::from(self.scroll_bottom),
+                usize::from(self.pos.row),
+            );
             // self.scroll_bottom is maintained to always be a valid row
             self.rows[usize::from(self.scroll_bottom)].wrap(false);
         }
     }
 
     pub fn delete_lines(&mut self, count: u16) {
+        let row = usize::from(self.pos.row);
+        let below_region = usize::from(self.scroll_bottom) + 1;
         for _ in 0..(count.min(self.size.rows - self.pos.row)) {
-            self.rows
-                .insert(usize::from(self.scroll_bottom) + 1, self.new_row());
-            self.rows.remove(usize::from(self.pos.row));
-        }
-    }
-
-    pub fn scroll_up(&mut self, count: u16) {
-        for _ in 0..(count.min(self.size.rows - self.scroll_top)) {
-            self.rows
-                .insert(usize::from(self.scroll_bottom) + 1, self.new_row());
-            let removed = self.rows.remove(usize::from(self.scroll_top));
-            if self.scrollback_len > 0 && !self.scroll_region_active() {
-                self.scrollback.push_back(removed);
-                while self.scrollback.len() > self.scrollback_len {
-                    self.scrollback.pop_front();
+            match row.cmp(&below_region) {
+                std::cmp::Ordering::Less => {
+                    self.recycle_row(row, below_region - 1);
                 }
-                if self.scrollback_offset > 0 {
-                    self.scrollback_offset =
-                        self.scrollback.len().min(self.scrollback_offset + 1);
+                std::cmp::Ordering::Equal => {}
+                std::cmp::Ordering::Greater => {
+                    self.recycle_row(row - 1, below_region);
                 }
             }
         }
     }
 
+    pub fn scroll_up(&mut self, count: u16) {
+        for _ in 0..(count.min(self.size.rows - self.scroll_top)) {
+            let removed = self.rows.remove(usize::from(self.scroll_top));
+            let unused =
+                if self.scrollback_len > 0 && !self.scroll_region_active() {
+                    self.push_scrollback(removed)
+                } else {
+                    Some(removed)
+                };
+            let row = match unused {
+                Some(mut row) => {
+                    row.recycle(self.size.cols);
+                    row
+                }
+                None => self.new_row(),
+            };
+            self.rows.insert(usize::from(self.scroll_bottom), row);
+        }
+    }
+
+    fn push_scrollback(
+        &mut self,
+        row: crate::row::Row,
+    ) -> Option<crate::row::Row> {
+        let dropped = if self.scrollback.len() >= self.scrollback_len {
+            self.scrollback.pop_front()
+        } else {
+            None
+        };
+        self.scrollback.push_back(row);
+        if self.scrollback_offset > 0 {
+            self.scrollback_offset =
+                self.scrollback.len().min(self.scrollback_offset + 1);
+        }
+        dropped
+    }
+
     pub fn scroll_down(&mut self, count: u16) {
         for _ in 0..count {
-            self.rows.remove(usize::from(self.scroll_bottom));
-            self.rows
-                .insert(usize::from(self.scroll_top), self.new_row());
+            self.recycle_row(
+                usize::from(self.scroll_bottom),
+                usize::from(self.scroll_top),
+            );
             // self.scroll_bottom is maintained to always be a valid row
             self.rows[usize::from(self.scroll_bottom)].wrap(false);
         }
