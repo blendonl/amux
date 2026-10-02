@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use snow::params::DHChoice;
 use snow::resolvers::{CryptoResolver, DefaultResolver};
 use snow::{Builder, HandshakeState, StatelessTransportState};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::sync::oneshot;
 use tracing::debug;
 
@@ -22,6 +22,8 @@ pub const MAX_PLAINTEXT_LEN: usize = MAX_MESSAGE_LEN - TAG_LEN;
 const NOISE_KEY_FILE_MODE: u32 = 0o600;
 const PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 const TAG_LEN: usize = 16;
+const NOISE_LEN_PREFIX: usize = 2;
+const MAX_NOISE_FRAME_LEN: usize = NOISE_LEN_PREFIX + MAX_MESSAGE_LEN;
 const MAX_OPENING_LEN: u32 = 64;
 const PIPE_CAPACITY: usize = 64 * 1024;
 const LINGER: Duration = Duration::from_secs(2);
@@ -259,18 +261,21 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut chunk = vec![0; MAX_PLAINTEXT_LEN];
-    let mut message = vec![0; MAX_MESSAGE_LEN];
+    let mut frame = vec![0; MAX_NOISE_FRAME_LEN];
     let mut nonce = 0;
     loop {
         let len = plain.read(&mut chunk).await?;
         if len == 0 {
             break;
         }
+        let (prefix, message) = frame.split_at_mut(NOISE_LEN_PREFIX);
         let sealed = transport
-            .write_message(nonce, &chunk[..len], &mut message)
+            .write_message(nonce, &chunk[..len], message)
             .context("encrypting a noise message")?;
         nonce += 1;
-        write_noise_frame(&mut wire, &message[..sealed]).await?;
+        prefix.copy_from_slice(&noise_len_prefix(sealed)?);
+        wire.write_all(&frame[..NOISE_LEN_PREFIX + sealed]).await?;
+        wire.flush().await?;
     }
     wire.shutdown().await?;
     Ok(())
@@ -295,12 +300,14 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let mut wire = BufReader::with_capacity(MAX_NOISE_FRAME_LEN, wire);
+    let mut received = vec![0; MAX_MESSAGE_LEN];
     let mut chunk = vec![0; MAX_MESSAGE_LEN];
     let mut nonce = 0;
     let mut delivering = true;
-    while let Some(message) = read_noise_frame(wire).await? {
+    while let Some(message) = read_noise_frame_into(&mut wire, &mut received).await? {
         let len = transport
-            .read_message(nonce, &message, &mut chunk)
+            .read_message(nonce, message, &mut chunk)
             .context("decrypting a noise message")?;
         nonce += 1;
         if delivering && plain.write_all(&chunk[..len]).await.is_err() {
@@ -314,28 +321,57 @@ async fn write_noise_frame<W>(writer: &mut W, message: &[u8]) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let len = u16::try_from(message.len())
-        .with_context(|| format!("a noise message of {} bytes is too long", message.len()))?;
-    let mut frame = Vec::with_capacity(message.len() + 2);
-    frame.extend_from_slice(&len.to_be_bytes());
+    let len = noise_len_prefix(message.len())?;
+    let mut frame = Vec::with_capacity(message.len() + NOISE_LEN_PREFIX);
+    frame.extend_from_slice(&len);
     frame.extend_from_slice(message);
     writer.write_all(&frame).await?;
     writer.flush().await?;
     Ok(())
 }
 
+fn noise_len_prefix(len: usize) -> Result<[u8; NOISE_LEN_PREFIX]> {
+    let len = u16::try_from(len)
+        .with_context(|| format!("a noise message of {len} bytes is too long"))?;
+    Ok(len.to_be_bytes())
+}
+
 async fn read_noise_frame<R>(reader: &mut R) -> Result<Option<Vec<u8>>>
 where
     R: AsyncRead + Unpin,
 {
-    let len = match reader.read_u16().await {
-        Ok(len) => len,
-        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(err) => return Err(err.into()),
+    let Some(len) = read_noise_len(reader).await? else {
+        return Ok(None);
     };
-    let mut message = vec![0; usize::from(len)];
+    let mut message = vec![0; len];
     reader.read_exact(&mut message).await?;
     Ok(Some(message))
+}
+
+async fn read_noise_frame_into<'a, R>(
+    reader: &mut R,
+    buffer: &'a mut [u8],
+) -> Result<Option<&'a [u8]>>
+where
+    R: AsyncRead + Unpin,
+{
+    let Some(len) = read_noise_len(reader).await? else {
+        return Ok(None);
+    };
+    let message = &mut buffer[..len];
+    reader.read_exact(message).await?;
+    Ok(Some(message))
+}
+
+async fn read_noise_len<R>(reader: &mut R) -> Result<Option<usize>>
+where
+    R: AsyncRead + Unpin,
+{
+    match reader.read_u16().await {
+        Ok(len) => Ok(Some(usize::from(len))),
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(err) => Err(err.into()),
+    }
 }
 
 #[cfg(test)]
@@ -445,6 +481,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(received, sent);
+    }
+
+    #[tokio::test]
+    async fn frames_written_one_byte_at_a_time_still_open() {
+        let (initiator, responder) = transports();
+        let pasted = payload(3);
+        let typed: [&[u8]; 3] = [b"echo hi\r", &pasted[..1000], b"exit\r"];
+        let mut wire = Vec::new();
+        seal(
+            typed[0].chain(typed[1]).chain(typed[2]),
+            &mut wire,
+            &initiator,
+        )
+        .await
+        .unwrap();
+        assert_eq!(frame_lengths(&wire).len(), typed.len());
+
+        let (mut writer, reader) = duplex(1);
+        let trickle = tokio::spawn(async move {
+            for byte in wire {
+                writer.write_all(&[byte]).await.unwrap();
+            }
+        });
+        let mut received = Vec::new();
+        unseal(reader, &mut received, &responder).await.unwrap();
+        trickle.await.unwrap();
+
+        assert_eq!(received, typed.concat());
     }
 
     #[tokio::test]
