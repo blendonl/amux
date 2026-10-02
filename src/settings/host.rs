@@ -31,7 +31,7 @@ impl Default for PaneSettings {
         Self {
             shell: None,
             term: "screen-256color".into(),
-            scrollback: 10_000,
+            scrollback: 2_000,
             env: BTreeMap::new(),
             strip_env: vec!["SSH_".into()],
             images: true,

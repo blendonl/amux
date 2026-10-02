@@ -264,6 +264,12 @@ amux.on("session_created", function(event) amux.log("new session " .. event.sess
 
 `name` defaults to the hostname and `projects_dir` to `~/projects`. A leading `~` in `projects_dir`, `worktrees_dir` and `search.project_dirs` means your home directory. Each entry under `servers` is a peer to link to. Each entry under `projects` is keyed by project name: `default_server` is where `amux new` puts that project's sessions when you don't pass `--on`, and `worktrees_dir` is where its worktrees go instead of the default `<checkout>/../<project>-worktrees`.
 
+```lua
+amux.opt.pane.scrollback = 10000
+```
+
+`amux.opt.pane.scrollback` is the number of lines of history each pane keeps, which is how far back copy mode can go. The default is 2,000 and the most is 100,000. History costs about 36 bytes per cell, so a busy 200-column pane holds roughly 14 MB of it at the default and 72 MB at 10,000 lines. A reload applies a new value to the panes opened after it, and running panes keep the history they started with.
+
 `amux.opt.discovery` controls how servers find each other without a config entry (see [Cluster](#cluster)):
 
 | Option           | Default                                    | Means                                                                 |
@@ -316,7 +322,7 @@ A config that fails to load changes nothing. The running settings, bindings and 
 What a reload changes:
 
 - **The client**: the prefix, the key bindings, the status bar, the tree, the which-key popup, the search directories, the theme, and the notice and escape times, right away. An open prompt, tree or which-key popup closes.
-- **Panes and windows**: the ones opened after the reload get the new `pane`, `window` and session naming settings. Panes that are already running keep the shell, `TERM` and environment they started with. Pane borders are drawn again with the new `borders` and theme.
+- **Panes and windows**: the ones opened after the reload get the new `pane`, `window` and session naming settings. Panes that are already running keep the shell, `TERM`, environment and history length they started with. Pane borders are drawn again with the new `borders` and theme.
 - **Projects**: `projects` and `projects_dir` apply to the next session.
 - **Images**: `images.memory_mb` and `images.client_memory_mb` apply right away, and so does `images.client` in the client. `pane.images` and `pane.sixel` apply to the panes opened after the reload.
 - **The cluster**: servers added to `amux.opt.servers` or `servers.lua` are linked, and removed ones are dropped. The status interval applies right away, and the other `cluster` timings to the next dial, backoff and link.
