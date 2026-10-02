@@ -1,4 +1,4 @@
-// Modified by amux: owns the kitty image bitmap cache, resends the pty size when the cell pixel size changes and reads placeholder cells as spaces
+// Modified by amux: owns the kitty image bitmap cache, resends the pty size when the cell pixel size changes, reads placeholder cells as spaces and rebuilds the accessibility text at most every 300 ms
 package com.termux.view;
 
 import android.annotation.SuppressLint;
@@ -128,6 +128,11 @@ public final class TerminalView extends View {
     private String[] mAutoFillHints = new String[0];
 
     private final boolean mAccessibilityEnabled;
+    private final Runnable mAccessibilityTextUpdate = this::updateAccessibilityText;
+    private boolean mAccessibilityTextPending;
+    private long mAccessibilityTextUpdatedAt;
+
+    private static final long ACCESSIBILITY_TEXT_INTERVAL_MS = 300;
 
     private static final String LOG_TAG = "TerminalView";
 
@@ -484,7 +489,24 @@ public final class TerminalView extends View {
         mEmulator.clearScrollCounter();
 
         invalidate();
-        if (mAccessibilityEnabled) setContentDescription(getText());
+        if (mAccessibilityEnabled) scheduleAccessibilityText();
+    }
+
+    private void scheduleAccessibilityText() {
+        if (mAccessibilityTextPending) return;
+        final long wait = mAccessibilityTextUpdatedAt + ACCESSIBILITY_TEXT_INTERVAL_MS - SystemClock.uptimeMillis();
+        if (wait <= 0) {
+            updateAccessibilityText();
+            return;
+        }
+        mAccessibilityTextPending = true;
+        postDelayed(mAccessibilityTextUpdate, wait);
+    }
+
+    private void updateAccessibilityText() {
+        mAccessibilityTextPending = false;
+        mAccessibilityTextUpdatedAt = SystemClock.uptimeMillis();
+        if (mEmulator != null) setContentDescription(getText());
     }
 
     /** This must be called by the hosting activity in {@link Activity#onContextMenuClosed(Menu)}
