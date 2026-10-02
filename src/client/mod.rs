@@ -1,4 +1,5 @@
 mod chrome;
+mod clipboard;
 mod fuzzy;
 pub(crate) mod graphics;
 mod listing;

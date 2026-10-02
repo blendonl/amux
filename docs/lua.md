@@ -259,6 +259,23 @@ amux.opt.images.client = "off"
 amux.opt.images.client_memory_mb = 64
 ```
 
+## Clipboard
+
+Text that amux copies, such as a selection yanked in copy mode, goes to the clipboard of the client that copied it. The client writes it to its terminal, runs a command with it, or both.
+
+| Option    | Default | Is                                                                                         |
+| --------- | ------- | ------------------------------------------------------------------------------------------ |
+| `osc52`   | `true`  | Whether the client writes the text to its terminal as an OSC 52 sequence, which puts it on the clipboard of the machine the terminal runs on, over SSH too |
+| `command` | none    | A program and its arguments, run on the client's machine with the text on standard input, such as `{ "wl-copy" }`, `{ "xclip", "-selection", "clipboard" }` or `{ "pbcopy" }`. Its output is thrown away, and when it can't start or fails, the error shows on the status row |
+
+Both live under `amux.opt.clipboard`, and the client reads them, so a reload applies them to the next copy. Copied text past 1 MiB is cut off.
+
+Most terminals take OSC 52, among them kitty, ghostty, WezTerm, foot, Alacritty and the amux app. Some, such as GNOME Terminal, ignore it, and iTerm2 only takes it once you allow it in its settings; set `command` for those. On Android, the app's terminal takes OSC strings of up to 8,192 characters, so about 6 KB of copied text reaches the phone's clipboard, and a longer copy doesn't.
+
+```lua
+amux.opt.clipboard.command = { "wl-copy" }
+```
+
 ## The status bar
 
 | Option                | Default                  | Is                                                                 |

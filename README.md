@@ -330,6 +330,11 @@ luarc    /home/you/.config/amux/.luarc.json
 
 The types know which functions only the client or only the server has, and `amux.on` knows the fields of each event, so `amux.on("pane_exited", function(event) … end)` completes `event.status`. `amux config check` still has the last word, since the language server can't run the config.
 
+`amux.opt.clipboard` decides where the text you copy goes. With `osc52`, the default, the client that copied writes it to its terminal as an OSC 52 sequence, which puts it on the clipboard of the machine the terminal runs on, through SSH too. `command` runs a program on the client's machine with the text on standard input, for terminals that ignore OSC 52. On Android, the app's terminal takes OSC strings of up to 8,192 characters, so about 6 KB of copied text reaches the phone's clipboard. [docs/lua.md](docs/lua.md#clipboard) has the details.
+
+```lua
+amux.opt.clipboard.command = { "wl-copy" }
+```
 #### Reloading
 
 A change to the config takes effect without a restart:

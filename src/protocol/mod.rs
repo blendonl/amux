@@ -13,12 +13,12 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 pub use client::{
-    is_locale_variable, AnimationControl, AnimationState, AttachedSession, CellPixels,
-    ClientMessage, ClientTerminal, ClusterStatus, DebugCommand, Direction, DiscoveryReport,
-    DiscoveryStatus, DiscoveryView, FrameSpec, ImageFormat, ImageOp, LinkInfo, LinkState,
-    LinkTransport, NewSession, ProjectCheckout, ProjectRef, ServerMessage, ServerStatus,
+    cap_clipboard, is_locale_variable, AnimationControl, AnimationState, AttachedSession,
+    CellPixels, ClientMessage, ClientTerminal, ClusterStatus, DebugCommand, Direction,
+    DiscoveryReport, DiscoveryStatus, DiscoveryView, FrameSpec, ImageFormat, ImageOp, LinkInfo,
+    LinkState, LinkTransport, NewSession, ProjectCheckout, ProjectRef, ServerMessage, ServerStatus,
     ServerView, SessionCommand, SessionId, SessionInfo, SessionState, Size, SourceState,
-    SourceView, Split, Via, WindowSummary, MIN_COLS, MIN_ROWS,
+    SourceView, Split, Via, WindowSummary, MAX_CLIPBOARD_LEN, MIN_COLS, MIN_ROWS,
 };
 pub use greeting::{
     accept, cli_version, greet, Greeting, IncompatibleServer, Role, TcpKind, TcpOpen, Version,
@@ -430,6 +430,47 @@ mod tests {
             postcard::to_stdvec(&frame).unwrap(),
             [3, 1, 0, 0, 0, 0, 0, 0, 0, 2, 2, 3, 1, 3, 3, 7, 8, 9, 1]
         );
+    }
+
+    #[tokio::test]
+    async fn clipboard_text_survives_a_round_trip() {
+        let (mut server, mut client) = byte_pipe(1024);
+        let sent = ServerMessage::Clipboard("naïve 日本\n\tdone".into());
+        write_message(&mut server, &sent).await.unwrap();
+
+        assert_eq!(
+            read_message::<_, ServerMessage>(&mut client).await.unwrap(),
+            Some(sent)
+        );
+    }
+
+    #[test]
+    fn clipboard_text_within_the_cap_is_kept_whole() {
+        assert_eq!(cap_clipboard(String::new()), "");
+        assert_eq!(cap_clipboard("naïve 日本".into()), "naïve 日本");
+        let full = "a".repeat(MAX_CLIPBOARD_LEN);
+        assert_eq!(cap_clipboard(full.clone()), full);
+    }
+
+    #[test]
+    fn clipboard_text_over_the_cap_is_cut_at_the_cap() {
+        let text = "a".repeat(MAX_CLIPBOARD_LEN + 10);
+        assert_eq!(cap_clipboard(text), "a".repeat(MAX_CLIPBOARD_LEN));
+    }
+
+    #[test]
+    fn clipboard_text_is_never_cut_inside_a_character() {
+        for (short, kept) in [
+            (0, MAX_CLIPBOARD_LEN),
+            (1, MAX_CLIPBOARD_LEN - 1),
+            (2, MAX_CLIPBOARD_LEN - 2),
+            (3, MAX_CLIPBOARD_LEN),
+        ] {
+            let text = "a".repeat(MAX_CLIPBOARD_LEN - short) + &"日".repeat(4);
+            let capped = cap_clipboard(text.clone());
+            assert_eq!(capped.len(), kept);
+            assert!(text.starts_with(&capped));
+        }
     }
 
     #[test]
