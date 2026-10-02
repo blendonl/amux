@@ -14,7 +14,13 @@ import kotlin.math.max
 import kotlin.math.min
 
 class KeyboardHalfView(context: Context, attrs: AttributeSet?) : View(context, attrs) {
-    private class PlacedKey(val key: Key, val bounds: RectF)
+    private class PlacedKey(val key: Key, val bounds: RectF) {
+        var label: String? = null
+        var labelSize = 0f
+        var hintSize: Float? = null
+    }
+
+    private class PopupBoxes(val choices: List<Key>, val anchor: RectF, val width: Int, val height: Int, val boxes: List<RectF>)
 
     private inner class Repeat(private val key: Key) : Runnable {
         override fun run() {
@@ -31,6 +37,7 @@ class KeyboardHalfView(context: Context, attrs: AttributeSet?) : View(context, a
     private var placedHeight = 0
     private val pressed = mutableMapOf<Int, PlacedKey>()
     private val repeats = mutableMapOf<Int, Repeat>()
+    private var popupBoxes: PopupBoxes? = null
 
     private val density = resources.displayMetrics.density
     private val gap = GAP_DP * density
@@ -92,8 +99,16 @@ class KeyboardHalfView(context: Context, attrs: AttributeSet?) : View(context, a
                 latch?.state == Latch.State.ONE_SHOT -> accentColor
                 else -> labelColor
             }
-            drawLabel(canvas, keyboard.label(key))
-            key.hint?.let { drawHint(canvas, it) }
+            val label = keyboard.label(key)
+            if (label != placedKey.label) {
+                placedKey.label = label
+                placedKey.labelSize = labelSize(label)
+            }
+            drawLabel(canvas, label, placedKey.labelSize)
+            key.hint?.let { hint ->
+                val size = placedKey.hintSize ?: hintSize(hint).also { placedKey.hintSize = it }
+                drawHint(canvas, hint, size)
+            }
         }
         drawPopup(canvas, keyboard)
     }
@@ -162,6 +177,11 @@ class KeyboardHalfView(context: Context, attrs: AttributeSet?) : View(context, a
     }
 
     private fun popupBoxes(popup: SplitKeyboard.Popup, anchor: RectF): List<RectF> {
+        popupBoxes?.let { cached ->
+            if (cached.choices === popup.choices && cached.anchor === anchor && cached.width == width && cached.height == height) {
+                return cached.boxes
+            }
+        }
         val boxWidth = anchor.width()
         val boxHeight = min(anchor.height(), popupHeight)
         val columns = max(1, min(popup.choices.size, (width / boxWidth).toInt()))
@@ -171,11 +191,13 @@ class KeyboardHalfView(context: Context, attrs: AttributeSet?) : View(context, a
         val left = (anchor.centerX() - totalWidth / 2).coerceIn(0f, max(0f, width - totalWidth))
         val above = anchor.top - totalHeight
         val top = if (above >= 0f) above else min(anchor.bottom, height - totalHeight)
-        return popup.choices.indices.map { index ->
+        val boxes = popup.choices.indices.map { index ->
             val boxLeft = left + (index % columns) * boxWidth
             val boxTop = top + (index / columns) * boxHeight
             RectF(boxLeft, boxTop, boxLeft + boxWidth, boxTop + boxHeight)
         }
+        popupBoxes = PopupBoxes(popup.choices, anchor, width, height, boxes)
+        return boxes
     }
 
     private fun drawPopup(canvas: Canvas, keyboard: SplitKeyboard) {
@@ -193,7 +215,8 @@ class KeyboardHalfView(context: Context, attrs: AttributeSet?) : View(context, a
             facePaint.color = if (selected) accentColor else pressedColor
             canvas.drawRoundRect(face, radius, radius, facePaint)
             labelPaint.color = if (selected) lockedLabelColor else labelColor
-            drawLabel(canvas, keyboard.label(popup.choices[index]))
+            val label = keyboard.label(popup.choices[index])
+            drawLabel(canvas, label, labelSize(label))
         }
     }
 
@@ -222,20 +245,25 @@ class KeyboardHalfView(context: Context, attrs: AttributeSet?) : View(context, a
         return placed
     }
 
-    private fun drawLabel(canvas: Canvas, label: String) {
-        labelPaint.textSize = min(largestText, face.height() * LABEL_HEIGHT_SHARE)
+    private fun labelSize(label: String): Float = fittedSize(labelPaint, label, min(largestText, face.height() * LABEL_HEIGHT_SHARE))
+
+    private fun hintSize(hint: String): Float = fittedSize(hintPaint, hint, min(largestHint, face.height() * HINT_HEIGHT_SHARE))
+
+    private fun fittedSize(paint: Paint, text: String, largest: Float): Float {
+        paint.textSize = largest
         val available = face.width() - 2 * labelPadding
-        val measured = labelPaint.measureText(label)
-        if (measured > available && measured > 0f) labelPaint.textSize *= available / measured
+        val measured = paint.measureText(text)
+        return if (measured > available && measured > 0f) largest * available / measured else largest
+    }
+
+    private fun drawLabel(canvas: Canvas, label: String, size: Float) {
+        labelPaint.textSize = size
         val baseline = face.centerY() - (labelPaint.descent() + labelPaint.ascent()) / 2
         canvas.drawText(label, face.centerX(), baseline, labelPaint)
     }
 
-    private fun drawHint(canvas: Canvas, hint: String) {
-        hintPaint.textSize = min(largestHint, face.height() * HINT_HEIGHT_SHARE)
-        val available = face.width() - 2 * labelPadding
-        val measured = hintPaint.measureText(hint)
-        if (measured > available && measured > 0f) hintPaint.textSize *= available / measured
+    private fun drawHint(canvas: Canvas, hint: String, size: Float) {
+        hintPaint.textSize = size
         canvas.drawText(hint, face.right - labelPadding, face.top + labelPadding - hintPaint.ascent(), hintPaint)
     }
 
