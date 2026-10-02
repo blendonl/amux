@@ -151,6 +151,38 @@ async fn a_lone_escape_leaves_copy_mode_after_the_escape_time() {
 }
 
 #[tokio::test]
+async fn a_search_moves_the_cursor_to_the_match_and_says_when_it_wraps() {
+    let server = TestServer::start();
+    let mut client = session_with_prompt(&server).await;
+    seq_100(&mut client).await;
+    enter_copy_mode(&mut client).await;
+
+    client.type_text("?42").await;
+    wait_for_row(&mut client, SIZE.rows - 1, "?42").await;
+    assert_eq!(client.screen().cursor_position(), (SIZE.rows - 1, 3));
+
+    client.type_text("\r").await;
+    wait_for_row(&mut client, 0, &format!("31{}[43/102]", " ".repeat(70))).await;
+    assert_eq!(client.screen().cursor_position(), (11, 0));
+
+    client.type_text("N").await;
+    wait_for_row(
+        &mut client,
+        SIZE.rows - 1,
+        "search hit BOTTOM, continuing at TOP",
+    )
+    .await;
+    assert!(screen_row(client.screen(), 0).ends_with("[43/102]"));
+
+    client.type_text("k").await;
+    wait_for_row(&mut client, SIZE.rows - 1, "54").await;
+    assert!(screen_row(client.screen(), 0).ends_with("[42/102]"));
+
+    client.type_text("q").await;
+    wait_until_live(&mut client).await;
+}
+
+#[tokio::test]
 async fn copy_mode_stays_on_its_pane_across_a_window_switch() {
     let server = TestServer::start();
     let mut client = session_with_prompt(&server).await;

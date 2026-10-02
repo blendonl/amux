@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 
 pub use differ::GridDiffer;
-use grid::{text_width, BorderLook, Grid};
+use grid::{text_width, BorderLook, Cell, Grid};
 
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
@@ -93,12 +93,28 @@ pub struct Frame {
     pub images: Vec<ImageUse>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusLine {
+    pub text: String,
+    pub cursor: Option<u16>,
+}
+
 pub struct CopyView<'a> {
     pub screen: &'a vt100::Screen,
     pub top: usize,
     pub cursor: (u16, u16),
     pub position: String,
     pub selection: Vec<(u16, Range<u16>)>,
+    pub status: Option<StatusLine>,
+}
+
+impl CopyView<'_> {
+    fn focus(&self, rows: u16) -> (u16, u16) {
+        match self.status.as_ref().and_then(|status| status.cursor) {
+            Some(col) => (rows.saturating_sub(1), col),
+            None => self.cursor,
+        }
+    }
 }
 
 pub trait Screens {
@@ -132,7 +148,7 @@ pub fn compose(
         let focus = match screens.copy_view(pane) {
             Some(view) => {
                 paint_copy(&mut grid, &view, rect, settings);
-                Some((pane == active).then(|| (cursor_in(rect, view.cursor), COPY_MODES)))
+                Some((pane == active).then(|| (cursor_in(rect, view.focus(rect.rows)), COPY_MODES)))
             }
             None => screens.with_pane(pane, |screen, placements| {
                 grid.paint(screen, rect);
@@ -188,6 +204,19 @@ fn paint_copy(grid: &mut Grid, view: &CopyView<'_>, rect: Rect, settings: &Setti
         &view.position,
         settings.theme.copy_position.into(),
     );
+    if let Some(status) = &view.status {
+        let style = settings.theme.copy_prompt.into();
+        let row = rect.bottom().saturating_sub(1);
+        grid.paint_with(
+            Rect {
+                row,
+                rows: 1,
+                ..rect
+            },
+            |_, _| Some(Cell::blank(style)),
+        );
+        grid.write_text(row, rect.col, rect, &status.text, style);
+    }
 }
 
 fn cursor_in(rect: Rect, (row, col): (u16, u16)) -> (u16, u16) {
@@ -425,6 +454,7 @@ mod tests {
         panes: BTreeMap<PaneId, vt100::Parser>,
         copy: BTreeMap<PaneId, (vt100::Screen, usize)>,
         selection: Vec<(u16, Range<u16>)>,
+        status: Option<StatusLine>,
     }
 
     impl Screens for Browsing {
@@ -443,6 +473,7 @@ mod tests {
                 cursor: (1, 2),
                 position: "[3/5]".into(),
                 selection: self.selection.clone(),
+                status: self.status.clone(),
             })
         }
     }
@@ -462,6 +493,7 @@ mod tests {
                 panes,
                 copy,
                 selection: Vec::new(),
+                status: None,
             },
         )
     }
@@ -573,6 +605,46 @@ mod tests {
         );
         assert_eq!(styles(2), [plain; 10]);
         assert_eq!(text_of(&frame, 1, 0..4), "x日.y");
+    }
+
+    #[test]
+    fn a_copy_pane_draws_its_status_on_the_last_row_and_the_cursor_in_a_prompt() {
+        let window = size(21, 3);
+        let (layout, mut browsing) = browsing(window, "a\r\nb\r\nc\r\nd\r\ne");
+        browsing.status = Some(StatusLine {
+            text: "/日x".into(),
+            cursor: Some(4),
+        });
+        let prompt = compose(
+            &layout,
+            window,
+            LEFT,
+            &browsing,
+            &Settings::default(),
+            Viewer::text(),
+        );
+        assert_eq!(text_of(&prompt, 0, 0..10), "b....[3/5]");
+        assert_eq!(text_of(&prompt, 2, 0..11), "/日.x......│");
+        let style = Style::from(Settings::default().theme.copy_prompt);
+        for col in 0..10 {
+            assert_eq!(prompt.grid.cell(2, col).unwrap().style(), style, "{col}");
+        }
+        assert_eq!(prompt.cursor, Some((2, 4)));
+
+        browsing.status = Some(StatusLine {
+            text: "pattern not found: x".into(),
+            cursor: None,
+        });
+        let message = compose(
+            &layout,
+            window,
+            LEFT,
+            &browsing,
+            &Settings::default(),
+            Viewer::text(),
+        );
+        assert_eq!(text_of(&message, 2, 0..11), "pattern no│");
+        assert_eq!(message.cursor, Some((1, 2)));
     }
 
     #[test]

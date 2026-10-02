@@ -280,7 +280,7 @@ impl Session {
             InputEvent::Bytes(bytes) => {
                 let handled = windows
                     .active_window_mut()
-                    .map(|window| window.keys(keys, &bytes, timed_out, &keymap.copy))
+                    .map(|window| window.keys(keys, &bytes, timed_out, &keymap))
                     .unwrap_or_default();
                 if handled.redraw {
                     windows.redraw();

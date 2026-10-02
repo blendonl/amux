@@ -174,6 +174,10 @@ pub enum CopyAction {
     ClearSelectionOrCancel,
     Cancel,
     RefreshFromPane,
+    SearchForward,
+    SearchBackward,
+    SearchAgain,
+    SearchReverse,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -501,6 +505,10 @@ fn copy_table() -> Table<CopyAction> {
             CopyAction::ClearSelectionOrCancel,
         ),
         (Key::char('r'), CopyAction::RefreshFromPane),
+        (Key::char('/'), CopyAction::SearchForward),
+        (Key::char('?'), CopyAction::SearchBackward),
+        (Key::char('n'), CopyAction::SearchAgain),
+        (Key::char('N'), CopyAction::SearchReverse),
     ]
     .into_iter()
     .collect()
@@ -776,10 +784,14 @@ mod tests {
             ("C-c", CopyAction::Cancel),
             ("Escape", CopyAction::ClearSelectionOrCancel),
             ("r", CopyAction::RefreshFromPane),
+            ("/", CopyAction::SearchForward),
+            ("?", CopyAction::SearchBackward),
+            ("n", CopyAction::SearchAgain),
+            ("N", CopyAction::SearchReverse),
         ] {
             assert_eq!(keymap.copy.get(&key(notation)), Some(&action), "{notation}");
         }
-        assert_eq!(keymap.copy.iter().count(), 41);
+        assert_eq!(keymap.copy.iter().count(), 45);
         assert_eq!(keymap.copy.key_for(&CopyAction::ClearSelection), None);
         assert_eq!(keymap.copy.get(&key("C-b")), None);
         assert!(is_panel_table(COPY_TABLE));

@@ -38,7 +38,7 @@ The tables are:
 
 - `root`: keys that act as soon as they are typed, without the prefix. Empty by default. Everything else reaches the pane byte for byte, and only a lone `Escape` is ever held back, when a root binding starts with it (`M-h` does).
 - `prefix`: the key after the prefix. The defaults are the keys in the [README](../README.md#windows-and-panes). A key it doesn't bind is dropped, and the prefix itself, when it isn't bound here, sends a literal prefix.
-- `prompt`: the rename and `amux.prompt` prompts. It binds prompt actions by name: `submit`, `cancel`, `delete_backward`, `delete_forward`, `delete_line`, `cursor_left`, `cursor_right`, `cursor_start` and `cursor_end`.
+- `prompt`: the rename and `amux.prompt` prompts. It binds prompt actions by name: `submit`, `cancel`, `delete_backward`, `delete_forward`, `delete_line`, `cursor_left`, `cursor_right`, `cursor_start` and `cursor_end`. The search prompt of [copy mode](#copy-mode) uses it too, from the config of the server that holds the session.
 - `tree`: the `Ctrl-b s s` tree. It binds tree actions by name: `down`, `up`, `top`, `bottom`, `collapse`, `expand`, `pick` and `cancel`.
 - `picker`: the `Ctrl-b s p` and `Ctrl-b s w` lists (see [Search](#search)). It binds picker actions by name: `down`, `up`, `pick`, `cancel`, `delete_backward`, `delete_word` and `delete_line`, and a key it doesn't bind types into the query.
 - `copy`: [copy mode](#copy-mode), read by the server that holds the session. It binds copy actions by name.
@@ -190,10 +190,16 @@ The `copy` table holds the keys of [copy mode](../README.md#copy-mode). The serv
 | `copy_selection_and_cancel` | Copies the selection and leaves copy mode            | `y`, `Enter`      |
 | `clear_selection_or_cancel` | Clears the selection, or leaves when there is none   | `Escape`          |
 | `cancel`                    | Leaves copy mode                                     | `q`, `C-c`        |
+| `search_forward`            | Opens the prompt to search down the history          | `/`               |
+| `search_backward`           | Opens the prompt to search up the history            | `?`               |
+| `search_again`              | Goes to the next match in the search's direction     | `n`               |
+| `search_reverse`            | Goes to the next match in the other direction        | `N`               |
 
 The digits `1` to `9` start a count that repeats the next action, and `0` adds to a count once one has started. They aren't in the table. A key the table doesn't bind does nothing.
 
 `begin_selection` and `select_line` start a new selection at the cursor, even while one shows, and `refresh_from_pane` clears it. The selection is drawn in the `copy_selection` [theme](#the-theme) slot. `copy_selection_and_cancel` sends the text to the clipboard of the client that pressed the key, as set in [Clipboard](#clipboard), and keeps it in the server's paste buffer, which `paste_buffer()` types into the active pane.
+
+`search_forward` and `search_backward` open a prompt on the bottom row of the pane, edited with the `prompt` table of the server's config, not the client's. `submit` searches and `cancel` closes only the prompt. A count before them goes to that match, and a count before `search_again` or `search_reverse` repeats it. The search is literal and smart-case: it ignores case unless the text holds a capital letter. It looks at each line on its own and wraps around the ends of the history. The prompt and the `search hit BOTTOM` and `pattern not found` messages are drawn in the `copy_prompt` theme slot.
 
 ```lua
 amux.keymap.set("copy", "K", "halfpage_up")
@@ -204,6 +210,8 @@ amux.keymap.set("root", "S-PageUp", amux.action.copy_mode_page_up())
 amux.keymap.set("root", "M-p", amux.action.paste_buffer())
 amux.opt.theme.copy_position = { fg = "black", bg = "cyan" }
 amux.opt.theme.copy_selection = { fg = "black", bg = "yellow" }
+amux.opt.theme.copy_prompt = { fg = "white", bg = "blue" }
+amux.keymap.set("prompt", "C-w", "delete_line")
 ```
 
 ## Which key
@@ -363,6 +371,7 @@ Each slot under `amux.opt.theme` is a style: `fg`, `bg`, `bold`, `dim`, `italic`
 | `pane_border_active`   | The active pane's border, drawn by the host            | green                |
 | `copy_position`        | The `[line/total]` position in copy mode, drawn by the host | black on yellow |
 | `copy_selection`       | The selection in copy mode, drawn by the host          | reverse              |
+| `copy_prompt`          | The search prompt and its messages in copy mode, drawn by the host | black on yellow |
 
 The pane border and copy mode slots come from the server's config, since the host draws them. Everything else comes from the client's.
 

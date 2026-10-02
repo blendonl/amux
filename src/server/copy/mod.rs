@@ -1,10 +1,12 @@
 mod motion;
+mod search;
 mod selection;
 mod snapshot;
 
 use std::ops::Range;
 
 use motion::Span;
+use search::{Direction, Prompt, Search};
 use selection::{Kind, Selection};
 pub use snapshot::Snapshot;
 
@@ -12,7 +14,7 @@ use super::mouse::Wheel;
 use super::render::CopyView;
 use crate::keys::{Decoded, Key, Scanner};
 use crate::protocol::Size;
-use crate::settings::{CopyAction, Table};
+use crate::settings::{CopyAction, Keymap};
 
 const MAX_COUNT: usize = 99_999;
 
@@ -39,6 +41,9 @@ pub struct CopyMode {
     paste: Scanner,
     selection: Option<Selection>,
     exit_at_bottom: bool,
+    prompt: Option<Prompt>,
+    search: Option<Search>,
+    message: Option<String>,
 }
 
 impl CopyMode {
@@ -52,6 +57,9 @@ impl CopyMode {
             paste: Scanner::default(),
             selection: None,
             exit_at_bottom: false,
+            prompt: None,
+            search: None,
+            message: None,
         };
         mode.top = mode.bottom();
         mode.clamp();
@@ -125,8 +133,13 @@ impl CopyMode {
         self.copy_selection()
     }
 
-    pub fn press(&mut self, decoded: &Decoded, bindings: &Table<CopyAction>) -> Outcome {
+    pub fn press(&mut self, decoded: &Decoded, keymap: &Keymap) -> Outcome {
+        self.message = None;
         if self.swallows_paste(&decoded.raw) {
+            return Outcome::Stay;
+        }
+        if self.prompt.is_some() {
+            self.edit_prompt(decoded, &keymap.prompt);
             return Outcome::Stay;
         }
         if let Some(digit) = decoded.key.and_then(|key| self.count_digit(key)) {
@@ -134,7 +147,7 @@ impl CopyMode {
             self.count = Some(count.min(MAX_COUNT));
             return Outcome::Stay;
         }
-        for (_, action) in bindings.resolve(decoded) {
+        for (_, action) in keymap.copy.resolve(decoded) {
             let count = self.count.take().unwrap_or(1);
             let outcome = action.map_or(Outcome::Stay, |action| self.act(action, count));
             if outcome != Outcome::Stay {
@@ -154,6 +167,7 @@ impl CopyMode {
             ),
             position: format!("[{}/{}]", self.cursor.line + 1, self.snapshot.lines()),
             selection: self.selected_columns(),
+            status: self.status(),
         }
     }
 
@@ -176,6 +190,11 @@ impl CopyMode {
         let pasting = self.paste.is_pasting();
         for &byte in raw {
             self.paste.feed(byte);
+        }
+        if pasting && self.paste.is_pasting() {
+            if let Some(prompt) = &mut self.prompt {
+                prompt.paste(raw);
+            }
         }
         pasting || self.paste.is_pasting()
     }
@@ -250,6 +269,10 @@ impl CopyMode {
             }
             CopyAction::Cancel => return Outcome::Exit,
             CopyAction::RefreshFromPane => return Outcome::Refresh,
+            CopyAction::SearchForward => self.open_prompt(Direction::Forward, count),
+            CopyAction::SearchBackward => self.open_prompt(Direction::Backward, count),
+            CopyAction::SearchAgain => self.search_again(count, false),
+            CopyAction::SearchReverse => self.search_again(count, true),
         }
         self.clamp();
         Outcome::Stay
@@ -410,23 +433,23 @@ mod tests {
     }
 
     fn type_keys(mode: &mut CopyMode, input: &[u8]) -> Vec<Outcome> {
-        let bindings = Keymap::default().copy;
+        let keymap = Keymap::default();
         KeyDecoder::default()
             .feed(input)
             .iter()
-            .map(|decoded| mode.press(decoded, &bindings))
+            .map(|decoded| mode.press(decoded, &keymap))
             .filter(|outcome| *outcome != Outcome::Stay)
             .collect()
     }
 
     fn type_keys_and_pause(mode: &mut CopyMode, input: &[u8]) -> Vec<Outcome> {
-        let bindings = Keymap::default().copy;
+        let keymap = Keymap::default();
         let mut decoder = KeyDecoder::default();
         let mut decoded = decoder.feed(input);
         decoded.extend(decoder.time_out());
         decoded
             .iter()
-            .map(|decoded| mode.press(decoded, &bindings))
+            .map(|decoded| mode.press(decoded, &keymap))
             .filter(|outcome| *outcome != Outcome::Stay)
             .collect()
     }
@@ -576,16 +599,16 @@ mod tests {
         for input in [&b"q"[..], b"\x03", b"\x1b[3~\x1b"] {
             let mut mode = browsing(5, 20, "text");
             let mut decoder = KeyDecoder::default();
-            let bindings = Keymap::default().copy;
+            let keymap = Keymap::default();
             let mut outcomes: Vec<Outcome> = decoder
                 .feed(input)
                 .iter()
-                .map(|decoded| mode.press(decoded, &bindings))
+                .map(|decoded| mode.press(decoded, &keymap))
                 .collect();
             outcomes.extend(
                 decoder
                     .time_out()
-                    .map(|decoded| mode.press(&decoded, &bindings)),
+                    .map(|decoded| mode.press(&decoded, &keymap)),
             );
             assert_eq!(outcomes.last(), Some(&Outcome::Exit), "{input:?}");
         }
@@ -709,12 +732,14 @@ mod tests {
     #[test]
     fn clear_selection_drops_the_selection_and_stays() {
         let mut mode = browsing(5, 20, "text");
-        let mut bindings = Keymap::default().copy;
-        bindings.insert(Key::char('c'), CopyAction::ClearSelection);
+        let mut keymap = Keymap::default();
+        keymap
+            .copy
+            .insert(Key::char('c'), CopyAction::ClearSelection);
         let outcomes: Vec<Outcome> = KeyDecoder::default()
             .feed(b"0v$c")
             .iter()
-            .map(|decoded| mode.press(decoded, &bindings))
+            .map(|decoded| mode.press(decoded, &keymap))
             .collect();
         assert!(outcomes.iter().all(|outcome| *outcome == Outcome::Stay));
         assert!(mode.view().selection.is_empty());
