@@ -35,6 +35,7 @@ use crate::keys::Key;
 use crate::paths;
 
 const DEFAULT_PROJECTS_DIR: &str = "~/projects";
+const MAX_SCROLLBACK: usize = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -138,6 +139,12 @@ impl Settings {
         }
         if self.pane.shell.as_ref().is_some_and(Vec::is_empty) {
             return Err("amux.opt.pane.shell must name a program".into());
+        }
+        if self.pane.scrollback > MAX_SCROLLBACK {
+            return Err(format!(
+                "amux.opt.pane.scrollback ({}) must not be more than {MAX_SCROLLBACK} lines",
+                self.pane.scrollback
+            ));
         }
         if self.worktrees.suffix.is_empty() {
             return Err("amux.opt.worktrees.suffix must not be empty".into());
@@ -290,7 +297,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(settings.pane.term, "tmux-256color");
-        assert_eq!(settings.pane.scrollback, 10_000);
+        assert_eq!(settings.pane.scrollback, 2_000);
         assert_eq!(settings.window.base_index, 1);
         assert_eq!(settings.session.clash_format, "{base}.{n}");
         assert_eq!(settings.session.clash_start, 2);
@@ -360,6 +367,10 @@ mod tests {
             "amux.opt.pane.shell must name a program"
         );
         assert_eq!(
+            rejected(|settings| settings.pane.scrollback = 100_001),
+            "amux.opt.pane.scrollback (100001) must not be more than 100000 lines"
+        );
+        assert_eq!(
             rejected(|settings| settings.worktrees.suffix.clear()),
             "amux.opt.worktrees.suffix must not be empty"
         );
@@ -381,6 +392,19 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(named.validate(), Ok(()));
+    }
+
+    #[test]
+    fn panes_may_keep_up_to_100_000_lines_of_history() {
+        assert_eq!(Settings::default().pane.scrollback, 2_000);
+        let longest = Settings {
+            pane: PaneSettings {
+                scrollback: 100_000,
+                ..PaneSettings::default()
+            },
+            ..Settings::default()
+        };
+        assert_eq!(longest.validate(), Ok(()));
     }
 
     #[test]
