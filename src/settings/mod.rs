@@ -39,6 +39,7 @@ use crate::paths;
 
 const DEFAULT_PROJECTS_DIR: &str = "~/projects";
 const MAX_SCROLLBACK: usize = 100_000;
+const MAX_FRAME_INTERVAL_MS: u64 = 1000;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -151,6 +152,13 @@ impl Settings {
             return Err(format!(
                 "amux.opt.pane.scrollback ({}) must not be more than {MAX_SCROLLBACK} lines",
                 self.pane.scrollback
+            ));
+        }
+        if self.session.frame_interval_ms > MAX_FRAME_INTERVAL_MS {
+            return Err(format!(
+                "amux.opt.session.frame_interval_ms ({}) must not be more than \
+                 {MAX_FRAME_INTERVAL_MS} ms",
+                self.session.frame_interval_ms
             ));
         }
         if self.worktrees.suffix.is_empty() {
@@ -420,6 +428,10 @@ mod tests {
             "amux.opt.pane.scrollback (100001) must not be more than 100000 lines"
         );
         assert_eq!(
+            rejected(|settings| settings.session.frame_interval_ms = 1001),
+            "amux.opt.session.frame_interval_ms (1001) must not be more than 1000 ms"
+        );
+        assert_eq!(
             rejected(|settings| settings.worktrees.suffix.clear()),
             "amux.opt.worktrees.suffix must not be empty"
         );
@@ -466,6 +478,23 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(longest.validate(), Ok(()));
+    }
+
+    #[test]
+    fn frames_are_paced_every_8_ms_unless_turned_off() {
+        assert_eq!(Settings::default().session.frame_interval_ms, 8);
+        for frame_interval_ms in [0, 1000] {
+            let settings = Settings {
+                session: SessionSettings {
+                    frame_interval_ms,
+                    ..SessionSettings::default()
+                },
+                ..Settings::default()
+            };
+            assert_eq!(settings.validate(), Ok(()), "{frame_interval_ms}");
+        }
+        let settings: Settings = toml::from_str("[session]\nframe_interval_ms = 0").unwrap();
+        assert_eq!(settings.session.frame_interval(), Duration::ZERO);
     }
 
     #[test]
