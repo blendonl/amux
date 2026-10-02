@@ -272,6 +272,7 @@ impl Session {
         keys: &mut KeyDecoder,
         timed_out: bool,
     ) -> Option<String> {
+        let settings = self.settings();
         let keymap = self.keymap();
         let mut windows = self.state();
         let size = windows.size;
@@ -287,13 +288,14 @@ impl Session {
                 handled.copied
             }
             InputEvent::Mouse(event) => {
-                let focused = windows
+                let handled = windows
                     .active_window_mut()
-                    .is_some_and(|window| window.mouse(event, size));
-                if focused {
+                    .map(|window| window.mouse(event, size, &settings.mouse))
+                    .unwrap_or_default();
+                if handled.redraw {
                     windows.redraw();
                 }
-                None
+                handled.copied
             }
         };
         drop(windows);

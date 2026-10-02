@@ -123,6 +123,7 @@ impl Settings {
                 self.worktrees.fetch_timeout_ms,
             ),
             ("search.project_depth", u64::from(self.search.project_depth)),
+            ("mouse.scroll_lines", u64::from(self.mouse.scroll_lines)),
             ("images.memory_mb", u64::from(self.images.memory_mb)),
             (
                 "images.client_memory_mb",
@@ -324,7 +325,7 @@ mod tests {
              [window]\nbase_index = 1\n\n\
              [session]\nclash_format = \"{base}.{n}\"\n\n\
              [borders]\nvertical = \"|\"\n\n\
-             [mouse]\nescape_time_ms = 40\n\n\
+             [mouse]\nescape_time_ms = 40\nscroll = false\n\n\
              [worktrees]\nsuffix = \".trees\"\n\n\
              [theme.pane_border_active]\nfg = \"bright-blue\"",
         )
@@ -337,6 +338,8 @@ mod tests {
         assert_eq!(settings.borders.vertical, '|');
         assert_eq!(settings.borders.horizontal, '─');
         assert_eq!(settings.mouse.escape_time_ms, 40);
+        assert!(!settings.mouse.scroll);
+        assert_eq!(settings.mouse.scroll_lines, 3);
         assert_eq!(settings.worktrees.suffix, ".trees");
         assert_eq!(settings.worktrees.fetch_timeout_ms, 30_000);
         assert_eq!(
@@ -359,6 +362,14 @@ mod tests {
             SearchSettings {
                 project_dirs: vec!["~/projects".into(), "~/Projects".into()],
                 project_depth: 1,
+            }
+        );
+        assert_eq!(
+            Settings::default().mouse,
+            MouseSettings {
+                escape_time_ms: 25,
+                scroll: true,
+                scroll_lines: 3,
             }
         );
     }
@@ -410,6 +421,10 @@ mod tests {
         assert_eq!(
             rejected(|settings| settings.search.project_depth = 0),
             "amux.opt.search.project_depth must be a positive number"
+        );
+        assert_eq!(
+            rejected(|settings| settings.mouse.scroll_lines = 0),
+            "amux.opt.mouse.scroll_lines must be a positive number"
         );
         assert_eq!(
             rejected(|settings| settings.images.memory_mb = 0),

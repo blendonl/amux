@@ -276,6 +276,76 @@ async fn escape_clears_the_selection_before_it_leaves_copy_mode() {
     assert!(client.clipboard().is_empty());
 }
 
+#[tokio::test]
+async fn the_wheel_scrolls_into_copy_mode_and_back_out_at_the_bottom() {
+    let server = TestServer::start();
+    let mut client = session_with_prompt(&server).await;
+    seq_100(&mut client).await;
+
+    client.type_text("\x1b[<64;5;5M").await;
+    wait_for_row(&mut client, 0, &format!("75{}[99/102]", " ".repeat(70))).await;
+    client.type_text("\x1b[<64;5;5M").await;
+    wait_for_row(&mut client, 0, &format!("72{}[96/102]", " ".repeat(70))).await;
+
+    client.type_text("\x1b[<65;5;5M").await;
+    wait_for_row(&mut client, 0, &format!("75{}[96/102]", " ".repeat(70))).await;
+    client.type_text("\x1b[<65;5;5M").await;
+    wait_until_live(&mut client).await;
+    wait_for_row(&mut client, 0, "78").await;
+    client.type_text("echo live-$((6*7))\r").await;
+    client.wait_for_text("live-42").await;
+}
+
+#[tokio::test]
+async fn the_wheel_over_the_alternate_screen_sends_arrow_keys() {
+    let server = TestServer::start();
+    let mut client = session_with_prompt(&server).await;
+    raw_cat(&mut client, "printf '\\033[?1049h'; ").await;
+    client.type_text("\x1b[<64;5;5M").await;
+    client.wait_for_text("^[[A^[[A^[[A").await;
+    client.type_text("\x1b[<65;5;5M").await;
+    client.wait_for_text("^[[A^[[A^[[A^[[B^[[B^[[B").await;
+}
+
+#[tokio::test]
+async fn a_program_that_asked_for_the_mouse_gets_its_own_wheel_events() {
+    let server = TestServer::start();
+    let mut client = session_with_prompt(&server).await;
+    raw_cat(&mut client, "printf '\\033[?1000h'; ").await;
+    client.type_text("\x1b[<64;5;5M").await;
+    client.wait_for_text("^[[M`%%").await;
+    assert!(!screen_row(client.screen(), 0).ends_with(']'));
+}
+
+#[tokio::test]
+async fn a_drag_selects_text_and_the_release_copies_it() {
+    let server = TestServer::start();
+    let mut client = session_with_prompt(&server).await;
+    client.type_text("printf 'alpha\\nbeta\\n'\r").await;
+    client
+        .wait_for_screen("the printf output", |screen| {
+            screen.contents().contains("\nalpha\nbeta\n$")
+        })
+        .await;
+
+    client.type_text("\x1b[<0;1;2M\x1b[<32;3;3M").await;
+    client
+        .wait_for_screen("the copy mode position", |screen| {
+            screen_row(screen, 0).ends_with(']')
+        })
+        .await;
+    client.type_text("\x1b[<32;4;3M\x1b[<0;4;3m").await;
+    client
+        .wait_until("the dragged text", |client| !client.clipboard().is_empty())
+        .await;
+    assert_eq!(client.clipboard(), ["alpha\nbeta"]);
+    wait_until_live(&mut client).await;
+
+    raw_cat(&mut client, "").await;
+    client.command(SessionCommand::PasteBuffer).await;
+    client.wait_for_text("alpha^Mbeta").await;
+}
+
 #[test]
 fn ctrl_b_bracket_enters_copy_mode_and_q_leaves_it() {
     let server = TestServer::start();

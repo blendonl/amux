@@ -124,6 +124,8 @@ impl Default for BorderSettings {
 #[serde(default, deny_unknown_fields)]
 pub struct MouseSettings {
     pub escape_time_ms: u64,
+    pub scroll: bool,
+    pub scroll_lines: u16,
 }
 
 impl MouseSettings {
@@ -134,7 +136,11 @@ impl MouseSettings {
 
 impl Default for MouseSettings {
     fn default() -> Self {
-        Self { escape_time_ms: 25 }
+        Self {
+            escape_time_ms: 25,
+            scroll: true,
+            scroll_lines: 3,
+        }
     }
 }
 
