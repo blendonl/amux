@@ -21,7 +21,8 @@ class AmuxEnvironment(
     val tmpDir = if (withUserland) userland.tmp else dirs.cache
     val binary = File(dirs.nativeLibraries, BINARY_NAME)
     val binaryLink = File(binDir, "amux")
-    val initFile = File(configHome, "amux/init.lua")
+    val configDir = File(configHome, "amux")
+    val initFile = File(configDir, "init.lua")
     val zshrc = File(home, ".zshrc")
     val runtimeDir = File(tmpDir, "amux-$uid")
     val socket = File(runtimeDir, "default")
