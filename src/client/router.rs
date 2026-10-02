@@ -359,6 +359,8 @@ impl KeyRouter {
             }
             Binding::KillPane => Action::Command(SessionCommand::KillPane),
             Binding::KillWindow => Action::Command(SessionCommand::KillWindow),
+            Binding::CopyMode => Action::Command(SessionCommand::CopyMode { page_up: false }),
+            Binding::CopyModePageUp => Action::Command(SessionCommand::CopyMode { page_up: true }),
         })
     }
 }
@@ -604,6 +606,7 @@ mod tests {
             (b'o', SessionCommand::NextPane),
             (b'x', SessionCommand::KillPane),
             (b'&', SessionCommand::KillWindow),
+            (b'[', SessionCommand::CopyMode { page_up: false }),
         ];
         for (key, bound) in bindings {
             assert_eq!(
@@ -1154,6 +1157,10 @@ mod tests {
         assert_eq!(
             router.run_binding(Binding::SendPrefix),
             vec![forward(b"\x02")]
+        );
+        assert_eq!(
+            router.run_binding(Binding::CopyModePageUp),
+            vec![command(SessionCommand::CopyMode { page_up: true })]
         );
         assert_eq!(
             router.run_binding(Binding::SwitchTable(PREFIX_TABLE.into())),

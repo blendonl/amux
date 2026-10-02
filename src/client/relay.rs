@@ -2050,7 +2050,7 @@ mod tests {
         relay.input(b"\x1b[5~\x1b[5~");
         let screen = rows(&mut relay, &mut parser);
         assert_eq!(screen[0], rule(4));
-        assert_eq!(screen[1], " Up    → pane up");
+        assert_eq!(screen[1], " [     → copy mode");
         assert_eq!(relay.take_messages(), vec![]);
 
         relay.input(b"d");

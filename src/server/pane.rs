@@ -114,6 +114,10 @@ impl Pane {
         read(parser.screen(), parser.callbacks().placements())
     }
 
+    pub fn snapshot(&self) -> vt100::Screen {
+        lock(&self.parser).screen().clone()
+    }
+
     pub fn write_input(&self, bytes: Vec<u8>) -> Result<()> {
         self.input
             .send(bytes)

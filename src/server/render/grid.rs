@@ -1,5 +1,6 @@
 use std::fmt;
 
+use unicode_width::UnicodeWidthChar;
 use vt100::Color;
 
 use super::placeholder::{placeholder_cell, ImageSpan, MAX_IMAGE_CELLS};
@@ -174,14 +175,48 @@ impl Grid {
     }
 
     pub fn paint(&mut self, screen: &vt100::Screen, rect: Rect) {
+        self.paint_with(rect, |row, col| screen.cell(row, col).map(Cell::from_vt100));
+    }
+
+    pub fn paint_with(&mut self, rect: Rect, cell_at: impl Fn(u16, u16) -> Option<Cell>) {
         let area = self.clip(rect);
         for row in 0..area.rows {
             for col in 0..area.cols {
-                let cell = screen.cell(row, col).map(Cell::from_vt100);
+                let cell = cell_at(row, col);
                 self.set(area.row + row, area.col + col, cell.unwrap_or_default());
             }
             self.repair_wide_cells(area.row + row, area.col, area.right());
         }
+    }
+
+    pub fn write_text(&mut self, row: u16, col: u16, clip: Rect, text: &str, style: Style) {
+        let area = self.clip(clip);
+        if !(area.row..area.bottom()).contains(&row) {
+            return;
+        }
+        let mut col = col.max(area.col);
+        for character in text.chars() {
+            let wide = match character.width() {
+                Some(0) | None => continue,
+                Some(1) => false,
+                Some(_) => true,
+            };
+            let end = col + 1 + u16::from(wide);
+            if end > area.right() {
+                break;
+            }
+            let glyph = Cell::glyph(character, style);
+            self.set(row, col, Cell { wide, ..glyph });
+            if wide {
+                let continuation = Cell {
+                    wide_continuation: true,
+                    ..Cell::blank(style)
+                };
+                self.set(row, col + 1, continuation);
+            }
+            col = end;
+        }
+        self.repair_wide_cells(row, area.col, area.right());
     }
 
     pub fn paint_image(&mut self, span: &ImageSpan, clip: Rect) {
@@ -305,6 +340,11 @@ impl Grid {
     fn style_at(&self, row: u16, col: u16) -> Style {
         self.cell(row, col).map(Cell::style).unwrap_or_default()
     }
+}
+
+pub fn text_width(text: &str) -> u16 {
+    let width: usize = text.chars().filter_map(UnicodeWidthChar::width).sum();
+    u16::try_from(width).unwrap_or(u16::MAX)
 }
 
 struct Joins {

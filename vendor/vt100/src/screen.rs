@@ -546,6 +546,94 @@ impl Screen {
     }
 
     #[allow(missing_docs)]
+    #[must_use]
+    pub fn history_len(&self) -> usize {
+        self.grid().history_len()
+    }
+
+    #[allow(missing_docs)]
+    #[must_use]
+    pub fn line_cell(&self, line: usize, col: u16) -> Option<&crate::Cell> {
+        self.grid().line(line).and_then(|row| row.get(col))
+    }
+
+    #[allow(missing_docs)]
+    #[must_use]
+    pub fn line_wrapped(&self, line: usize) -> bool {
+        self.grid().line(line).is_some_and(crate::row::Row::wrapped)
+    }
+
+    #[allow(missing_docs)]
+    #[must_use]
+    pub fn line_contents(
+        &self,
+        line: usize,
+        start: u16,
+        width: u16,
+    ) -> String {
+        let mut contents = String::new();
+        if let Some(row) = self.grid().line(line) {
+            row.write_contents(&mut contents, start, width, false);
+        }
+        contents
+    }
+
+    #[allow(missing_docs)]
+    #[must_use]
+    pub fn line_contents_between(
+        &self,
+        start_line: usize,
+        start_col: u16,
+        end_line: usize,
+        end_col: u16,
+    ) -> String {
+        match start_line.cmp(&end_line) {
+            std::cmp::Ordering::Less => {
+                let mut contents = String::new();
+                for line in start_line..=end_line {
+                    let Some(row) = self.grid().line(line) else {
+                        break;
+                    };
+                    if line == start_line {
+                        row.write_contents(
+                            &mut contents,
+                            start_col,
+                            row.cols().saturating_sub(start_col),
+                            false,
+                        );
+                    } else if line == end_line {
+                        row.write_contents(&mut contents, 0, end_col, false);
+                        break;
+                    } else {
+                        row.write_contents(
+                            &mut contents,
+                            0,
+                            row.cols(),
+                            false,
+                        );
+                    }
+                    if !row.wrapped() {
+                        contents.push('\n');
+                    }
+                }
+                contents
+            }
+            std::cmp::Ordering::Equal => {
+                if start_col < end_col {
+                    self.line_contents(
+                        start_line,
+                        start_col,
+                        end_col - start_col,
+                    )
+                } else {
+                    String::new()
+                }
+            }
+            std::cmp::Ordering::Greater => String::new(),
+        }
+    }
+
+    #[allow(missing_docs)]
     pub fn row_ids(&self) -> impl Iterator<Item = u64> + '_ {
         self.grid().visible_rows().map(crate::row::Row::id)
     }

@@ -67,6 +67,7 @@ A session holds numbered windows, and each window splits into panes, each runnin
 | `Ctrl-b &`              | Kill the active window                                 |
 | `Ctrl-b ,`              | Rename the active window                               |
 | `Ctrl-b $`              | Rename the session                                     |
+| `Ctrl-b [`              | Browse the active pane's history in copy mode          |
 | `Ctrl-b s p`            | Find a project in your project directories and open it |
 | `Ctrl-b s w`            | Find a worktree of this session's project and open it  |
 | `Ctrl-b s s`            | Pick a session or window anywhere in the cluster       |
@@ -81,6 +82,31 @@ A session holds numbered windows, and each window splits into panes, each runnin
 - Every client attached to a session sees the same active window and pane. The window takes the size of the client that typed last, and a client with a smaller terminal sees the top-left part of it.
 - While a window has more than one pane, the terminal reports mouse clicks to amux, and clicking a pane makes it the active one. Most terminals still select text when you hold Shift. A program that turns on mouse reporting itself, like `vim` with `mouse=a` or `htop`, gets the clicks inside its own pane in its own coordinates.
 - These keys work the same on a session on another server: they travel over the peer link to the server that holds the session.
+
+### Copy mode
+
+`Ctrl-b [` puts the active pane in copy mode, where you scroll back through its history. The pane holds still while you look: amux shows a copy of it taken when you pressed the keys, the program keeps running underneath, and what it prints meanwhile shows when you leave. The top right corner shows `[line/total]`, the line the cursor is on out of all the lines of history and screen. The keys are vi's:
+
+| Keys                             | Action                                                  |
+| -------------------------------- | ------------------------------------------------------- |
+| `h` `j` `k` `l`, arrow keys      | Move the cursor                                         |
+| `w`, `b`, `e`                    | Next word, previous word, end of the word               |
+| `W`, `B`, `E`                    | The same, for words that only spaces separate           |
+| `0` or `Home`, `^`, `$` or `End` | Start of the line, its first character, end of the line |
+| `g`, `G`                         | Top and bottom of the history                           |
+| `H`, `M`, `L`                    | Top, middle and bottom line of the pane                 |
+| `Ctrl-y`, `Ctrl-e`               | Scroll up and down a line                               |
+| `Ctrl-u`, `Ctrl-d`               | Scroll up and down half a page                          |
+| `PageUp`, `PageDown` or `Ctrl-f` | Scroll up and down a page                               |
+| `r`                              | Take a new copy of the pane, keeping your place         |
+| `q`, `Escape`, `Ctrl-c`          | Leave copy mode                                         |
+
+- A number before a key repeats it: `10k` moves up ten lines. Other keys do nothing, and pasted text is dropped.
+- Copy mode belongs to the pane, so every client attached to the session sees it. It stays while you switch windows and panes, detach and attach again, or reload the config.
+- The copy keys and the colour of the position come from the config of the server that holds the session, like the pane borders: `amux.keymap.set("copy", "K", "halfpage_up")` binds a key there, and `amux.opt.theme.copy_position` colours the position. [docs/lua.md](docs/lua.md#copy-mode) lists the actions.
+- `amux.action.copy_mode_page_up()` starts copy mode a page up, like tmux's `copy-mode -u`. It has no key, since `PageUp` after `Ctrl-b` turns the pages of the which-key popup. Bind it with `amux.keymap.set("root", "S-PageUp", amux.action.copy_mode_page_up())`.
+- Images are hidden while you browse: the pane shows only its text, and the images come back when you leave copy mode.
+- A program in the alternate screen, such as `vim`, `less` or `htop`, has no history there, so copy mode shows only its screen.
 
 ### Images
 

@@ -8,12 +8,13 @@ use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use super::forward::{self, Host, Opening};
-use super::mouse::MouseDecoder;
+use super::mouse::{InputEvent, MouseDecoder};
 use super::render::GridDiffer;
 use super::session::Session;
 use super::status::StatusFeed;
 use super::upload::{Turn, Uploader};
 use super::{target_index, Resolved, Server};
+use crate::keys::KeyDecoder;
 use crate::pairing;
 use crate::protocol::{
     AttachedSession, ClientMessage, ClientTerminal, DebugCommand, Duplex, NewSession,
@@ -400,6 +401,7 @@ async fn attach(
     );
     let mut derivations = JoinSet::new();
     let mut mouse = MouseDecoder::new();
+    let mut keys = KeyDecoder::default();
     let escape = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(escape);
     let mut dirty = true;
@@ -463,10 +465,9 @@ async fn attach(
                     send(&client.outgoing, message).await?;
                 }
             }
-            () = &mut escape, if mouse.has_pending() => {
-                if let Some(pending) = mouse.flush() {
-                    session.input(pending);
-                }
+            () = &mut escape, if mouse.has_pending() || keys.is_partial() => {
+                let pending = mouse.flush().unwrap_or(InputEvent::Bytes(Vec::new()));
+                session.input(pending, &mut keys, true);
             }
             message = client.incoming.recv() => match message {
                 Some(ClientMessage::Input(bytes)) => {
@@ -474,9 +475,9 @@ async fn attach(
                     tracked.mark_active();
                     session.record_input();
                     for event in mouse.decode(&bytes) {
-                        session.input(event);
+                        session.input(event, &mut keys, false);
                     }
-                    if mouse.has_pending() {
+                    if mouse.has_pending() || keys.is_partial() {
                         let escape_time = server.settings().mouse.escape_time();
                         escape.as_mut().reset(Instant::now() + escape_time);
                     }

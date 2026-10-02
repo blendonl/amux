@@ -11,7 +11,7 @@ mod round_trip;
 use std::collections::BTreeSet;
 
 pub use differ::GridDiffer;
-use grid::{BorderLook, Grid};
+use grid::{text_width, BorderLook, Grid};
 
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
@@ -31,6 +31,15 @@ pub struct InputModes {
     pub mouse_protocol_encoding: MouseProtocolEncoding,
     pub hide_cursor: bool,
 }
+
+const COPY_MODES: InputModes = InputModes {
+    application_cursor: false,
+    application_keypad: false,
+    bracketed_paste: true,
+    mouse_protocol_mode: MouseProtocolMode::None,
+    mouse_protocol_encoding: MouseProtocolEncoding::Default,
+    hide_cursor: false,
+};
 
 impl InputModes {
     pub fn from_screen(screen: &vt100::Screen) -> Self {
@@ -83,12 +92,23 @@ pub struct Frame {
     pub images: Vec<ImageUse>,
 }
 
+pub struct CopyView<'a> {
+    pub screen: &'a vt100::Screen,
+    pub top: usize,
+    pub cursor: (u16, u16),
+    pub position: String,
+}
+
 pub trait Screens {
     fn with_pane<R>(
         &self,
         pane: PaneId,
         read: impl FnOnce(&vt100::Screen, Option<&Placements>) -> R,
     ) -> Option<R>;
+
+    fn copy_view(&self, _pane: PaneId) -> Option<CopyView<'_>> {
+        None
+    }
 }
 
 pub fn compose(
@@ -107,11 +127,22 @@ pub fn compose(
     let mut images = Vec::new();
 
     for (pane, rect) in layout.rects(size) {
-        let focus = screens.with_pane(pane, |screen, placements| {
-            grid.paint(screen, rect);
-            images::paint(&mut grid, screen, placements, rect, viewer, &mut images);
-            (pane == active).then(|| (pane_cursor(screen, rect), InputModes::from_screen(screen)))
-        });
+        let focus = match screens.copy_view(pane) {
+            Some(view) => {
+                paint_copy(&mut grid, &view, rect, settings);
+                Some((pane == active).then(|| (cursor_in(rect, view.cursor), COPY_MODES)))
+            }
+            None => screens.with_pane(pane, |screen, placements| {
+                grid.paint(screen, rect);
+                images::paint(&mut grid, screen, placements, rect, viewer, &mut images);
+                (pane == active).then(|| {
+                    (
+                        cursor_in(rect, screen.cursor_position()),
+                        InputModes::from_screen(screen),
+                    )
+                })
+            }),
+        };
         if pane == active {
             active_rect = Some(rect);
             if let Some(Some((position, active_modes))) = focus {
@@ -136,8 +167,23 @@ pub fn compose(
     }
 }
 
-fn pane_cursor(screen: &vt100::Screen, rect: Rect) -> (u16, u16) {
-    let (row, col) = screen.cursor_position();
+fn paint_copy(grid: &mut Grid, view: &CopyView<'_>, rect: Rect, settings: &Settings) {
+    grid.paint_with(rect, |row, col| {
+        view.screen
+            .line_cell(view.top + usize::from(row), col)
+            .map(images::text_cell)
+    });
+    let position = rect.right().saturating_sub(text_width(&view.position));
+    grid.write_text(
+        rect.row,
+        position,
+        rect,
+        &view.position,
+        settings.theme.copy_position.into(),
+    );
+}
+
+fn cursor_in(rect: Rect, (row, col): (u16, u16)) -> (u16, u16) {
     (
         rect.row + row.min(rect.rows.saturating_sub(1)),
         rect.col + col.min(rect.cols.saturating_sub(1)),
@@ -366,6 +412,150 @@ mod tests {
         assert_eq!(frame.cursor, None);
         assert_eq!(frame.modes, InputModes::default());
         assert!(frame.grid.cell(0, 5).unwrap().is_erased());
+    }
+
+    struct Browsing {
+        panes: BTreeMap<PaneId, vt100::Parser>,
+        copy: BTreeMap<PaneId, (vt100::Screen, usize)>,
+    }
+
+    impl Screens for Browsing {
+        fn with_pane<R>(
+            &self,
+            pane: PaneId,
+            read: impl FnOnce(&vt100::Screen, Option<&Placements>) -> R,
+        ) -> Option<R> {
+            self.panes.with_pane(pane, read)
+        }
+
+        fn copy_view(&self, pane: PaneId) -> Option<CopyView<'_>> {
+            self.copy.get(&pane).map(|(screen, top)| CopyView {
+                screen,
+                top: *top,
+                cursor: (1, 2),
+                position: "[3/5]".into(),
+            })
+        }
+    }
+
+    fn browsing(window: Size, left: &str) -> (Layout, Browsing) {
+        let (layout, mut panes) = side_by_side(window);
+        let rect = layout.rects(window)[0].1;
+        let mut parser = vt100::Parser::new(rect.rows, rect.cols, 10);
+        parser.process(left.as_bytes());
+        let snapshot = parser.screen().clone();
+        parser.process(b"\r\nlive output\x1b[?25l\x1b[?1000h");
+        panes.insert(LEFT, parser);
+        let copy = BTreeMap::from([(LEFT, (snapshot, 1))]);
+        (layout, Browsing { panes, copy })
+    }
+
+    fn text_of(frame: &Frame, row: u16, cols: std::ops::Range<u16>) -> String {
+        cols.map(|col| match frame.grid.cell(row, col).unwrap().text() {
+            "" => ".".to_owned(),
+            text => text.to_owned(),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn a_copy_pane_shows_its_snapshot_from_the_top_line_with_its_position() {
+        let window = size(21, 3);
+        let (layout, browsing) = browsing(window, "a\r\nb\r\nc\r\nd\r\ne");
+        let frame = compose(
+            &layout,
+            window,
+            RIGHT,
+            &browsing,
+            &Settings::default(),
+            Viewer::text(),
+        );
+        assert_eq!(text_of(&frame, 0, 0..10), "b....[3/5]");
+        assert_eq!(text_of(&frame, 1, 0..10), "c.........");
+        assert_eq!(text_of(&frame, 2, 0..10), "d.........");
+        assert_eq!(
+            frame.grid.cell(0, 5).unwrap().style(),
+            Style::from(Settings::default().theme.copy_position)
+        );
+        assert_eq!(frame.grid.cell(0, 4).unwrap().style(), Style::default());
+        assert_eq!(frame.modes, InputModes::default());
+    }
+
+    #[test]
+    fn an_active_copy_pane_takes_the_cursor_and_accepts_pastes() {
+        let window = size(21, 3);
+        let (layout, browsing) = browsing(window, "a\r\nb\r\nc\r\nd\r\ne");
+        let frame = compose(
+            &layout,
+            window,
+            LEFT,
+            &browsing,
+            &Settings::default(),
+            Viewer::text(),
+        );
+        assert_eq!(frame.cursor, Some((1, 2)));
+        assert_eq!(
+            frame.modes,
+            InputModes {
+                bracketed_paste: true,
+                ..InputModes::default()
+            }
+        );
+    }
+
+    #[test]
+    fn the_position_is_cut_to_a_narrow_pane() {
+        let window = size(9, 3);
+        let (layout, browsing) = browsing(window, "a\r\nb\r\nc\r\nd\r\ne");
+        let frame = compose(
+            &layout,
+            window,
+            LEFT,
+            &browsing,
+            &Settings::default(),
+            Viewer::text(),
+        );
+        assert_eq!(text_of(&frame, 0, 0..5), "[3/5│");
+    }
+
+    #[test]
+    fn a_copy_pane_blanks_image_placeholders_the_way_a_pane_without_images_does() {
+        let window = size(21, 3);
+        let placeholders = "a\r\nb\x1b[38;5;7;44m\u{10eeee}\u{305}\u{305}\u{10eeee}\x1b[0mc";
+        let (layout, mut browsing) = browsing(window, placeholders);
+        browsing.copy.get_mut(&LEFT).unwrap().1 = 0;
+        let browsed = compose(
+            &layout,
+            window,
+            LEFT,
+            &browsing,
+            &Settings::default(),
+            Viewer::text(),
+        );
+        assert_eq!(text_of(&browsed, 1, 0..10), "b..c......");
+        assert_eq!(
+            browsed.grid.cell(1, 1).unwrap().style(),
+            Style {
+                bg: vt100::Color::Idx(4),
+                ..Style::default()
+            }
+        );
+        assert!(browsed.images.is_empty());
+
+        let mut live = vt100::Parser::new(3, 10, 10);
+        live.process(placeholders.as_bytes());
+        let panes = BTreeMap::from([(LEFT, live)]);
+        let shown = compose(
+            &layout,
+            window,
+            LEFT,
+            &panes,
+            &Settings::default(),
+            Viewer::text(),
+        );
+        for col in 0..10 {
+            assert_eq!(browsed.grid.cell(1, col), shown.grid.cell(1, col), "{col}");
+        }
     }
 
     #[test]

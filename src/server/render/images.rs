@@ -34,6 +34,21 @@ pub fn paint(
     }
 }
 
+pub fn text_cell(cell: &vt100::Cell) -> Cell {
+    if cell.contents().starts_with(PLACEHOLDER) {
+        blanked(cell.bgcolor())
+    } else {
+        Cell::from_vt100(cell)
+    }
+}
+
+fn blanked(background: Color) -> Cell {
+    Cell::blank(Style {
+        bg: background,
+        ..Style::default()
+    })
+}
+
 fn paint_spans(
     grid: &mut Grid,
     screen: &vt100::Screen,
@@ -134,10 +149,7 @@ fn rewrite_row(
                 placeholder.image_col,
                 background,
             ),
-            None => Cell::blank(Style {
-                bg: background,
-                ..Style::default()
-            }),
+            None => blanked(background),
         };
         grid.set(rect.row + row, rect.col + col, rewritten);
     }
