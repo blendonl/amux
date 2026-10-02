@@ -634,6 +634,7 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::*;
+    use crate::cluster::channel::CREDIT_BYTES;
     use crate::cluster::noise;
     use crate::cluster::{
         Channel, ChannelEnd, ClusterOptions, NoiseKey, TrustStore, Voucher, CREDIT_WINDOW,
@@ -1597,6 +1598,38 @@ mod tests {
         host.outgoing.send(output(window + 1)).await.unwrap();
         channel.delivered();
         assert_eq!(from_host(&mut channel).await, Some(output(window + 1)));
+    }
+
+    #[tokio::test]
+    async fn the_host_stops_at_its_byte_budget_before_its_message_window() {
+        let lower = node(LOWER, "low").build();
+        let higher = node(HIGHER, "high").build();
+        let _runs = running(&lower, &higher).await;
+        let mut channel = open(&lower, &higher, ClientMessage::ListSessions).await;
+        let host = higher.next_hosted().await;
+
+        let half_budget = |index: u8| ServerMessage::Output(vec![index; CREDIT_BYTES / 2]);
+        for index in 0..2 {
+            host.outgoing.send(half_budget(index)).await.unwrap();
+        }
+        for index in 0..2 {
+            assert_eq!(from_host(&mut channel).await, Some(half_budget(index)));
+        }
+        host.outgoing.send(half_budget(2)).await.unwrap();
+        assert!(
+            host.outgoing.try_send(half_budget(3)).is_err(),
+            "the host rendered past its byte budget"
+        );
+
+        channel.delivered();
+        assert_eq!(from_host(&mut channel).await, Some(half_budget(2)));
+        host.outgoing.send(half_budget(3)).await.unwrap();
+        assert!(
+            host.outgoing.try_send(half_budget(4)).is_err(),
+            "the host rendered past its byte budget"
+        );
+        channel.delivered();
+        assert_eq!(from_host(&mut channel).await, Some(half_budget(3)));
     }
 
     #[tokio::test]
