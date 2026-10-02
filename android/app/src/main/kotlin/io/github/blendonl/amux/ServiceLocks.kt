@@ -17,8 +17,9 @@ class ServiceLocks(context: Context) {
     val keepingAwake: Boolean
         get() = wake.isHeld
 
-    fun holdMulticast() {
-        multicast?.acquire()
+    fun holdMulticast(hold: Boolean) {
+        val lock = multicast ?: return
+        if (hold) lock.acquire() else if (lock.isHeld) lock.release()
     }
 
     fun toggleKeepAwake() {

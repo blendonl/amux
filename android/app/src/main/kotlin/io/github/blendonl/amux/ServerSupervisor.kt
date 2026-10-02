@@ -2,6 +2,8 @@ package io.github.blendonl.amux
 
 import java.io.IOException
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
@@ -19,6 +21,7 @@ class ServerSupervisor(
     private val probe = SocketProbe(amux.socket)
     private val policy = RestartPolicy()
     private val stopRequested = CountDownLatch(1)
+    private val wakeups = Semaphore(0)
     private val worker = Thread(::supervise, "amux-supervisor")
 
     @Volatile
@@ -32,7 +35,10 @@ class ServerSupervisor(
 
     fun start() = worker.start()
 
-    fun requestStop() = stopRequested.countDown()
+    fun requestStop() {
+        stopRequested.countDown()
+        wakeups.release()
+    }
 
     fun awaitStop(grace: Duration) {
         requestStop()
@@ -58,9 +64,14 @@ class ServerSupervisor(
     private fun watchRunningServer(): Exit {
         report(ServerState.Ready)
         val started = TimeSource.Monotonic.markNow()
-        do {
-            val stopped = stopRequested.await(WATCH_INTERVAL)
-        } while (!stopped && probe.answers())
+        val socketWatch = FileWatch(amux.socket) { wakeups.release() }.also(FileWatch::start)
+        try {
+            do {
+                wakeups.tryAcquire(WATCH_INTERVAL.inWholeMilliseconds, TimeUnit.MILLISECONDS)
+            } while (!stopping && probe.answers())
+        } finally {
+            socketWatch.stop()
+        }
         return Exit(0, started.elapsedNow(), ServerFailure.Exited(0, null))
     }
 
@@ -111,6 +122,6 @@ class ServerSupervisor(
         const val SILENT = -2
         val READY_TIMEOUT = 10.seconds
         val POLL_INTERVAL = 100.milliseconds
-        val WATCH_INTERVAL = 2.seconds
+        val WATCH_INTERVAL = 30.seconds
     }
 }
