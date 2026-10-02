@@ -8,6 +8,7 @@ use motion::Span;
 use selection::{Kind, Selection};
 pub use snapshot::Snapshot;
 
+use super::mouse::Wheel;
 use super::render::CopyView;
 use crate::keys::{Decoded, Key, Scanner};
 use crate::protocol::Size;
@@ -37,6 +38,7 @@ pub struct CopyMode {
     count: Option<usize>,
     paste: Scanner,
     selection: Option<Selection>,
+    exit_at_bottom: bool,
 }
 
 impl CopyMode {
@@ -49,6 +51,7 @@ impl CopyMode {
             count: None,
             paste: Scanner::default(),
             selection: None,
+            exit_at_bottom: false,
         };
         mode.top = mode.bottom();
         mode.clamp();
@@ -72,6 +75,54 @@ impl CopyMode {
 
     pub fn page_up(&mut self) {
         self.act(CopyAction::PageUp, 1);
+    }
+
+    pub fn exit_at_bottom(self) -> Self {
+        Self {
+            exit_at_bottom: true,
+            ..self
+        }
+    }
+
+    pub fn scroll(&mut self, wheel: Wheel, lines: usize) -> Outcome {
+        let action = match wheel {
+            Wheel::Up => CopyAction::ScrollUp,
+            Wheel::Down => CopyAction::ScrollDown,
+        };
+        self.act(action, lines);
+        if self.exit_at_bottom && self.selection.is_none() && self.top == self.bottom() {
+            Outcome::Exit
+        } else {
+            Outcome::Stay
+        }
+    }
+
+    pub fn click(&mut self, row: u16, col: u16) {
+        self.selection = None;
+        self.move_to(row, col);
+    }
+
+    pub fn drag(&mut self, row: i32, col: u16) {
+        if self.selection.is_none() {
+            self.select(Kind::Char);
+        }
+        let last = i32::from(self.size.rows) - 1;
+        let on_row = u16::try_from(row.clamp(0, last)).unwrap_or_default();
+        let from = self.cursor;
+        self.move_to(on_row, col);
+        let pushed = row != i32::from(on_row)
+            || from.line != self.cursor.line
+            || from.col == self.cursor.col;
+        if pushed && on_row == 0 {
+            self.scroll_up(1);
+        } else if pushed && i32::from(on_row) == last {
+            self.scroll_down(1);
+        }
+        self.clamp();
+    }
+
+    pub fn release(&self) -> Outcome {
+        self.copy_selection()
     }
 
     pub fn press(&mut self, decoded: &Decoded, bindings: &Table<CopyAction>) -> Outcome {
@@ -266,6 +317,14 @@ impl CopyMode {
     fn move_to_line(&mut self, line: usize) {
         self.cursor.line = line.min(self.last_line());
         self.follow_cursor();
+    }
+
+    fn move_to(&mut self, row: u16, col: u16) {
+        self.cursor = Point {
+            line: self.top + usize::from(row),
+            col,
+        };
+        self.clamp();
     }
 
     fn move_to_row(&mut self, row: usize) {
@@ -660,5 +719,99 @@ mod tests {
         assert!(outcomes.iter().all(|outcome| *outcome == Outcome::Stay));
         assert!(mode.view().selection.is_empty());
         assert_eq!(type_keys(&mut mode, b"y"), [Outcome::Exit]);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_view_by_the_lines_asked_for() {
+        let mut mode = browsing(5, 20, &numbered(30));
+        assert_eq!(mode.scroll(Wheel::Up, 3), Outcome::Stay);
+        assert_eq!(top_and_cursor(&mode), (22, 26, 2));
+        assert_eq!(mode.scroll(Wheel::Down, 2), Outcome::Stay);
+        assert_eq!(top_and_cursor(&mode), (24, 26, 2));
+        assert_eq!(mode.scroll(Wheel::Down, 3), Outcome::Stay);
+        assert_eq!(top_and_cursor(&mode), (25, 26, 2));
+        mode.scroll(Wheel::Up, 100);
+        assert_eq!(top_and_cursor(&mode), (0, 4, 2));
+    }
+
+    #[test]
+    fn copy_mode_from_the_wheel_leaves_at_the_bottom_unless_something_is_selected() {
+        let mut mode = browsing(5, 20, &numbered(30)).exit_at_bottom();
+        assert_eq!(mode.scroll(Wheel::Up, 3), Outcome::Stay);
+        assert_eq!(mode.scroll(Wheel::Down, 2), Outcome::Stay);
+        assert_eq!(mode.scroll(Wheel::Down, 2), Outcome::Exit);
+
+        let mut selecting = browsing(5, 20, &numbered(30)).exit_at_bottom();
+        selecting.scroll(Wheel::Up, 3);
+        type_keys(&mut selecting, b"v");
+        assert_eq!(selecting.scroll(Wheel::Down, 3), Outcome::Stay);
+        type_keys_and_pause(&mut selecting, b"\x1b");
+        assert_eq!(selecting.scroll(Wheel::Down, 3), Outcome::Exit);
+
+        assert_eq!(
+            browsing(5, 20, "text")
+                .exit_at_bottom()
+                .scroll(Wheel::Up, 3),
+            Outcome::Exit
+        );
+        assert_eq!(
+            browsing(5, 20, &numbered(30)).scroll(Wheel::Down, 3),
+            Outcome::Stay
+        );
+    }
+
+    #[test]
+    fn a_click_moves_the_cursor_and_clears_the_selection() {
+        let mut mode = browsing(5, 20, "one two\r\nthree four\r\n$ ");
+        type_keys(&mut mode, b"vk");
+        mode.click(1, 6);
+        assert_eq!(top_and_cursor(&mode), (0, 1, 6));
+        assert!(mode.view().selection.is_empty());
+        mode.click(9, 30);
+        assert_eq!(top_and_cursor(&mode), (0, 4, 19));
+
+        let mut wide = browsing(3, 10, "a日本b");
+        wide.click(0, 2);
+        assert_eq!(top_and_cursor(&wide), (0, 0, 1));
+    }
+
+    #[test]
+    fn a_drag_selects_from_the_press_point_and_a_release_copies_it() {
+        let mut mode = browsing(5, 20, "one two\r\nthree four\r\n$ ");
+        mode.click(0, 4);
+        mode.drag(1, 4);
+        assert_eq!(top_and_cursor(&mode), (0, 1, 4));
+        assert_eq!(mode.view().selection, [(0, 4..20), (1, 0..5)]);
+        mode.drag(1, 2);
+        assert_eq!(mode.release(), Outcome::Copy("two\nthr".into()));
+
+        let mut blank = browsing(5, 20, "text");
+        blank.click(2, 0);
+        blank.drag(2, 5);
+        assert_eq!(blank.release(), Outcome::Exit);
+    }
+
+    #[test]
+    fn dragging_onto_or_past_an_edge_scrolls_a_line_at_a_time() {
+        let mut mode = browsing(5, 20, &numbered(30));
+        mode.click(2, 0);
+        mode.drag(1, 0);
+        assert_eq!(top_and_cursor(&mode), (25, 26, 0));
+        mode.drag(0, 0);
+        assert_eq!(top_and_cursor(&mode), (24, 24, 0));
+        mode.drag(0, 1);
+        assert_eq!(top_and_cursor(&mode), (24, 24, 1));
+        mode.drag(-1, 1);
+        assert_eq!(top_and_cursor(&mode), (23, 23, 1));
+        mode.drag(-3, 1);
+        assert_eq!(top_and_cursor(&mode), (22, 22, 1));
+
+        mode.drag(4, 1);
+        assert_eq!(top_and_cursor(&mode), (23, 27, 1));
+        for _ in 0..3 {
+            mode.drag(9, 1);
+        }
+        assert_eq!(top_and_cursor(&mode), (25, 29, 1));
+        assert_eq!(mode.release(), Outcome::Copy("28\n29\n30".into()));
     }
 }

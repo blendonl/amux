@@ -288,6 +288,23 @@ Most terminals take OSC 52, among them kitty, ghostty, WezTerm, foot, Alacritty 
 amux.opt.clipboard.command = { "wl-copy" }
 ```
 
+## Mouse
+
+The server that holds the session reads these, and a reload applies them at once. The [README](../README.md#windows-and-panes) describes what the mouse does.
+
+| Option           | Default | Is                                                                                         |
+| ---------------- | ------- | ------------------------------------------------------------------------------------------ |
+| `scroll`         | `true`  | Whether the terminal reports the mouse to amux in every window, so the wheel scrolls a pane's history and dragging selects text in [copy mode](#copy-mode). With `false`, it reports the mouse only while a window has more than one pane or the active pane is in copy mode |
+| `scroll_lines`   | `3`     | How many lines each turn of the wheel scrolls, in copy mode and as `Up` and `Down` keys to a program in the alternate screen |
+| `escape_time_ms` | `25`    | How long a lone `Escape` that could start a mouse report waits for the rest of it          |
+
+All of them live under `amux.opt.mouse`. On Android, a swipe on the terminal scrolls like the wheel.
+
+```lua
+amux.opt.mouse.scroll_lines = 5
+amux.opt.mouse.scroll = false
+```
+
 ## The status bar
 
 | Option                | Default                  | Is                                                                 |
