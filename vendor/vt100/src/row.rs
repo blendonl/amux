@@ -128,6 +128,24 @@ impl Row {
         self.cells.get_mut(usize::from(col))
     }
 
+    pub fn print_narrow(
+        &mut self,
+        col: u16,
+        c: char,
+        attrs: crate::attrs::Attrs,
+    ) -> bool {
+        let Some(cell) = self.cells.get_mut(usize::from(col)) else {
+            return false;
+        };
+        if cell.is_wide() || cell.is_wide_continuation() {
+            return false;
+        }
+        cell.set(c, attrs);
+        self.restamp();
+        self.mark_used(usize::from(col) + 1);
+        true
+    }
+
     pub fn insert(&mut self, i: u16, cell: crate::Cell) {
         self.restamp();
         self.cells.insert(usize::from(i), cell);
