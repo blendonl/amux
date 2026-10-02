@@ -29,10 +29,7 @@ pub struct Opt<T> {
 impl<T: Serialize + DeserializeOwned + Default> Opt<T> {
     pub fn install(lua: &Lua) -> mlua::Result<Self> {
         let defaults = T::default();
-        let Shape::Struct(fields) = defaults
-            .serialize(Recorder)
-            .map_err(mlua::Error::external)?
-        else {
+        let Shape::Struct(fields) = shape(&defaults).map_err(mlua::Error::external)? else {
             return Err(mlua::Error::runtime(format!("{ROOT} must be a struct")));
         };
         let tree = |lua: &Lua| match lua.to_value_with(&defaults, SERIALIZE)? {
@@ -335,11 +332,15 @@ impl<'a> Unwrapper<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Shape {
+pub(super) enum Shape {
     Struct(BTreeMap<&'static str, Shape>),
     Map,
     Callback,
     Value,
+}
+
+pub(super) fn shape<T: Serialize + ?Sized>(value: &T) -> Result<Shape, Error> {
+    value.serialize(Recorder)
 }
 
 impl Shape {

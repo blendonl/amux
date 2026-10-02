@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard, PoisonError, Weak};
 
 use anyhow::Result;
 use tracing::{info, warn};
@@ -7,6 +7,7 @@ use tracing::{info, warn};
 use super::session::Session;
 use super::{server_name, Server};
 use crate::cluster;
+use crate::config::Watch;
 use crate::paths;
 use crate::settings::{ServerConfig, Settings};
 
@@ -15,6 +16,7 @@ const RESTART_REQUIRED: &str = "restart required for";
 impl Server {
     pub(super) async fn reload_config(&self) -> Result<Option<String>> {
         let _reloading = self.reloading.lock().await;
+        self.config_watch().reset(&self.config);
         match self.reload().await {
             Ok(notice) => {
                 info!(
@@ -28,6 +30,12 @@ impl Server {
                 Err(err)
             }
         }
+    }
+
+    fn config_watch(&self) -> MutexGuard<'_, Watch> {
+        self.config_watch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     async fn reload(&self) -> Result<Option<String>> {
@@ -73,6 +81,29 @@ impl Server {
             }
         }
         problems
+    }
+}
+
+pub(super) async fn watch_config(server: Weak<Server>) {
+    loop {
+        let Some(interval) = server
+            .upgrade()
+            .map(|server| server.settings().reload.interval())
+        else {
+            return;
+        };
+        tokio::time::sleep(interval).await;
+        let Some(server) = server.upgrade() else {
+            return;
+        };
+        if !server.settings().reload.watch {
+            continue;
+        }
+        let changed = server.config_watch().changed(&server.config);
+        if changed {
+            info!("the config changed, reloading it");
+            let _ = server.reload_config().await;
+        }
     }
 }
 

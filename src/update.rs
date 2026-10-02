@@ -13,6 +13,7 @@ use tempfile::TempDir;
 
 use crate::cli::UpdateArgs;
 use crate::client::{self, Endpoint};
+use crate::paths;
 use crate::protocol::{self, IncompatibleServer, ServerStatus, ServerView, Version, Welcome};
 
 const GITHUB_RELEASES: &str = "https://github.com/blendonl/amux/releases";
@@ -109,6 +110,9 @@ pub async fn run(endpoint: &Endpoint, args: UpdateArgs) -> Result<()> {
                 "updated {} from amux {current} to amux {wanted}",
                 installed.path.display()
             );
+            if let Some(types) = refresh_lua_types(&installed.path, endpoint.config.as_deref()) {
+                println!("updated the Lua types in {}", types.display());
+            }
             if let Some((server, cluster)) = running_server(&endpoint.socket).await {
                 print!("{}", after_update(&installed.version, &server, &cluster));
             }
@@ -120,6 +124,22 @@ pub async fn run(endpoint: &Endpoint, args: UpdateArgs) -> Result<()> {
 struct Installed {
     path: PathBuf,
     version: Version,
+}
+
+fn refresh_lua_types(binary: &Path, config: Option<&Path>) -> Option<PathBuf> {
+    let types = paths::lua_types_file()
+        .ok()
+        .filter(|types| types.exists())?;
+    let mut command = Command::new(binary);
+    if let Some(config) = config {
+        command.arg("--config").arg(config);
+    }
+    command
+        .args(["config", "lsp"])
+        .stdin(Stdio::null())
+        .output()
+        .is_ok_and(|output| output.status.success())
+        .then_some(types)
 }
 
 fn install(releases: &Releases, release: &Release) -> Result<Installed> {

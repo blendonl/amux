@@ -16,8 +16,8 @@ pub const INIT_FILE: &str = "init.lua";
 pub const SERVERS_FILE: &str = "servers.lua";
 pub const SYSTEM_INIT: &str = "/etc/amux/init.lua";
 const SERVERS_OPTION: &str = "servers";
-const MODULE_DIR: &str = "lua";
-const MODULE_PATTERNS: [&str; 2] = ["?.lua", "?/init.lua"];
+pub const MODULE_DIR: &str = "lua";
+pub const MODULE_PATTERNS: [&str; 2] = ["?.lua", "?/init.lua"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Process {
@@ -351,8 +351,8 @@ mod tests {
         assert!(
             error.contains(
                 "borders, cluster, discovery, escape_time_ms, lan, mouse, name, notice_ms, pane, \
-                 prefix, projects, projects_dir, search, servers, session, status, theme, tree, \
-                 which_key, window, worktrees"
+                 prefix, projects, projects_dir, reload, search, servers, session, status, theme, \
+                 tree, which_key, window, worktrees"
             ),
             "{error}"
         );

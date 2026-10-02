@@ -446,7 +446,7 @@ fn log(_: &Lua, values: Variadic<Value>) -> mlua::Result<()> {
     Ok(())
 }
 
-fn variants<T: DeserializeOwned>() -> &'static [&'static str] {
+pub(super) fn variants<T: DeserializeOwned>() -> &'static [&'static str] {
     let found = Cell::new(&[][..]);
     T::deserialize(VariantProbe(&found)).ok();
     found.get()

@@ -205,6 +205,11 @@ pub enum ConfigAction {
 
     #[command(about = "Make the running server load its config again, without a restart")]
     Reload,
+
+    #[command(
+        about = "Write the Lua types of the amux API and a .luarc.json for lua-language-server"
+    )]
+    Lsp,
 }
 
 #[derive(Debug, Args)]
