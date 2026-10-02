@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
@@ -11,10 +12,12 @@ use super::mouse::MouseDecoder;
 use super::render::GridDiffer;
 use super::session::Session;
 use super::status::StatusFeed;
+use super::upload::{Turn, Uploader};
 use super::{target_index, Resolved, Server};
 use crate::pairing;
 use crate::protocol::{
-    AttachedSession, ClientMessage, DebugCommand, Duplex, NewSession, ServerMessage, Size,
+    AttachedSession, ClientMessage, ClientTerminal, DebugCommand, Duplex, NewSession,
+    ServerMessage, Size,
 };
 use crate::target::{validate_session_name, Target};
 
@@ -61,8 +64,12 @@ pub async fn handle(
     mut client: ClientConnection,
     origin: Origin,
 ) -> Result<()> {
-    let Some(request) = client.incoming.recv().await else {
-        return Ok(());
+    let request = loop {
+        match client.incoming.recv().await {
+            Some(ClientMessage::Terminal(_)) => {}
+            Some(request) => break request,
+            None => return Ok(()),
+        }
     };
     debug!(?request, ?origin, "client request");
 
@@ -283,11 +290,14 @@ async fn run_routes(
     origin: Origin,
 ) -> Result<()> {
     let mut size = size.clamped();
+    let mut terminal = None;
     loop {
         let outcome = match route {
-            Route::Local(session) => attach(server, &session, &mut size, client, origin).await?,
+            Route::Local(session) => {
+                attach(server, &session, &mut size, &mut terminal, client, origin).await?
+            }
             Route::Remote { host, opening } => {
-                forward::run(server, client, &host, opening, &mut size).await?
+                forward::run(server, client, &host, opening, &mut size, &mut terminal).await?
             }
         };
         let target = match outcome {
@@ -348,10 +358,15 @@ async fn attach(
     server: &Arc<Server>,
     session: &Arc<Session>,
     size: &mut Size,
+    terminal: &mut Option<ClientTerminal>,
     client: &mut ClientConnection,
     origin: Origin,
 ) -> Result<Outcome> {
     let _client = server.track_client(session, origin);
+    let tracked = session.track_terminal();
+    if let Some(reported) = *terminal {
+        tracked.report(reported);
+    }
     session.resize(*size);
 
     let attached = ServerMessage::Attached(AttachedSession {
@@ -371,24 +386,52 @@ async fn attach(
     .await?;
     let mut cluster = StatusFeed::new(server, origin);
     let mut differ = GridDiffer::new(*size);
+    let mut uploader = Uploader::new(
+        Arc::clone(server.images()),
+        origin,
+        server.settings().images.client_memory_bytes(),
+    );
+    uploader.set_graphics(terminal.is_some_and(|reported| reported.graphics));
+    let mut session_terminal = session.watch_client_terminal();
+    uploader.set_cell_pixels(
+        session
+            .client_terminal()
+            .and_then(|latest| latest.cell_pixels),
+    );
+    let mut derivations = JoinSet::new();
     let mut mouse = MouseDecoder::new();
     let escape = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(escape);
     let mut dirty = true;
 
     loop {
+        if let Some(job) = uploader.take_job() {
+            derivations.spawn_blocking(move || job.run());
+        }
         tokio::select! {
-            permit = client.outgoing.reserve(), if dirty => {
+            permit = client.outgoing.reserve(), if dirty || uploader.has_work() => {
                 let Ok(permit) = permit else {
                     return Ok(Outcome::Detached);
                 };
-                dirty = false;
-                let Some(frame) = session.frame() else {
-                    continue;
-                };
-                let output = differ.diff(&frame);
-                if !output.is_empty() {
-                    permit.send(ServerMessage::Output(output));
+                match uploader.choose(dirty) {
+                    Some(Turn::Frame) => {
+                        dirty = false;
+                        uploader.set_budget(server.settings().images.client_memory_bytes());
+                        let Some(frame) = session.frame(uploader.viewer()) else {
+                            continue;
+                        };
+                        uploader.frame(&frame.images);
+                        let output = differ.diff(&frame);
+                        if !output.is_empty() {
+                            permit.send(ServerMessage::Output(output));
+                        }
+                    }
+                    Some(Turn::Upload) => {
+                        if let Some(op) = uploader.next() {
+                            permit.send(ServerMessage::Image(op));
+                        }
+                    }
+                    None => {}
                 }
             }
             changed = updates.changed() => {
@@ -396,6 +439,20 @@ async fn attach(
                     send(&client.outgoing, ServerMessage::Exited).await?;
                     return Ok(Outcome::Exited);
                 }
+                dirty = true;
+            }
+            Some(finished) = derivations.join_next(), if !derivations.is_empty() => {
+                match finished {
+                    Ok(finished) => uploader.finish(finished),
+                    Err(err) => {
+                        warn!("deriving an image failed: {err}");
+                        uploader.abandon();
+                    }
+                }
+            }
+            Ok(()) = session_terminal.changed() => {
+                let latest = *session_terminal.borrow_and_update();
+                uploader.set_cell_pixels(latest.and_then(|latest| latest.cell_pixels));
                 dirty = true;
             }
             Ok(()) = status.changed() => {
@@ -414,6 +471,7 @@ async fn attach(
             message = client.incoming.recv() => match message {
                 Some(ClientMessage::Input(bytes)) => {
                     resize_to_latest(session, *size);
+                    tracked.mark_active();
                     session.record_input();
                     for event in mouse.decode(&bytes) {
                         session.input(event);
@@ -426,11 +484,19 @@ async fn attach(
                 Some(ClientMessage::Resize(new_size)) => {
                     *size = new_size.clamped();
                     session.resize(*size);
+                    tracked.mark_active();
                     differ.set_client_size(*size);
+                    dirty = true;
+                }
+                Some(ClientMessage::Terminal(reported)) => {
+                    *terminal = Some(reported);
+                    tracked.report(reported);
+                    uploader.set_graphics(reported.graphics);
                     dirty = true;
                 }
                 Some(ClientMessage::Command(command)) => {
                     resize_to_latest(session, *size);
+                    tracked.mark_active();
                     session.record_input();
                     if let Err(err) = session.run(command.clone()) {
                         debug!(?command, "command failed: {err:#}");
@@ -444,6 +510,7 @@ async fn attach(
                 }
                 Some(ClientMessage::Redraw) => {
                     differ.reset();
+                    uploader.restart();
                     dirty = true;
                 }
                 Some(ClientMessage::ListCluster) => {

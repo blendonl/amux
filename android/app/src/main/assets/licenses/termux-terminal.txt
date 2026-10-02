@@ -1,5 +1,11 @@
 terminal-emulator and terminal-view v0.118.3
 https://github.com/termux/termux-app
+commit 5b657c6adf4304e5198951ce815fe0205dcac29c
+
+amux vendors these libraries as android/terminal-emulator and
+android/terminal-view in https://github.com/blendonl/amux and modifies them.
+Every file amux changed starts with a "Modified by amux" line that says what
+changed, and each library's UPSTREAM.md lists those files.
 
 These libraries derive from Terminal Emulator for Android by Jack Palevich
 (https://github.com/jackpal/Android-Terminal-Emulator) and are distributed

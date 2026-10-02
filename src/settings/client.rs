@@ -112,3 +112,40 @@ impl Default for WhichKeySettings {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientImages {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ImagesSettings {
+    pub client: ClientImages,
+    pub memory_mb: u32,
+    pub client_memory_mb: u32,
+}
+
+impl ImagesSettings {
+    pub fn memory_bytes(&self) -> u64 {
+        u64::from(self.memory_mb) * 1024 * 1024
+    }
+
+    pub fn client_memory_bytes(&self) -> u64 {
+        u64::from(self.client_memory_mb) * 1024 * 1024
+    }
+}
+
+impl Default for ImagesSettings {
+    fn default() -> Self {
+        Self {
+            client: ClientImages::Auto,
+            memory_mb: 320,
+            client_memory_mb: 256,
+        }
+    }
+}

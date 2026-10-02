@@ -2,8 +2,11 @@ mod common;
 
 use std::time::Duration;
 
-use amux::protocol::{ClientMessage, NewSession, ServerMessage};
-use common::{TestServer, SIZE, TIMEOUT};
+use amux::protocol::{ClientMessage, ClientTerminal, NewSession, ServerMessage, SessionCommand};
+use common::{
+    screen_row, terminal_log, TestClient, TestServer, DETACH, KITTY, PLAIN, SIZE, TIMEOUT,
+};
+use tokio::task::block_in_place;
 
 #[tokio::test]
 async fn reattaching_after_a_detach_redraws_the_whole_screen() {
@@ -123,5 +126,96 @@ async fn a_session_ends_when_its_shell_exits() {
             "the session was never removed"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_takes_the_terminal_its_client_reports_once_attached() {
+    let server = TestServer::start();
+    let mut client = server.client().await;
+    client.send(ClientMessage::Terminal(PLAIN)).await;
+    client.new_session(Some("s")).await;
+    client.send(ClientMessage::Terminal(KITTY)).await;
+
+    let log = block_in_place(|| server.wait_for_log(&terminal_log("s", KITTY)));
+    assert_eq!(log.matches("client terminal changed").count(), 1, "{log}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_latest_active_client_sets_the_session_terminal() {
+    let server = TestServer::start();
+    let mut first = server.client().await;
+    first.new_session(Some("s")).await;
+    first.send(ClientMessage::Terminal(KITTY)).await;
+    block_in_place(|| server.wait_for_log(&terminal_log("s", KITTY)));
+
+    let mut second = server.client().await;
+    second.attach(Some("s")).await;
+    second.send(ClientMessage::Terminal(PLAIN)).await;
+    block_in_place(|| server.wait_for_log(&terminal_log("s", PLAIN)));
+
+    first.type_text("true\r").await;
+    block_in_place(|| server.wait_for_log_count(&terminal_log("s", KITTY), 2));
+
+    first.detach().await;
+    block_in_place(|| server.wait_for_log_count(&terminal_log("s", PLAIN), 2));
+    second.detach().await;
+}
+
+const PROBE: &str = "sh -c 'printf \"\\033[16t\\033_Gi=31,s=1,v=1,a=q,f=24;AAAA\\033\\134\\033[c\"; read -r reply'\r";
+const KITTY_REPLIES: &str = "^[[6;21;10t^[_Gi=31;OK^[\\^[[?62;4;22c";
+
+async fn probe(client: &mut TestClient) -> String {
+    client.type_text("clear\r").await;
+    client
+        .wait_for_screen("a cleared screen", |screen| {
+            screen_row(screen, 0).trim() == "$" && screen_row(screen, 1).trim().is_empty()
+        })
+        .await;
+    client.type_text(PROBE).await;
+    let screen = client.wait_for_text("^[[?62;4;22c").await;
+    client.type_text("\r").await;
+    screen
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_session_terminal_reaches_its_panes() {
+    let server = TestServer::start();
+    let mut client = server.client().await;
+    client.new_session(Some("s")).await;
+    client.wait_for_text("$").await;
+
+    let before = probe(&mut client).await;
+    assert!(!before.contains("^[[6;"), "{before}");
+    assert!(!before.contains("OK"), "{before}");
+
+    client.send(ClientMessage::Terminal(KITTY)).await;
+    block_in_place(|| server.wait_for_log(&terminal_log("s", KITTY)));
+    let after = probe(&mut client).await;
+    assert!(after.contains(KITTY_REPLIES), "{after}");
+
+    client.command(SessionCommand::NewWindow).await;
+    client.wait_for_text("$").await;
+    let new_window = probe(&mut client).await;
+    assert!(new_window.contains(KITTY_REPLIES), "{new_window}");
+}
+
+#[test]
+fn the_client_reports_its_terminal_once_the_probe_is_over() {
+    for (images, graphics) in [("auto", false), ("on", true), ("off", false)] {
+        let server = TestServer::builder()
+            .config(&format!("amux.opt.images.client = {images:?}"))
+            .start();
+        let mut terminal = server.terminal(&["new", "-s", "s"]);
+        terminal.type_text("echo typed-$((6*7))\r");
+        terminal.wait_for_text("typed-42");
+
+        let reported = ClientTerminal {
+            graphics,
+            cell_pixels: None,
+        };
+        server.wait_for_log(&terminal_log("s", reported));
+        terminal.type_text(DETACH);
+        terminal.wait_for_exit();
     }
 }

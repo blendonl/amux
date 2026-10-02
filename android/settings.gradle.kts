@@ -11,11 +11,8 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
-        maven("https://jitpack.io") {
-            content { includeGroup("com.github.termux.termux-app") }
-        }
     }
 }
 
 rootProject.name = "amux"
-include(":app")
+include(":app", ":terminal-emulator", ":terminal-view")

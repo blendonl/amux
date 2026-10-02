@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 
 pub use android::{AndroidSettings, KeyboardSettings};
 pub use callback::{CallbackId, CALLBACK_SLOT};
-pub use client::{SearchSettings, StatusSettings, TreeSettings, WhichKeySettings};
+pub use client::{
+    ClientImages, ImagesSettings, SearchSettings, StatusSettings, TreeSettings, WhichKeySettings,
+};
 pub use cluster::{ClusterSettings, DiscoverySettings, LanSettings, ServerConfig, SshSettings};
 pub use host::{
     BorderSettings, MouseSettings, PaneSettings, ProjectConfig, SessionSettings, WindowSettings,
@@ -49,6 +51,7 @@ pub struct Settings {
     pub tree: TreeSettings,
     pub which_key: WhichKeySettings,
     pub search: SearchSettings,
+    pub images: ImagesSettings,
     pub pane: PaneSettings,
     pub window: WindowSettings,
     pub session: SessionSettings,
@@ -117,6 +120,11 @@ impl Settings {
                 self.worktrees.fetch_timeout_ms,
             ),
             ("search.project_depth", u64::from(self.search.project_depth)),
+            ("images.memory_mb", u64::from(self.images.memory_mb)),
+            (
+                "images.client_memory_mb",
+                u64::from(self.images.client_memory_mb),
+            ),
         ];
         if let Some((option, _)) = positive.iter().find(|(_, value)| *value == 0) {
             return Err(format!("amux.opt.{option} must be a positive number"));
@@ -153,6 +161,7 @@ impl Default for Settings {
             tree: TreeSettings::default(),
             which_key: WhichKeySettings::default(),
             search: SearchSettings::default(),
+            images: ImagesSettings::default(),
             pane: PaneSettings::default(),
             window: WindowSettings::default(),
             session: SessionSettings::default(),
@@ -217,6 +226,55 @@ mod tests {
         assert!(toml::from_str::<Settings>("[tree]\nbogus = 1").is_err());
         assert!(toml::from_str::<Settings>("[theme]\nbogus = {}").is_err());
         assert!(toml::from_str::<Settings>("[theme.status]\nbogus = 1").is_err());
+    }
+
+    #[test]
+    fn the_client_images_mode_is_auto_on_or_off() {
+        assert_eq!(Settings::default().images.client, ClientImages::Auto);
+        for (written, mode) in [
+            ("auto", ClientImages::Auto),
+            ("on", ClientImages::On),
+            ("off", ClientImages::Off),
+        ] {
+            let settings: Settings =
+                toml::from_str(&format!("[images]\nclient = \"{written}\"")).unwrap();
+            assert_eq!(settings.images.client, mode);
+        }
+        assert!(toml::from_str::<Settings>("[images]\nclient = \"yes\"").is_err());
+        assert!(toml::from_str::<Settings>("[images]\nbogus = 1").is_err());
+    }
+
+    #[test]
+    fn images_are_on_in_panes_and_capped_at_320_mib() {
+        let defaults = Settings::default();
+        assert!(defaults.pane.images);
+        assert_eq!(defaults.images.memory_mb, 320);
+        assert_eq!(defaults.images.memory_bytes(), 320 * 1024 * 1024);
+
+        let settings: Settings =
+            toml::from_str("[pane]\nimages = false\n\n[images]\nmemory_mb = 64").unwrap();
+        assert!(!settings.pane.images);
+        assert_eq!(settings.images.memory_mb, 64);
+        assert_eq!(settings.images.client, ClientImages::Auto);
+    }
+
+    #[test]
+    fn sixel_is_on_in_panes_unless_turned_off() {
+        assert!(Settings::default().pane.sixel);
+        let settings: Settings = toml::from_str("[pane]\nsixel = false").unwrap();
+        assert!(!settings.pane.sixel);
+        assert!(settings.pane.images);
+    }
+
+    #[test]
+    fn each_client_may_hold_256_mib_of_decoded_images() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.images.client_memory_mb, 256);
+        assert_eq!(defaults.images.client_memory_bytes(), 256 * 1024 * 1024);
+
+        let settings: Settings = toml::from_str("[images]\nclient_memory_mb = 32").unwrap();
+        assert_eq!(settings.images.client_memory_bytes(), 32 * 1024 * 1024);
+        assert_eq!(settings.images.memory_mb, 320);
     }
 
     #[test]
@@ -308,6 +366,14 @@ mod tests {
         assert_eq!(
             rejected(|settings| settings.search.project_depth = 0),
             "amux.opt.search.project_depth must be a positive number"
+        );
+        assert_eq!(
+            rejected(|settings| settings.images.memory_mb = 0),
+            "amux.opt.images.memory_mb must be a positive number"
+        );
+        assert_eq!(
+            rejected(|settings| settings.images.client_memory_mb = 0),
+            "amux.opt.images.client_memory_mb must be a positive number"
         );
 
         let named = Settings {

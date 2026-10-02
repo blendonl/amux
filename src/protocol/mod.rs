@@ -13,11 +13,12 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 pub use client::{
-    is_locale_variable, AttachedSession, ClientMessage, ClusterStatus, DebugCommand, Direction,
-    DiscoveryReport, DiscoveryStatus, DiscoveryView, LinkInfo, LinkState, LinkTransport,
-    NewSession, ProjectCheckout, ProjectRef, ServerMessage, ServerStatus, ServerView,
-    SessionCommand, SessionId, SessionInfo, SessionState, Size, SourceState, SourceView, Split,
-    Via, WindowSummary, MIN_COLS, MIN_ROWS,
+    is_locale_variable, AnimationControl, AnimationState, AttachedSession, CellPixels,
+    ClientMessage, ClientTerminal, ClusterStatus, DebugCommand, Direction, DiscoveryReport,
+    DiscoveryStatus, DiscoveryView, FrameSpec, ImageFormat, ImageOp, LinkInfo, LinkState,
+    LinkTransport, NewSession, ProjectCheckout, ProjectRef, ServerMessage, ServerStatus,
+    ServerView, SessionCommand, SessionId, SessionInfo, SessionState, Size, SourceState,
+    SourceView, Split, Via, WindowSummary, MIN_COLS, MIN_ROWS,
 };
 pub use greeting::{
     accept, cli_version, greet, Greeting, IncompatibleServer, Role, TcpKind, TcpOpen, Version,
@@ -302,6 +303,133 @@ mod tests {
             received.push(message);
         }
         assert_eq!(received, sent);
+    }
+
+    #[tokio::test]
+    async fn terminal_reports_survive_a_round_trip() {
+        let (mut client, mut server) = byte_pipe(1024);
+        let sent = vec![
+            ClientMessage::Terminal(ClientTerminal {
+                graphics: true,
+                cell_pixels: Some(CellPixels {
+                    width: 10,
+                    height: 21,
+                }),
+            }),
+            ClientMessage::Terminal(ClientTerminal::default()),
+        ];
+        for message in &sent {
+            write_message(&mut client, message).await.unwrap();
+        }
+        drop(client);
+
+        let mut received = Vec::new();
+        while let Some(message) = read_message::<_, ClientMessage>(&mut server).await.unwrap() {
+            received.push(message);
+        }
+        assert_eq!(received, sent);
+    }
+
+    #[tokio::test]
+    async fn image_operations_survive_a_round_trip() {
+        let (mut server, mut client) = byte_pipe(1 << 16);
+        let transmit = |format, data: Vec<u8>, last| ImageOp::Transmit {
+            key: 70_000,
+            format,
+            width: 640,
+            height: 480,
+            compressed: format != ImageFormat::Png,
+            total: 40_000,
+            data,
+            last,
+        };
+        let sent = vec![
+            ServerMessage::Image(transmit(ImageFormat::Rgb24, vec![0, 255, 7], false)),
+            ServerMessage::Image(transmit(ImageFormat::Rgba32, vec![1; 9000], true)),
+            ServerMessage::Image(transmit(ImageFormat::Png, Vec::new(), true)),
+            ServerMessage::Image(ImageOp::Place {
+                key: 70_000,
+                cols: 30,
+                rows: 12,
+            }),
+            ServerMessage::Image(ImageOp::Delete { key: u32::MAX }),
+            ServerMessage::Image(ImageOp::Frame {
+                key: 70_000,
+                spec: FrameSpec {
+                    edit: 3,
+                    base: 2,
+                    x: 10,
+                    y: 20,
+                    background: 0xff00_00ff,
+                    replace: true,
+                    gap: -1,
+                },
+                format: ImageFormat::Rgba32,
+                width: 30,
+                height: 40,
+                compressed: true,
+                total: 9000,
+                data: vec![5; 9000],
+                last: false,
+            }),
+            ServerMessage::Image(ImageOp::Animate {
+                key: 70_000,
+                control: AnimationControl {
+                    frame: 1,
+                    gap: 120,
+                    current: 4,
+                    state: Some(AnimationState::Loading),
+                    loops: 3,
+                },
+            }),
+            ServerMessage::Image(ImageOp::Animate {
+                key: 1,
+                control: AnimationControl::default(),
+            }),
+        ];
+        for message in &sent {
+            write_message(&mut server, message).await.unwrap();
+        }
+        drop(server);
+
+        let mut received = Vec::new();
+        while let Some(message) = read_message::<_, ServerMessage>(&mut client).await.unwrap() {
+            received.push(message);
+        }
+        assert_eq!(received, sent);
+    }
+
+    #[test]
+    fn image_data_travels_as_raw_bytes() {
+        let transmit = ImageOp::Transmit {
+            key: 1,
+            format: ImageFormat::Png,
+            width: 2,
+            height: 3,
+            compressed: true,
+            total: 3,
+            data: vec![7, 8, 9],
+            last: true,
+        };
+        assert_eq!(
+            postcard::to_stdvec(&transmit).unwrap(),
+            [0, 1, 2, 2, 3, 1, 3, 3, 7, 8, 9, 1]
+        );
+        let frame = ImageOp::Frame {
+            key: 1,
+            spec: FrameSpec::default(),
+            format: ImageFormat::Png,
+            width: 2,
+            height: 3,
+            compressed: true,
+            total: 3,
+            data: vec![7, 8, 9],
+            last: true,
+        };
+        assert_eq!(
+            postcard::to_stdvec(&frame).unwrap(),
+            [3, 1, 0, 0, 0, 0, 0, 0, 0, 2, 2, 3, 1, 3, 3, 7, 8, 9, 1]
+        );
     }
 
     #[test]

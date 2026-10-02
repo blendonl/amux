@@ -1,5 +1,6 @@
 mod chrome;
 mod fuzzy;
+pub(crate) mod graphics;
 mod listing;
 mod projects;
 mod relay;
@@ -540,7 +541,9 @@ async fn attach(
     );
     let outcome = {
         let _terminal = RawTerminal::enter()?;
-        relay::run(incoming, outgoing, &mut relay, endpoint).await?
+        let outcome = relay::run(incoming, outgoing, &mut relay, endpoint).await;
+        let _ = terminal::write_output(&relay.clear_images());
+        outcome?
     };
     println!("[{outcome} (from session {})]", relay.label());
     Ok(())

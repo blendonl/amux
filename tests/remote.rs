@@ -5,8 +5,8 @@ use amux::protocol::{
     ClientMessage, Direction, NewSession, ServerMessage, ServerView, SessionCommand, Size, Split,
 };
 use common::{
-    linked, screen_column, screen_region, window_summary as window, Listing, Resume, TestClient,
-    TestServer, DETACH, SIZE,
+    linked, screen_column, screen_region, terminal_log, window_summary as window, Listing, Resume,
+    TestClient, TestServer, DETACH, KITTY, PLAIN, SIZE,
 };
 use nix::sys::signal::{kill, Signal};
 
@@ -209,6 +209,42 @@ async fn dropping_the_link_mid_attach_reconnects_with_a_full_redraw() {
     client.type_text("echo again-$((6*7))\r").await;
     client.wait_for_text("again-42").await;
     client.detach().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_client_terminal_follows_the_client_to_a_peer_and_after_a_reconnect() {
+    let [a, b] = a_dials_b(&[]);
+    session_on(&b, "s").await;
+    blocking(|| a.wait_for_ls("s on b", |ls| sessions_on(ls, "b") == ["s"]));
+    let mut client = a.client().await;
+    client.new_session(Some("here")).await;
+    client.send(ClientMessage::Terminal(KITTY)).await;
+    blocking(|| a.wait_for_log(&terminal_log("here", KITTY)));
+
+    client
+        .send(ClientMessage::Switch("s@b".parse().unwrap()))
+        .await;
+    match client.next_non_output().await {
+        Some(ServerMessage::Attached(attached)) => assert_eq!(attached.session, "s"),
+        other => panic!("expected to switch to s@b, got {other:?}"),
+    }
+    blocking(|| b.wait_for_log(&terminal_log("s", KITTY)));
+
+    let mut direct = b.client().await;
+    direct.attach(Some("s")).await;
+    direct.send(ClientMessage::Terminal(PLAIN)).await;
+    blocking(|| b.wait_for_log(&terminal_log("s", PLAIN)));
+
+    blocking(|| a.run_ok(&["debug", "drop-link", "b"]));
+    match client.next_non_output().await {
+        Some(ServerMessage::Reconnecting { server }) => assert_eq!(server, "b"),
+        other => panic!("expected to reconnect, got {other:?}"),
+    }
+    match client.next_non_output().await {
+        Some(ServerMessage::Attached(attached)) => assert_eq!(attached.session, "s"),
+        other => panic!("expected to be attached again, got {other:?}"),
+    }
+    blocking(|| b.wait_for_log_count(&terminal_log("s", KITTY), 2));
 }
 
 #[tokio::test(flavor = "multi_thread")]

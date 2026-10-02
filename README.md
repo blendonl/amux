@@ -82,6 +82,21 @@ A session holds numbered windows, and each window splits into panes, each runnin
 - While a window has more than one pane, the terminal reports mouse clicks to amux, and clicking a pane makes it the active one. Most terminals still select text when you hold Shift. A program that turns on mouse reporting itself, like `vim` with `mouse=a` or `htop`, gets the clicks inside its own pane in its own coordinates.
 - These keys work the same on a session on another server: they travel over the peer link to the server that holds the session.
 
+### Images
+
+Programs in a pane can show images with the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/): `kitten icat`, yazi, chafa, timg, image.nvim, ratatui-image and the other programs that speak it, including the ones that think they run inside tmux and wrap their commands in tmux passthrough. amux keeps each image on the server and draws it into the frame as kitty's Unicode placeholder cells, so an image scrolls with its text, stays inside its pane and under the status bar and the popups, and comes back when you detach and attach again, on a remote session too.
+
+Images show in terminals that draw those placeholders: kitty 0.28 or later, ghostty, and the amux Android app (see [Images on the phone](#images-on-the-phone)). In any other terminal you see the text under the image, and blank cells where a program printed placeholders itself.
+
+When it attaches, the client asks the terminal whether it shows images: a kitty graphics query, `XTVERSION`, the cell size in pixels and a device attributes query, answered within 500 ms or not at all. `amux.opt.images.client` decides what to do with the answers. `"auto"`, the default, shows images when the terminal answers the kitty query and names itself kitty 0.28 or later, ghostty or the amux app. `"on"` shows them without asking, and `"off"` never asks and never shows them. A program that asks a pane whether images work is told yes only while the client that typed last shows them, and `amux.opt.pane.images = false` turns images off in new panes.
+
+- Animations play in kitty. The frames a program adds, edits and composes, their gaps and its commands to start, stop and loop reach the terminal, and a client that attaches in the middle gets every frame and the animation's state. Ghostty and the amux app show only the first frame. A placement that gets a derived image, described next, isn't animated and shows the image as first sent. Frames count against `amux.opt.images.memory_mb` with their image, and a program that sends more frames than fit gets `ENOSPC`.
+- A placement that crops its image, moves it inside its first cell, stretches it to a given number of columns and rows, or shows it at its own size without filling its cells is sent as a new image the server makes to look that way, in cells the size of those of the client that typed last. Past 4096×4096 pixels, or when it doesn't fit in `amux.opt.images.memory_mb`, the image is fitted whole into its cells instead. A client whose cells are another size sees the new image scaled to fit.
+- An image that scrolls off the top of its pane is gone. Scrolling the terminal back doesn't bring it back.
+- The server keeps `amux.opt.images.memory_mb` (320) MiB of images, as stored, and lets go of the least recently used image without a placement first. Each client's terminal gets at most `amux.opt.images.client_memory_mb` (256) MiB of images, as decoded: when that's full, the server deletes the images the client isn't showing, least recently used first, and an image that still doesn't fit shows the text under it.
+
+Sixel images work too: `img2sixel`, `lsix`, gnuplot, `mpv --vo=sixel` and the other programs that print them. A pane says it has sixel in its device attributes, keeps 1024 colour registers and answers `XTSMGRAPHICS`, and amux sends each sixel image to the client like a kitty one. As in xterm and foot, the cursor ends on the image's last row at its first column, or right of the image with mode 8452, and text printed over a sixel cuts it. `amux.opt.pane.sixel = false` turns sixel off in new panes.
+
 ### Status bar and the cluster tree
 
 The client keeps the bottom row of the terminal for a status bar, so a session gets one row less than the terminal has. With `amux.opt.status.enabled = false` the session gets every row, and errors and prompts cover the bottom row only while they show:
@@ -280,6 +295,7 @@ What a reload changes:
 - **The client**: the prefix, the key bindings, the status bar, the tree, the which-key popup, the search directories, the theme, and the notice and escape times, right away. An open prompt, tree or which-key popup closes.
 - **Panes and windows**: the ones opened after the reload get the new `pane`, `window` and session naming settings. Panes that are already running keep the shell, `TERM` and environment they started with. Pane borders are drawn again with the new `borders` and theme.
 - **Projects**: `projects` and `projects_dir` apply to the next session.
+- **Images**: `images.memory_mb` and `images.client_memory_mb` apply right away, and so does `images.client` in the client. `pane.images` and `pane.sixel` apply to the panes opened after the reload.
 - **The cluster**: servers added to `amux.opt.servers` or `servers.lua` are linked, and removed ones are dropped. The status interval applies right away, and the other `cluster` timings to the next dial, backoff and link.
 - **A restart** (`amux kill-server`) is still needed for `name`, `discovery` and `lan`, because the server's identity, its listeners and its discovery sources are set up once. A reload keeps their running values, applies the rest, and says so: `config reloaded; restart required for amux.opt.name`.
 
@@ -684,6 +700,25 @@ layers.base.left[5] = {
 layers.base.right[5] = { "Backspace", "layer:sym", "layer:num" }
 ```
 
+#### Images on the phone
+
+The app's terminal draws the images amux sends it, so `kitten icat`, yazi, chafa and the other programs in [Images](#images) show pictures on the phone as they do on the desktop. The terminal answers the client's probe with a kitty graphics OK and the name `amux-android(1)`, so the default `amux.opt.images.client = "auto"` turns images on.
+
+- The terminal takes the kitty graphics commands the amux client writes: PNG, RGB and RGBA images sent in the command itself, compressed with `o=z` or not, virtual placements, deletes and queries. It draws an image only through the Unicode placeholder cells amux paints, never at the cursor, and reads no files or shared memory. Programs in panes can still use all of those, because amux turns them into placeholders. It leaves out animation frames, so an animated image shows its first frame.
+- The terminal keeps at most 48 MiB of images, as received, and lets go of the least recently used one past that. The view keeps at most 128 MiB of decoded bitmaps, least recently used out first.
+- The view decodes an image on the UI thread the first time it draws it, scaled down to at most 4096 pixels a side, so a large image can hold up that one frame.
+- Each image is fitted whole into the cells of its placement, keeping its shape and centred, as kitty does.
+
+To try it, run this in a pane. It shows a 2×2 picture of red, green, blue and white pixels across 8 columns and 4 rows:
+
+```sh
+printf '\e_Ga=T,f=24,s=2,v=2,c=8,r=4;%s\e\\' "$(printf '\377\0\0\0\377\0\0\0\377\377\377\377' | base64)"
+```
+
+A small PNG on the phone works the same way with `f=100`: `printf '\e_Ga=T,f=100;%s\e\\' "$(base64 -w0 picture.png)"`.
+
+The emulator's and the view's unit tests cover this, and `GraphicsFixturesTest` replays the exact bytes the amux client writes for an upload, as stored or derived by the server, its placement and its placeholder cells, which `cargo test` keeps in `android/terminal-emulator/src/test/resources/graphics/`. Images haven't been tried on a phone or an Android emulator yet.
+
 #### zsh, git and ssh
 
 The APK carries its own userland, built from Termux's package recipes. Panes run zsh, and these are on their `PATH`:
@@ -787,7 +822,6 @@ git, which is GPL-2.0-only, links OpenSSL 3. openssh is built without Kerberos, 
 - The userland only works for the phone's primary user. Its programs look for their libraries, and its scripts for their interpreters, under `/data/data/io.github.blendonl.amux/`, which is the primary user's data directory, so zsh, git and ssh don't work in a work profile or for a secondary user.
 - `amux update` can't replace amux on the phone: when a newer release is out, it stops with `there are no amux releases for android; build amux from source`. amux comes with the APK, so update the app instead: install `amux-android.apk` from a newer release, which keeps the app's data. An APK you build yourself is signed with another key, so it only installs over another build of your own, with `adb install -r`.
 - Android 12 and later limit the processes that apps start, which Android calls phantom processes, and kill them when there are more than 32 across the phone or when one uses a lot of CPU in the background. The server, the client and every pane's shell are such processes, so a pane's shell can stop without warning, and a server that is killed starts again without its sessions. To lift the limit, turn on "Disable child process restrictions" in the developer options on Android 14 and later, or run `adb shell settings put global settings_enable_monitor_phantom_procs false` from a computer on Android 12L and later. Android 12.0 takes `adb shell device_config set_sync_disabled_for_tests persistent` followed by `adb shell device_config put activity_manager max_phantom_processes 2147483647`.
-- Termux's `libtermux.so` v0.118.3, which the terminal view loads, isn't aligned for 16 KB memory pages, so the terminal may fail to load on phones that use them. The amux binary itself is aligned for 16 KB pages.
 
 #### Without the APK
 
@@ -818,7 +852,12 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 - Each **pane** spawns the user's shell in a PTY. Output goes through a `vt100` parser, so the server always holds the full screen state. That state is how a client gets a redraw when it reattaches. The shell doesn't inherit `SSH_*` variables from the server, and a session in a directory that doesn't exist fails instead of quietly starting in `$HOME`.
 - A **session** holds an ordered list of windows, and each **window** holds a layout tree and its panes. The layout splits the window into rectangles with a one-cell border between siblings, and each pane's PTY is sized to its rectangle.
 - The **compositor** paints the active window into a grid of cells: every pane's cells are read straight from its `vt100` screen while that pane's parser is locked, so nothing is copied per frame, and the borders are drawn with box-drawing characters. The cursor and input modes come from the active pane.
+- **Images** come out of a pane's output before the `vt100` parser sees them: an APC scanner cuts out kitty graphics commands and unwraps tmux passthrough. The images go into one store for the whole server, under keys that are never reused, and each placement is anchored to the screen rows it covers, so it moves when they scroll and ends when the last of them leaves the screen. Each placement also gets a display key of its own, which is the id the client's terminal knows its image by, so the same image placed twice is sent twice. An animation's frames are kept with their image as kitty keeps them: a frame drawn over another frame stays as it was sent until a program edits it or composes onto it, and then the server draws it whole, blending as kitty does.
+- **Sixel** images come through the DCS callbacks of the vendored `vt100` parser. The pane decodes each one, marks the cells it covers and moves the cursor as xterm does, and the pump stores the image, padded to whole cells, outside the parser lock. A sixel placement paints only the cells that are still marked, so text printed over it cuts it, and it ends when none are left or a newer sixel covers all of them.
+- For a client that shows images, the compositor paints every placement as kitty Unicode placeholder cells: U+10EEEE with diacritics for the image row and column, and the display key as the foreground colour. They go through the differ, the borders and the client's chrome like any other cell. Placeholders a program prints itself are rewritten from its image and placement ids to the display key, and a client that can't show an image gets the text under it instead, or blanks for printed placeholders. A pane without images and without printed placeholders costs nothing extra.
 - Each attached **client** has its own differ, which compares the new grid with the last one that client was sent, clipped to that client's terminal size, and sends only the changed cells. It moves the cursor and clears line by line, never the whole screen. Frames are pulled, not pushed: output in a visible pane or a layout change only marks the client dirty, and the server composes a frame when the connection has room for one. A slow client skips intermediate screens, and its keystrokes never wait behind output. Keystrokes go back as raw bytes, key bindings as commands, and resizes are sent when `SIGWINCH` arrives.
+- Each attached client also has an **uploader**, which sends the images its frames use as `Image` messages: the stored bytes in chunks of up to 1 MiB, or 64 KiB when the client is on another server, and then a virtual placement of the placement's size. A frame may use an image before it arrives, since the terminal draws the cells again when it does. The uploader sends one image message after each frame and keeps going while no frame is due, so neither waits for the other. It keeps each terminal within `images.client_memory_mb`, counting each image's first frame, deletes an image from the terminal when its placement ends, and starts over on every attach. After an animated image's placement come its animation frames and state, and later changes follow as the difference between what the terminal has and what the store holds: new animation frames as sent, changed ones whole, and new gaps and controls. Deleting an animation frame sends the whole image again. The client turns those messages into kitty graphics commands, never mixing another command into an unfinished upload, and deletes everything it sent when it attaches again or exits.
+- A terminal fits a virtual placement's whole image into its cells, so a placement with a source rectangle, a cell offset, a stretch or a size of its own would look wrong. For those the uploader sends a **derived image** instead: a blocking task decodes the stored image, crops, scales and pads it to the placement's cells at the session's cell size, and keeps it deflated in the store under the display key, counted against the store's quota and the first thing let go of when it fills. Until it's ready the frame uses the key as if its upload were still on its way. When the session's cell size changes, the uploader deletes each derived image from the terminal and sends it again for the new size. A sixel image is already padded to its cells, so it never needs one.
 - The host decodes **mouse** reports from the client's input. A click focuses the pane under the pointer, and a report only reaches a pane whose program asked for that kind of event, re-encoded in that pane's coordinates and format. A lone `Escape` that could start a report is held for at most 25 ms, so it never gets stuck.
 - The **protocol** uses length-prefixed `postcard` frames. A connection opens with a `Greeting` and a `Welcome` whose layout never changes, then carries `ClientMessage` and `ServerMessage`. Any change to those messages bumps the major version. The server handles a connection as a `Duplex`, a pair of message channels, so it doesn't care what transport sits underneath.
 - A **peer link** carries the same frames. After the greeting both servers send a `Hello`, the lower ID decides whether the link is a duplicate, and then each side sends a snapshot of its sessions followed by events stamped with its incarnation and a sequence number, so stale or repeated updates are dropped. One writer drains a control lane (pongs, credit, goodbyes, trust updates) ahead of a bulk lane (snapshots, events and channel data), and the reader never waits on anything the other side controls, so a peer that stops reading cannot stall this one.
@@ -872,7 +911,9 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 | `src/server/session.rs`       | Session state, its windows and the commands that change them                                                       |
 | `src/server/window.rs`        | A window's layout, panes, active pane and mouse routing                                                            |
 | `src/server/layout.rs`        | The pane layout tree: splits, rectangles, borders and neighbours                                                   |
-| `src/server/render/`          | The compositor, the per-client differ and escape sequences                                                         |
+| `src/server/render/`          | The compositor, image placeholders, the per-client differ and escape sequences                                     |
+| `src/server/graphics/`        | Kitty graphics commands, the image store, placements and the sixel decoder                                         |
+| `src/server/upload.rs`        | Sending each client the images its frames use, within its memory budget                                            |
 | `src/server/mouse.rs`         | Decoding and re-encoding mouse reports                                                                             |
 | `src/server/pane.rs`          | PTY, shell process, terminal emulation                                                                             |
 | `src/client/mod.rs`           | Commands, server bootstrap, attaching                                                                              |
@@ -892,6 +933,8 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 | `android/`                    | The Android app, a Gradle project: the userland installer, the service that runs `amux server`, and the terminal   |
 | `android/build.sh`            | Builds the image, amux and the userland, packages the userland, smoke-tests both in Termux and builds the APK      |
 | `android/docker/`             | The build image: JDK 17, the Android SDK and NDK, Rust with the Android targets, and `cargo-ndk`                   |
+| `android/terminal-emulator/`  | Termux's terminal emulator v0.118.3 and its `libtermux.so`, vendored; `UPSTREAM.md` lists the files amux changed   |
+| `android/terminal-view/`      | Termux's terminal view v0.118.3, the Android view that draws the emulator's screen, vendored the same way          |
 | `android/userland/`           | The userland's `packages.txt`, and the termux-packages commit and builder image `termux-packages.txt` pins         |
 | `android/userland/overlay/`   | Patches to termux-packages, such as the app's package name and openssh without Kerberos or sshd                    |
 | `android/userland/package.py` | Splits a userland into `libu_*.so` programs and a zip with the rest, `SYMLINKS.txt` and `USERLAND_VERSION`         |
@@ -905,6 +948,8 @@ Set `AMUX_LOG=debug` before the server starts to get more verbose logs.
 Discovery is off in every test server unless the test turns it on, so no test touches the real tailnet or LAN. A fake `tailscale` (`AMUX_TAILSCALE`) serves `status` and `whois` from JSON files the test rewrites, a directory stands in for mDNS (`AMUX_LAN_DIR`), and a fake `ssh` (`AMUX_SSH`) maps host names to test servers. The one test that pairs over real mDNS, on a random service type set with `AMUX_MDNS_SERVICE`, is ignored by default because loopback has no multicast. `cargo test -- --ignored` runs it on a machine with a real network.
 
 The `amux update` and `install.sh` tests serve fake releases from a `file://` directory through `AMUX_RELEASES_URL`, and update a copy of the binary in a temporary directory.
+
+Some unit tests write the fixtures the Android tests read: the keyboard defaults in `android/app/src/test/resources/keyboard/`, and the bytes the client writes for images in `android/terminal-emulator/src/test/resources/graphics/`. They fail when a fixture is out of date, and `AMUX_UPDATE_FIXTURES=1 cargo test` writes them again.
 
 ## Releasing
 
@@ -962,4 +1007,5 @@ Beyond the design:
 - [x] Releases for Linux and macOS, an install script and `amux update`
 - [x] An Android app that runs amux on a phone and joins the cluster, with zsh, git and ssh in its panes
 - [x] Key sequences and submaps, and `Ctrl-b s` to fuzzy-find projects and worktrees
+- [x] Images from the kitty graphics protocol, shown in kitty, ghostty and the Android app
 - [ ] Scrollback and copy mode

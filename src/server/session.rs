@@ -7,17 +7,20 @@ use std::time::SystemTime;
 use anyhow::{anyhow, bail, Result};
 use portable_pty::ExitStatus;
 use tokio::sync::{watch, Notify};
+use tracing::info;
 
 use super::connection::Origin;
+use super::graphics::store::ImageStore;
 use super::layout::PaneId;
 use super::lua_host::{HookEvent, HookSink};
 use super::mouse::InputEvent;
 use super::pane::{Pane, PaneObserver, PaneSpec};
-use super::render::Frame;
+use super::render::{Frame, Viewer};
 use super::window::Window;
 use crate::project::ProjectId;
 use crate::protocol::{
-    SessionCommand, SessionId, SessionInfo, SessionState, Size, Split, WindowSummary,
+    ClientTerminal, SessionCommand, SessionId, SessionInfo, SessionState, Size, Split,
+    WindowSummary,
 };
 use crate::settings::Settings;
 
@@ -39,6 +42,7 @@ impl Binding {
 pub struct SessionHost {
     pub settings: watch::Receiver<Arc<Settings>>,
     pub hooks: HookSink,
+    pub images: Arc<ImageStore>,
 }
 
 pub struct Session {
@@ -52,6 +56,9 @@ pub struct Session {
     binding: Option<Binding>,
     settings: watch::Receiver<Arc<Settings>>,
     hooks: HookSink,
+    images: Arc<ImageStore>,
+    terminals: Mutex<Terminals>,
+    terminal: watch::Sender<Option<ClientTerminal>>,
     windows: Mutex<Windows>,
 }
 
@@ -65,7 +72,11 @@ impl Session {
         binding: Option<Binding>,
         host: SessionHost,
     ) -> Result<Arc<Self>> {
-        let SessionHost { settings, hooks } = host;
+        let SessionHost {
+            settings,
+            hooks,
+            images,
+        } = host;
         let session = Arc::new(Self {
             id,
             name: Mutex::new(name),
@@ -77,6 +88,9 @@ impl Session {
             binding,
             settings,
             hooks,
+            images,
+            terminals: Mutex::new(Terminals::default()),
+            terminal: watch::channel(None).0,
             windows: Mutex::new(Windows::new(size.clamped())),
         });
         session.open_window()?;
@@ -187,6 +201,36 @@ impl Session {
         self.state().size
     }
 
+    pub fn track_terminal(&self) -> TrackedTerminal<'_> {
+        let id = self.update_terminals(Terminals::join);
+        TrackedTerminal { session: self, id }
+    }
+
+    pub fn client_terminal(&self) -> Option<ClientTerminal> {
+        *self.terminal.borrow()
+    }
+
+    pub fn watch_client_terminal(&self) -> watch::Receiver<Option<ClientTerminal>> {
+        self.terminal.subscribe()
+    }
+
+    fn update_terminals<T>(&self, change: impl FnOnce(&mut Terminals) -> T) -> T {
+        let mut terminals = lock(&self.terminals);
+        let result = change(&mut terminals);
+        let changed = terminals.latest().filter(|&latest| {
+            self.terminal
+                .send_if_modified(|current| current.replace(latest) != Some(latest))
+        });
+        drop(terminals);
+        if let Some(terminal) = changed {
+            for window in &self.state().list {
+                window.set_client_terminal(terminal);
+            }
+            info!(session = %self.name(), ?terminal, "client terminal changed");
+        }
+        result
+    }
+
     pub fn redraw(&self) {
         self.state().redraw();
     }
@@ -200,11 +244,15 @@ impl Session {
         windows.redraw();
     }
 
-    pub fn frame(&self) -> Option<Frame> {
+    pub fn frame(&self, viewer: Viewer<'_>) -> Option<Frame> {
         let settings = self.settings();
         let windows = self.state();
         windows.signals.as_ref()?;
-        Some(windows.active_window()?.compose(windows.size, &settings))
+        Some(
+            windows
+                .active_window()?
+                .compose(windows.size, &settings, viewer),
+        )
     }
 
     pub fn input(&self, event: InputEvent) {
@@ -415,6 +463,8 @@ impl Session {
             env: &self.env,
             settings: &self.settings().pane,
             observer,
+            store: &self.images,
+            terminal: self.client_terminal(),
         })
     }
 
@@ -463,6 +513,87 @@ impl PaneObserver for Session {
             signal,
         });
         self.window_closed(removed.closed.as_ref());
+    }
+}
+
+pub struct TrackedTerminal<'a> {
+    session: &'a Session,
+    id: u64,
+}
+
+impl TrackedTerminal<'_> {
+    pub fn report(&self, terminal: ClientTerminal) {
+        self.session
+            .update_terminals(|terminals| terminals.report(self.id, terminal));
+    }
+
+    pub fn mark_active(&self) {
+        self.session
+            .update_terminals(|terminals| terminals.activate(self.id));
+    }
+}
+
+impl Drop for TrackedTerminal<'_> {
+    fn drop(&mut self) {
+        self.session
+            .update_terminals(|terminals| terminals.leave(self.id));
+    }
+}
+
+#[derive(Default)]
+struct Terminals {
+    next_id: u64,
+    clock: u64,
+    clients: Vec<AttachedTerminal>,
+}
+
+struct AttachedTerminal {
+    id: u64,
+    active: u64,
+    terminal: Option<ClientTerminal>,
+}
+
+impl Terminals {
+    fn join(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.clock += 1;
+        self.clients.push(AttachedTerminal {
+            id,
+            active: self.clock,
+            terminal: None,
+        });
+        id
+    }
+
+    fn activate(&mut self, id: u64) {
+        self.clock += 1;
+        let clock = self.clock;
+        if let Some(client) = self.client(id) {
+            client.active = clock;
+        }
+    }
+
+    fn report(&mut self, id: u64, terminal: ClientTerminal) {
+        if let Some(client) = self.client(id) {
+            client.terminal = Some(terminal);
+        }
+    }
+
+    fn leave(&mut self, id: u64) {
+        self.clients.retain(|client| client.id != id);
+    }
+
+    fn client(&mut self, id: u64) -> Option<&mut AttachedTerminal> {
+        self.clients.iter_mut().find(|client| client.id == id)
+    }
+
+    fn latest(&self) -> Option<ClientTerminal> {
+        self.clients
+            .iter()
+            .filter_map(|client| Some((client.active, client.terminal?)))
+            .max_by_key(|(active, _)| *active)
+            .map(|(_, terminal)| terminal)
     }
 }
 
@@ -652,6 +783,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::CellPixels;
     use crate::settings::{PaneSettings, WindowSettings};
 
     fn spawn(window: WindowSettings) -> Arc<Session> {
@@ -673,6 +805,7 @@ mod tests {
             SessionHost {
                 settings: watch::channel(Arc::new(settings)).1,
                 hooks: HookSink::default(),
+                images: Arc::new(ImageStore::new(1 << 20)),
             },
         )
         .unwrap()
@@ -712,6 +845,55 @@ mod tests {
             [(1, editor()), (2, editor()), (3, editor())]
         );
         assert_eq!(session.status().active, 2);
+        session.kill();
+    }
+
+    #[test]
+    fn the_latest_active_client_with_a_terminal_sets_the_session_terminal() {
+        let session = spawn(WindowSettings::default());
+        let kitty = ClientTerminal {
+            graphics: true,
+            cell_pixels: Some(CellPixels {
+                width: 10,
+                height: 21,
+            }),
+        };
+        let plain = ClientTerminal {
+            graphics: false,
+            cell_pixels: Some(CellPixels {
+                width: 8,
+                height: 16,
+            }),
+        };
+        let mut changes = session.watch_client_terminal();
+        assert_eq!(session.client_terminal(), None);
+
+        let first = session.track_terminal();
+        assert!(!changes.has_changed().unwrap());
+        first.report(ClientTerminal::default());
+        assert_eq!(
+            *changes.borrow_and_update(),
+            Some(ClientTerminal::default())
+        );
+        first.report(kitty);
+        assert_eq!(*changes.borrow_and_update(), Some(kitty));
+
+        let second = session.track_terminal();
+        assert_eq!(session.client_terminal(), Some(kitty));
+        second.report(plain);
+        assert_eq!(*changes.borrow_and_update(), Some(plain));
+
+        first.mark_active();
+        assert_eq!(*changes.borrow_and_update(), Some(kitty));
+        first.report(kitty);
+        first.mark_active();
+        assert!(!changes.has_changed().unwrap());
+
+        drop(first);
+        assert_eq!(*changes.borrow_and_update(), Some(plain));
+        drop(second);
+        assert!(!changes.has_changed().unwrap());
+        assert_eq!(session.client_terminal(), Some(plain));
         session.kill();
     }
 }

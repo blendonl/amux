@@ -6,7 +6,8 @@ use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use tokio::sync::mpsc;
 
-use crate::protocol::Size;
+use super::graphics;
+use crate::protocol::{CellPixels, Size};
 use crate::settings::StatusSettings;
 
 const STDIN_BUFFER_LEN: usize = 4096;
@@ -17,6 +18,10 @@ const RESET_INPUT_MODES: &[u8] =
 pub fn size() -> Result<Size> {
     let (cols, rows) = terminal::size()?;
     Ok(Size { rows, cols }.clamped())
+}
+
+pub fn cell_pixels() -> Option<CellPixels> {
+    graphics::cell_pixels(&terminal::window_size().ok()?)
 }
 
 pub fn session_size(status: &StatusSettings) -> Result<Size> {
