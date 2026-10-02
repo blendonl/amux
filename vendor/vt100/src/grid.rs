@@ -5,7 +5,7 @@ pub struct Grid {
     size: Size,
     pos: Pos,
     saved_pos: Pos,
-    rows: Vec<crate::row::Row>,
+    rows: std::collections::VecDeque<crate::row::Row>,
     scroll_top: u16,
     scroll_bottom: u16,
     origin_mode: bool,
@@ -21,7 +21,7 @@ impl Grid {
             size,
             pos: Pos::default(),
             saved_pos: Pos::default(),
-            rows: vec![],
+            rows: std::collections::VecDeque::new(),
             scroll_top: 0,
             scroll_bottom: size.rows - 1,
             origin_mode: false,
@@ -145,10 +145,6 @@ impl Grid {
             )
     }
 
-    pub fn drawing_rows(&self) -> impl Iterator<Item = &crate::row::Row> {
-        self.rows.iter()
-    }
-
     pub fn drawing_rows_mut(
         &mut self,
     ) -> impl Iterator<Item = &mut crate::row::Row> {
@@ -156,18 +152,26 @@ impl Grid {
     }
 
     pub fn visible_row(&self, row: u16) -> Option<&crate::row::Row> {
-        self.visible_rows().nth(usize::from(row))
+        let row = usize::from(row);
+        if row >= self.rows.len() {
+            None
+        } else if row < self.scrollback_offset {
+            self.scrollback
+                .get(self.scrollback.len() - self.scrollback_offset + row)
+        } else {
+            self.rows.get(row - self.scrollback_offset)
+        }
     }
 
     pub fn drawing_row(&self, row: u16) -> Option<&crate::row::Row> {
-        self.drawing_rows().nth(usize::from(row))
+        self.rows.get(usize::from(row))
     }
 
     pub fn drawing_row_mut(
         &mut self,
         row: u16,
     ) -> Option<&mut crate::row::Row> {
-        self.drawing_rows_mut().nth(usize::from(row))
+        self.rows.get_mut(usize::from(row))
     }
 
     pub fn current_row_mut(&mut self) -> &mut crate::row::Row {
@@ -556,9 +560,10 @@ impl Grid {
     }
 
     fn recycle_row(&mut self, from: usize, to: usize) {
-        let mut row = self.rows.remove(from);
-        row.recycle(self.size.cols);
-        self.rows.insert(to, row);
+        if let Some(mut row) = self.rows.remove(from) {
+            row.recycle(self.size.cols);
+            self.rows.insert(to, row);
+        }
     }
 
     pub fn insert_lines(&mut self, count: u16) {
@@ -590,7 +595,11 @@ impl Grid {
 
     pub fn scroll_up(&mut self, count: u16) {
         for _ in 0..(count.min(self.size.rows - self.scroll_top)) {
-            let removed = self.rows.remove(usize::from(self.scroll_top));
+            let Some(removed) =
+                self.rows.remove(usize::from(self.scroll_top))
+            else {
+                return;
+            };
             let unused =
                 if self.scrollback_len > 0 && !self.scroll_region_active() {
                     self.push_scrollback(removed)
