@@ -47,7 +47,7 @@ The tables are:
 - `search`: the submap behind `Ctrl-b s`, a custom table amux starts with. It binds `p` to `search_projects`, `w` to `search_worktrees` and `s` to `cluster_tree`.
 - Any other name is a custom table, created by its first `set`. `switch_table(name)` reads the next key from it, then goes back to `root`. `Backspace`, when the table doesn't bind it, goes back to the table whose key switched here, or to `root` from the first one.
 
-In the `prompt`, `tree`, `picker` and `copy` tables, a modified key that isn't bound acts like the plain key, so `C-Left` moves like `Left`. Text pasted with bracketed paste (`ESC[200~ … ESC[201~`) always goes to the pane whole: root and prefix bindings don't fire inside a paste, and a paste right after the prefix cancels the prefix.
+In the `prompt`, `tree`, `picker` and `copy` tables, a modified key that isn't bound acts like the plain key, so `C-Left` moves like `Left`. Text pasted with bracketed paste (`ESC[200~ … ESC[201~`) always goes to the pane whole, unless the pane is in [copy mode](#copy-mode): root and prefix bindings don't fire inside a paste, and a paste right after the prefix cancels the prefix.
 
 ```lua
 amux.opt.prefix = "C-a"
@@ -197,7 +197,7 @@ The `copy` table holds the keys of [copy mode](../README.md#copy-mode). The serv
 | `search_again`              | Goes to the next match in the search's direction     | `n`               |
 | `search_reverse`            | Goes to the next match in the other direction        | `N`               |
 
-The digits `1` to `9` start a count that repeats the next action, and `0` adds to a count once one has started. They aren't in the table. A key the table doesn't bind does nothing.
+The digits `1` to `9` start a count that repeats the next action, and `0` adds to a count once one has started. They aren't in the table. A key the table doesn't bind does nothing, and pasted text goes into the search prompt while it is open and is dropped otherwise.
 
 `begin_selection` and `select_line` start a new selection at the cursor, even while one shows, and `refresh_from_pane` clears it. The selection is drawn in the `copy_selection` [theme](#the-theme) slot. `copy_selection_and_cancel` sends the text to the clipboard of the client that pressed the key, as set in [Clipboard](#clipboard), and keeps it in the server's paste buffer, which `paste_buffer()` types into the active pane.
 
