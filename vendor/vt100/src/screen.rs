@@ -857,6 +857,13 @@ impl Screen {
             // width() can only return 0, 1, or 2
             .unwrap();
 
+        if width == 1
+            && c != PLACEHOLDER
+            && self.grid_mut().print_narrow(c, attrs)
+        {
+            return;
+        }
+
         // it doesn't make any sense to wrap if the last column in a row
         // didn't already have contents. don't try to handle the case where a
         // character wraps because there was only one column left in the

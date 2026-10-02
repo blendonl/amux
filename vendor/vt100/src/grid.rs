@@ -193,6 +193,22 @@ impl Grid {
             .and_then(|r| r.get_mut(pos.col))
     }
 
+    pub fn print_narrow(
+        &mut self,
+        c: char,
+        attrs: crate::attrs::Attrs,
+    ) -> bool {
+        let pos = self.pos;
+        let printed = pos.col < self.size.cols
+            && self
+                .drawing_row_mut(pos.row)
+                .is_some_and(|row| row.print_narrow(pos.col, c, attrs));
+        if printed {
+            self.col_inc(1);
+        }
+        printed
+    }
+
     pub fn scrollback_len(&self) -> usize {
         self.scrollback_len
     }
