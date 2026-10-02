@@ -7,9 +7,11 @@ import com.termux.terminal.TerminalOutput;
 import junit.framework.TestCase;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.concurrent.Executor;
 
 public class BitmapCacheTest extends TestCase {
 
@@ -78,7 +80,24 @@ public class BitmapCacheTest extends TestCase {
         }
     }
 
+    private static final class QueuedExecutor implements Executor {
+        final ArrayDeque<Runnable> mQueued = new ArrayDeque<>();
+
+        @Override
+        public void execute(Runnable command) {
+            mQueued.add(command);
+        }
+
+        void runAll() {
+            while (!mQueued.isEmpty()) mQueued.poll().run();
+        }
+    }
+
+    private static final Executor DIRECT = Runnable::run;
+
     private final FakeLoader mLoader = new FakeLoader();
+    private final QueuedExecutor mDecoder = new QueuedExecutor();
+    private int mDecoded;
     private TerminalEmulator mEmulator;
     private ImageStore mStore;
 
@@ -115,7 +134,11 @@ public class BitmapCacheTest extends TestCase {
     }
 
     private BitmapCache<FakeBitmap> newCache(long capacity) {
-        return new BitmapCache<>(capacity, mLoader);
+        return new BitmapCache<>(capacity, mLoader, DIRECT, DIRECT, () -> mDecoded++);
+    }
+
+    private BitmapCache<FakeBitmap> newQueuedCache() {
+        return new BitmapCache<>(1000, mLoader, mDecoder, DIRECT, () -> mDecoded++);
     }
 
     public void testLoadsLazilyOnceAndReuses() {
@@ -131,6 +154,7 @@ public class BitmapCacheTest extends TestCase {
         assertSame(bitmap, cache.get(image, 4096));
         assertEquals(1, mLoader.mCalls);
         assertEquals(BITMAP_SIZE, cache.getSize());
+        assertEquals(1, mDecoded);
     }
 
     public void testRetransmittedImageIsReloaded() {
@@ -144,13 +168,106 @@ public class BitmapCacheTest extends TestCase {
         assertEquals(first.mId, second.mId);
         assertTrue(second.mGeneration != first.mGeneration);
         cache.sync(mStore);
-        assertTrue(firstBitmap.mReleased);
         assertFalse(cache.contains(first));
-        assertEquals(0, cache.getSize());
+        assertFalse(firstBitmap.mReleased);
 
         FakeBitmap secondBitmap = cache.get(second, 4096);
         assertSame(second, secondBitmap.mImage);
+        assertTrue(firstBitmap.mReleased);
+        assertEquals(BITMAP_SIZE, cache.getSize());
         assertEquals(2, mLoader.mCalls);
+    }
+
+    public void testAMissDecodesInTheBackgroundOnce() {
+        BitmapCache<FakeBitmap> cache = newQueuedCache();
+        ImageStore.Image image = transmit(1);
+        cache.sync(mStore);
+
+        assertNull(cache.get(image, 4096));
+        assertNull(cache.get(image, 4096));
+        assertEquals(0, mLoader.mCalls);
+        assertEquals(1, mDecoder.mQueued.size());
+
+        mDecoder.runAll();
+        assertEquals(1, mLoader.mCalls);
+        assertEquals(1, mDecoded);
+        assertSame(image, cache.get(image, 4096).mImage);
+    }
+
+    public void testThePreviousBitmapShowsUntilTheNewOneIsDecoded() {
+        BitmapCache<FakeBitmap> cache = newQueuedCache();
+        ImageStore.Image first = transmit(1);
+        cache.sync(mStore);
+        cache.get(first, 4096);
+        mDecoder.runAll();
+        FakeBitmap firstBitmap = cache.get(first, 4096);
+
+        ImageStore.Image second = transmit(1);
+        cache.sync(mStore);
+        assertSame(firstBitmap, cache.get(second, 4096));
+        assertEquals(BITMAP_SIZE, cache.getSize());
+
+        mDecoder.runAll();
+        assertTrue(firstBitmap.mReleased);
+        assertSame(second, cache.get(second, 4096).mImage);
+        assertEquals(BITMAP_SIZE, cache.getSize());
+    }
+
+    public void testAnImageReplacedDuringItsDecodeIsDropped() {
+        BitmapCache<FakeBitmap> cache = newQueuedCache();
+        ImageStore.Image first = transmit(1);
+        cache.sync(mStore);
+        cache.get(first, 4096);
+        ImageStore.Image second = transmit(1);
+        cache.sync(mStore);
+
+        mDecoder.runAll();
+        assertTrue(mLoader.mLoaded.get(0).mReleased);
+        assertFalse(cache.contains(first));
+        assertEquals(0, mDecoded);
+        assertNull(cache.get(second, 4096));
+    }
+
+    public void testAnImageDeletedDuringItsDecodeIsDropped() {
+        BitmapCache<FakeBitmap> cache = newQueuedCache();
+        ImageStore.Image image = transmit(1);
+        cache.sync(mStore);
+        cache.get(image, 4096);
+        delete(1);
+        cache.sync(mStore);
+
+        mDecoder.runAll();
+        assertTrue(mLoader.mLoaded.get(0).mReleased);
+        assertEquals(0, cache.size());
+        assertEquals(0, cache.getSize());
+    }
+
+    public void testADecodeThatFinishesAfterClearIsDropped() {
+        BitmapCache<FakeBitmap> cache = newQueuedCache();
+        ImageStore.Image image = transmit(1);
+        cache.sync(mStore);
+        cache.get(image, 4096);
+        cache.clear();
+
+        mDecoder.runAll();
+        assertTrue(mLoader.mLoaded.get(0).mReleased);
+        assertEquals(0, cache.size());
+        assertEquals(0, mDecoded);
+    }
+
+    public void testADeletedIdLetsGoOfItsPreviousBitmap() {
+        BitmapCache<FakeBitmap> cache = newCache(1000);
+        ImageStore.Image first = transmit(1);
+        cache.sync(mStore);
+        FakeBitmap firstBitmap = cache.get(first, 4096);
+        transmit(1);
+        cache.sync(mStore);
+        assertFalse(firstBitmap.mReleased);
+
+        delete(1);
+        cache.sync(mStore);
+        assertTrue(firstBitmap.mReleased);
+        assertEquals(0, cache.getSize());
     }
 
     public void testDeletedImageIsReleasedOnNextSync() {
