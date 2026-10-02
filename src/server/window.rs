@@ -13,7 +13,7 @@ use super::paste;
 use super::render::{self, CopyView, Frame, InputModes, Screens, Viewer};
 use crate::keys::KeyDecoder;
 use crate::protocol::{ClientTerminal, Direction, Size, Split, WindowSummary};
-use crate::settings::{CopyAction, MouseSettings, Settings, Table};
+use crate::settings::{Keymap, MouseSettings, Settings};
 
 #[derive(Debug, Default)]
 pub struct Handled {
@@ -176,7 +176,7 @@ impl Window {
         keys: &mut KeyDecoder,
         bytes: &[u8],
         timed_out: bool,
-        bindings: &Table<CopyAction>,
+        keymap: &Keymap,
     ) -> Handled {
         let id = self.active;
         let Some(copy) = self.copy.get_mut(&id) else {
@@ -194,7 +194,7 @@ impl Window {
             .or_else(|| timed_out.then(|| keys.time_out()).flatten())
         {
             handled.redraw = true;
-            match copy.press(&decoded, bindings) {
+            match copy.press(&decoded, keymap) {
                 Outcome::Stay => {}
                 Outcome::Refresh => {
                     if let Some(pane) = self.panes.get(&id) {
