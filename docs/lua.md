@@ -288,7 +288,7 @@ Text that amux copies, such as a selection yanked in copy mode, goes to the clip
 
 Both live under `amux.opt.clipboard`, and the client reads them, so a reload applies them to the next copy. Copied text past 1 MiB is cut off.
 
-Most terminals take OSC 52, among them kitty, ghostty, WezTerm, foot, Alacritty and the amux app. Some, such as GNOME Terminal, ignore it, and iTerm2 only takes it once you allow it in its settings; set `command` for those. On Android, the app's terminal takes OSC strings of up to 8,192 characters, so about 6 KB of copied text reaches the phone's clipboard, and a longer copy doesn't.
+Most terminals take OSC 52, among them kitty, ghostty, WezTerm, foot, Alacritty and the amux app. Some, such as GNOME Terminal, ignore it, and iTerm2 only takes it once you allow it in its settings; set `command` for those. On Android, the app's terminal takes OSC 52 sequences long enough for the whole 1 MiB. Android's clipboard is the limit there: it moves the text between processes in one transaction of about 1 MB, so it can turn down a copy of a few hundred KB or more, and the app then shows a short message and leaves the clipboard as it was.
 
 ```lua
 amux.opt.clipboard.command = { "wl-copy" }

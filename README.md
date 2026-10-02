@@ -329,7 +329,7 @@ A server's `address` is one of:
 - `tcp://host:port`, which links over Noise to that address. The other server's key must already be trusted, or vouched for by the tailnet. Tailscale discovery uses this form.
 - `lan://<server id>`, the form LAN discovery uses. The IP addresses and port come from mDNS each time amux dials.
 
-`amux.opt.clipboard` decides where the text you copy goes. With `osc52`, the default, the client that copied writes it to its terminal as an OSC 52 sequence, which puts it on the clipboard of the machine the terminal runs on, through SSH too. `command` runs a program on the client's machine with the text on standard input, for terminals that ignore OSC 52. On Android, the app's terminal takes OSC strings of up to 8,192 characters, so about 6 KB of copied text reaches the phone's clipboard. [docs/lua.md](docs/lua.md#clipboard) has the details.
+`amux.opt.clipboard` decides where the text you copy goes. With `osc52`, the default, the client that copied writes it to its terminal as an OSC 52 sequence, which puts it on the clipboard of the machine the terminal runs on, through SSH too. `command` runs a program on the client's machine with the text on standard input, for terminals that ignore OSC 52. On Android, the app's terminal takes the whole copy, but Android's clipboard turns down a very large one, and the app then shows a short message instead. [docs/lua.md](docs/lua.md#clipboard) has the details.
 
 ```lua
 amux.opt.clipboard.command = { "wl-copy" }
@@ -651,7 +651,7 @@ A layer key held by one thumb changes the other half, where the other thumb is f
 - `sym`, on the right thumb, turns the left half into every symbol the base layer lacks: `! @ # $ %` and `^ & * ( )` on the top two rows, then `[`, `]`, `=`, `\` and `` ` `` above `{`, `}`, `+`, `|` and `~`.
 - `num`, on the right thumb, turns the left half into a phone keypad, `1` to `9` with `0` under `8`, plus `F11` and `F12`. Holding a digit sends `F1` to `F10`, which its corner shows.
 - `nav`, on the left thumb, turns the right half into the arrows on `h` `j` `k` `l`, with `Home`, `PgDn`, `PgUp` and `End` under them, `Del` and `Ins`. The top row stays, so `Ctrl` then `←` still works.
-- `Prefix`, on the left thumb, sends `Ctrl-b`, whatever `amux.opt.prefix` is set to, when tapped. Held, it turns the right half into amux's prefix keys: new, previous, next, rename and kill window, split left-right and top-bottom, next and kill pane, help, the project, worktree and cluster pickers, reload, detach, rename session, and `Hide`.
+- `Prefix`, on the left thumb, sends `Ctrl-b`, whatever `amux.opt.prefix` is set to, when tapped. Held, it turns the right half into amux's prefix keys: new, previous, next, rename and kill window, split left-right and top-bottom, next and kill pane, help, the project, worktree and cluster pickers, reload, detach, rename session, and `Hide`. Its `copy` and `paste` keys start [copy mode](#copy-mode) and type the paste buffer into the pane, like `Ctrl-b [` and `Ctrl-b ]`.
 
 The keys:
 
@@ -660,13 +660,14 @@ The keys:
 - `Ctrl`, `Alt`, `⇧`, `sym`, `num` and `nav` all work the same way. A tap applies to the next key only, and shows the key's label in green meanwhile. A second tap locks it on and fills the key green, and a third tap turns it off. Holding the key applies it to every key you press until you let go, so one thumb can hold `nav` while the other taps arrows. While `Ctrl` or `Alt` is on, the letters show what they will send, such as `^C`.
 - With `⇧`, a letter types its capital, and `'`, `-`, `;`, `,`, `.` and `/` type `"`, `_`, `:`, `<`, `>` and `?`. Digits and the keys on `sym` stay as they are.
 - `⌫`, `Del`, the arrows, `PgUp` and `PgDn` repeat while held.
-- `Paste` pastes the clipboard, as bracketed paste when the pane asks for it.
+- `Paste` pastes the phone's clipboard, as bracketed paste when the pane asks for it. The `paste` key on the `Prefix` layer types amux's paste buffer instead.
 - `Hide` hides the keyboard so the terminal takes the whole width, and a tap on the terminal brings it back.
 
 In both:
 
 - Pinch to zoom. The app remembers the text size.
 - Long-press to select text on the screen, then pick Copy or Paste from the menu that opens.
+- Text you copy in [copy mode](#copy-mode) goes to the phone's clipboard, where other apps can paste it. When a copy is too large for Android's clipboard, a short message says so and the clipboard keeps what it had.
 - A tap on the terminal brings the keyboard back. amux turns on mouse reporting (see [Windows and panes](#windows-and-panes)), so the tap also reaches amux as a click and makes the pane under it active, and a swipe up or down scrolls the pane's history in [copy mode](#copy-mode).
 
 #### The landscape keyboard

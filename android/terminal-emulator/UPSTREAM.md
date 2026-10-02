@@ -15,7 +15,7 @@ This library is Termux's `terminal-emulator`, vendored from [termux/termux-app](
 
 Each modified file starts with a `Modified by amux:` line that says what changed.
 
-- `src/main/java/com/termux/terminal/TerminalEmulator.java`: buffers kitty graphics APC commands (`ESC _ G … ESC \`, at most 1 MiB each) and hands them to `KittyGraphics`, answers XTVERSION (`CSI > q`) with `amux-android(1)`, clears the image store on RIS, and exposes `getImages()`, `getCellWidthPixels()` and `getCellHeightPixels()`.
+- `src/main/java/com/termux/terminal/TerminalEmulator.java`: buffers kitty graphics APC commands (`ESC _ G … ESC \`, at most 1 MiB each) and hands them to `KittyGraphics`, answers XTVERSION (`CSI > q`) with `amux-android(1)`, clears the image store on RIS, and exposes `getImages()`, `getCellWidthPixels()` and `getCellHeightPixels()`. It also takes OSC strings of up to 1.5 Mi characters, so a 1 MiB OSC 52 copy from amux fits, drops a longer OSC whole up to its BEL or ST instead of printing the rest of it, and decodes OSC 52 with `java.util.Base64` so the unit tests can check it.
 - `src/main/java/com/termux/terminal/TerminalSession.java`: the two process queues and the receive buffer grow from 4 KiB to 64 KiB.
 
 ## New files
@@ -29,6 +29,7 @@ These are amux's own files, not upstream's.
 - `src/test/java/com/termux/terminal/KittyCommandTest.java`
 - `src/test/java/com/termux/terminal/KittyGraphicsTest.java`
 - `src/test/java/com/termux/terminal/ImageStoreTest.java`
+- `src/test/java/com/termux/terminal/ClipboardOscTest.java`: a 1 MiB OSC 52 copy, and an OSC too long to keep.
 - `src/main/java/com/termux/terminal/Placeholders.java`: the 297 kitty placeholder diacritics and their lookup.
 - `src/main/java/com/termux/terminal/PlaceholderRowScanner.java`: decodes a row's placeholder cells into image runs.
 - `src/test/java/com/termux/terminal/PlaceholdersTest.java`
