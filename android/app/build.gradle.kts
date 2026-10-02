@@ -18,6 +18,10 @@ fun versionCodeOf(version: String): Int {
     return major * 1_000_000 + minor * 1_000 + patch
 }
 
+val bundledAbis = listOf("arm64-v8a", "x86_64")
+val abis = providers.gradleProperty("amux.abis").map { it.split(',') }.getOrElse(bundledAbis)
+require(bundledAbis.containsAll(abis)) { "amux.abis names ${abis - bundledAbis}, amux bundles only $bundledAbis" }
+
 val releaseKeystore = providers.environmentVariable("AMUX_RELEASE_KEYSTORE")
 val releaseKeystorePassword = providers.environmentVariable("AMUX_RELEASE_KEYSTORE_PASSWORD")
 val releaseKeyAlias = providers.environmentVariable("AMUX_RELEASE_KEY_ALIAS")
@@ -36,7 +40,7 @@ android {
         versionCode = versionCodeOf(cargoVersion.get())
 
         ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
+            abiFilters += abis
         }
     }
 
@@ -63,6 +67,11 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
+    androidResources {
+        noCompress += "zip"
+        ignoreAssetsPatterns += (bundledAbis - abis).map { "!$it.zip" }
+    }
+
     packaging {
         jniLibs.useLegacyPackaging = true
         jniLibs.keepDebugSymbols += "**/libu_*.so"
@@ -71,6 +80,7 @@ android {
     lint {
         abortOnError = true
         textReport = true
+        disable += "ChromeOsAbiSupport"
     }
 }
 
