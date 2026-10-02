@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod android_fixtures;
+#[cfg(test)]
+mod bench;
 mod differ;
 mod escape;
 mod grid;
