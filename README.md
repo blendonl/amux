@@ -855,7 +855,7 @@ amux pair k7-4821-9930
 amux pair k7-4821-9930 --host 192.168.0.24:40123
 ```
 
-The app holds a Wi-Fi multicast lock while its service runs, because Android drops multicast on Wi-Fi without one, and the phone needs multicast to find the desktop over mDNS. Where multicast doesn't get through anyway, add `--host <addr>:<port>` with the desktop's IP address and the port `amux pair` printed, as in the second line. The phone then saves the desktop as a server at that `tcp://` address.
+The app holds a Wi-Fi multicast lock while it is on screen, because Android drops multicast on Wi-Fi without one, and the phone needs multicast to find the desktop over mDNS. In the background it holds the lock only while its server listens on the LAN, which keeps Wi-Fi from waking for every multicast packet. Where multicast doesn't get through anyway, add `--host <addr>:<port>` with the desktop's IP address and the port `amux pair` printed, as in the second line. The phone then saves the desktop as a server at that `tcp://` address.
 
 On a tailnet, link the phone by hand. Tailnet discovery never dials phones (see [On the same tailnet](#on-the-same-tailnet)), and the phone's server has no `tailscale` CLI, so it can't vouch for the desktop through `tailscale whois` and doesn't listen on the tailnet. A `tcp://` link to a key that nothing vouches for is refused, so pair once, with `--host`, the desktop's tailnet IP address and the port `amux pair` printed, then point the phone at the desktop's tailnet listener:
 

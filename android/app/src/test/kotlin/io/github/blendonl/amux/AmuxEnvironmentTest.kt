@@ -124,6 +124,15 @@ class AmuxEnvironmentTest {
     }
 
     @Test
+    fun `watches the lan port file where the server writes it`() {
+        listOf(true, false).forEach { withUserland ->
+            val env = environment(withUserland)
+
+            assertEquals(File(filesDir, "state/amux/default/lan-port"), env.lanPortFile)
+        }
+    }
+
+    @Test
     fun `keeps the runtime directory inside the tmp directory of its environment`() {
         listOf(true, false).forEach { withUserland ->
             val env = environment(withUserland)
@@ -138,17 +147,16 @@ class AmuxEnvironmentTest {
     }
 
     @Test
-    fun `creates the directories and a private runtime directory`() {
+    fun `creates the directories and private runtime and server state directories`() {
         listOf(true, false).forEach { withUserland ->
             val env = environment(withUserland)
 
             env.prepare("pixel-8", zshrcTemplate)
 
             listOf(env.home, env.configHome, env.stateHome).forEach { assertTrue(it.isDirectory) }
-            assertEquals(
-                PosixFilePermissions.fromString("rwx------"),
-                Files.getPosixFilePermissions(env.runtimeDir.toPath()),
-            )
+            listOf(env.runtimeDir, env.serverStateDir).forEach { dir ->
+                assertEquals(PosixFilePermissions.fromString("rwx------"), Files.getPosixFilePermissions(dir.toPath()))
+            }
         }
     }
 
