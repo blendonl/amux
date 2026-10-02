@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tracing::{info, warn};
 
+use super::lua_host::HostConfig;
 use super::session::Session;
 use super::{server_name, Server};
 use crate::cluster;
@@ -31,7 +32,10 @@ impl Server {
     }
 
     async fn reload(&self) -> Result<Option<String>> {
-        let loaded = self.hooks.reload().await?;
+        let HostConfig {
+            settings: loaded,
+            keymap,
+        } = self.hooks.reload().await?;
         let loaded = loaded.expand_home(&paths::home_dir()?);
         let running = self.settings();
         let Reconciled {
@@ -48,6 +52,7 @@ impl Server {
         notices.extend(self.reconfigure_servers(&settings.servers));
         self.images.set_quota(settings.images.memory_bytes());
         self.settings.send_replace(Arc::new(settings));
+        self.keymap.send_replace(Arc::new(keymap));
         let sessions: Vec<Arc<Session>> = self.state().sessions.values().cloned().collect();
         for session in sessions {
             session.redraw();

@@ -1,10 +1,12 @@
 mod connection;
+mod copy;
 mod forward;
 mod graphics;
 mod layout;
 pub mod lua_host;
 mod mouse;
 mod pane;
+mod paste;
 mod projects;
 mod reload;
 mod render;
@@ -44,12 +46,13 @@ use crate::protocol::{
     Role, ServerMessage, ServerState, ServerStatus, ServerView, SessionId, SessionInfo, Size,
     Snapshot, StateEvent, Version, WindowSummary,
 };
-use crate::settings::{SessionSettings, Settings};
+use crate::settings::{Keymap, SessionSettings, Settings};
 use crate::target::{self, Candidate, Target};
 use connection::Origin;
 use forward::{Host, RemoteSession};
 use graphics::store::ImageStore;
-use lua_host::{HookEvent, HookSink, LuaHost};
+use lua_host::{HookEvent, HookSink, HostConfig, LuaHost};
+use paste::PasteBuffer;
 use projects::{blocking, Projects, REGISTRY_FILE};
 use session::{Binding, Session, SessionHost};
 
@@ -59,7 +62,7 @@ const EVENT_CAPACITY: usize = 256;
 pub async fn run(socket: &Path, config: Option<&Path>) -> Result<()> {
     init_logging();
     let config_paths = paths::config_paths(config)?;
-    let (settings, host) = LuaHost::start(config_paths.clone())?;
+    let (HostConfig { settings, keymap }, host) = LuaHost::start(config_paths.clone())?;
     let settings = settings.expand_home(&paths::home_dir()?);
     info!(
         init = ?config_paths.init,
@@ -109,7 +112,7 @@ pub async fn run(socket: &Path, config: Option<&Path>) -> Result<()> {
     };
     let server = Server::new(
         identity,
-        settings,
+        HostConfig { settings, keymap },
         config_paths,
         registry,
         options,
@@ -184,11 +187,13 @@ enum Resolved {
 pub struct Server {
     identity: ServerIdentity,
     settings: watch::Sender<Arc<Settings>>,
+    keymap: watch::Sender<Arc<Keymap>>,
     config: ConfigPaths,
     state: Mutex<LocalState>,
     events: broadcast::Sender<Event>,
     hooks: HookSink,
     images: Arc<ImageStore>,
+    paste: Arc<PasteBuffer>,
     cluster: Arc<Cluster>,
     lan: LanListener,
     discovery: Discovery,
@@ -223,7 +228,7 @@ struct SessionSpec<'a> {
 impl Server {
     fn new(
         identity: ServerIdentity,
-        settings: Settings,
+        HostConfig { settings, keymap }: HostConfig,
         config: ConfigPaths,
         registry: Registry,
         options: ClusterOptions,
@@ -246,11 +251,13 @@ impl Server {
             Self {
                 identity,
                 settings: watch::channel(Arc::new(settings)).0,
+                keymap: watch::channel(Arc::new(keymap)).0,
                 config,
                 state: Mutex::new(state),
                 events: broadcast::channel(EVENT_CAPACITY).0,
                 hooks: HookSink::default(),
                 images,
+                paste: Arc::default(),
                 discovery: Discovery::new(Arc::clone(&cluster), discovery, lan.watch()),
                 cluster,
                 lan,
@@ -283,6 +290,10 @@ impl Server {
 
     fn watch_settings(&self) -> watch::Receiver<Arc<Settings>> {
         self.settings.subscribe()
+    }
+
+    fn watch_keymap(&self) -> watch::Receiver<Arc<Keymap>> {
+        self.keymap.subscribe()
     }
 
     async fn forget_server(&self, server: &str) -> Result<Option<String>> {
@@ -367,8 +378,10 @@ impl Server {
             spec.binding,
             SessionHost {
                 settings: self.watch_settings(),
+                keymap: self.watch_keymap(),
                 hooks: self.hooks.clone(),
                 images: Arc::clone(&self.images),
+                paste: Arc::clone(&self.paste),
             },
         )?;
         state.sessions.insert(name.clone(), Arc::clone(&session));

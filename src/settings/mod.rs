@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 pub use android::{AndroidSettings, KeyboardSettings};
 pub use callback::{CallbackId, CALLBACK_SLOT};
 pub use client::{
-    ClientImages, ImagesSettings, SearchSettings, StatusSettings, TreeSettings, WhichKeySettings,
+    ClientImages, ClipboardSettings, ImagesSettings, SearchSettings, StatusSettings, TreeSettings,
+    WhichKeySettings,
 };
 pub use cluster::{ClusterSettings, DiscoverySettings, LanSettings, ServerConfig, SshSettings};
 pub use host::{
@@ -25,8 +26,8 @@ pub use host::{
     WorktreeSettings,
 };
 pub use keymap::{
-    Binding, Keymap, PickerAction, PromptAction, Table, TreeAction, PICKER_TABLE, PREFIX_TABLE,
-    PROMPT_TABLE, ROOT_TABLE, SEARCH_TABLE, TREE_TABLE,
+    Binding, CopyAction, Keymap, PickerAction, PromptAction, Table, TreeAction, COPY_TABLE,
+    PICKER_TABLE, PREFIX_TABLE, PROMPT_TABLE, ROOT_TABLE, SEARCH_TABLE, TREE_TABLE,
 };
 pub use style::{Color, StyleSpec};
 pub use theme::Theme;
@@ -35,6 +36,7 @@ use crate::keys::Key;
 use crate::paths;
 
 const DEFAULT_PROJECTS_DIR: &str = "~/projects";
+const MAX_SCROLLBACK: usize = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -52,6 +54,7 @@ pub struct Settings {
     pub which_key: WhichKeySettings,
     pub search: SearchSettings,
     pub images: ImagesSettings,
+    pub clipboard: ClipboardSettings,
     pub pane: PaneSettings,
     pub window: WindowSettings,
     pub session: SessionSettings,
@@ -120,6 +123,7 @@ impl Settings {
                 self.worktrees.fetch_timeout_ms,
             ),
             ("search.project_depth", u64::from(self.search.project_depth)),
+            ("mouse.scroll_lines", u64::from(self.mouse.scroll_lines)),
             ("images.memory_mb", u64::from(self.images.memory_mb)),
             (
                 "images.client_memory_mb",
@@ -139,8 +143,22 @@ impl Settings {
         if self.pane.shell.as_ref().is_some_and(Vec::is_empty) {
             return Err("amux.opt.pane.shell must name a program".into());
         }
+        if self.pane.scrollback > MAX_SCROLLBACK {
+            return Err(format!(
+                "amux.opt.pane.scrollback ({}) must not be more than {MAX_SCROLLBACK} lines",
+                self.pane.scrollback
+            ));
+        }
         if self.worktrees.suffix.is_empty() {
             return Err("amux.opt.worktrees.suffix must not be empty".into());
+        }
+        if self
+            .clipboard
+            .command
+            .as_ref()
+            .is_some_and(|command| command.first().is_none_or(String::is_empty))
+        {
+            return Err("amux.opt.clipboard.command must name a program".into());
         }
         self.android.keyboard.validate()
     }
@@ -162,6 +180,7 @@ impl Default for Settings {
             which_key: WhichKeySettings::default(),
             search: SearchSettings::default(),
             images: ImagesSettings::default(),
+            clipboard: ClipboardSettings::default(),
             pane: PaneSettings::default(),
             window: WindowSettings::default(),
             session: SessionSettings::default(),
@@ -278,25 +297,49 @@ mod tests {
     }
 
     #[test]
+    fn the_clipboard_uses_osc52_and_runs_no_command_by_default() {
+        assert_eq!(
+            Settings::default().clipboard,
+            ClipboardSettings {
+                osc52: true,
+                command: None,
+            }
+        );
+        let settings: Settings =
+            toml::from_str("[clipboard]\nosc52 = false\ncommand = [\"wl-copy\", \"-n\"]").unwrap();
+        assert_eq!(
+            settings.clipboard,
+            ClipboardSettings {
+                osc52: false,
+                command: Some(vec!["wl-copy".into(), "-n".into()]),
+            }
+        );
+        assert_eq!(settings.validate(), Ok(()));
+        assert!(toml::from_str::<Settings>("[clipboard]\nbogus = 1").is_err());
+    }
+
+    #[test]
     fn host_settings_are_read_from_their_own_tables() {
         let settings: Settings = toml::from_str(
             "[pane]\nterm = \"tmux-256color\"\n\n\
              [window]\nbase_index = 1\n\n\
              [session]\nclash_format = \"{base}.{n}\"\n\n\
              [borders]\nvertical = \"|\"\n\n\
-             [mouse]\nescape_time_ms = 40\n\n\
+             [mouse]\nescape_time_ms = 40\nscroll = false\n\n\
              [worktrees]\nsuffix = \".trees\"\n\n\
              [theme.pane_border_active]\nfg = \"bright-blue\"",
         )
         .unwrap();
         assert_eq!(settings.pane.term, "tmux-256color");
-        assert_eq!(settings.pane.scrollback, 10_000);
+        assert_eq!(settings.pane.scrollback, 2_000);
         assert_eq!(settings.window.base_index, 1);
         assert_eq!(settings.session.clash_format, "{base}.{n}");
         assert_eq!(settings.session.clash_start, 2);
         assert_eq!(settings.borders.vertical, '|');
         assert_eq!(settings.borders.horizontal, '─');
         assert_eq!(settings.mouse.escape_time_ms, 40);
+        assert!(!settings.mouse.scroll);
+        assert_eq!(settings.mouse.scroll_lines, 3);
         assert_eq!(settings.worktrees.suffix, ".trees");
         assert_eq!(settings.worktrees.fetch_timeout_ms, 30_000);
         assert_eq!(
@@ -319,6 +362,14 @@ mod tests {
             SearchSettings {
                 project_dirs: vec!["~/projects".into(), "~/Projects".into()],
                 project_depth: 1,
+            }
+        );
+        assert_eq!(
+            Settings::default().mouse,
+            MouseSettings {
+                escape_time_ms: 25,
+                scroll: true,
+                scroll_lines: 3,
             }
         );
     }
@@ -360,12 +411,20 @@ mod tests {
             "amux.opt.pane.shell must name a program"
         );
         assert_eq!(
+            rejected(|settings| settings.pane.scrollback = 100_001),
+            "amux.opt.pane.scrollback (100001) must not be more than 100000 lines"
+        );
+        assert_eq!(
             rejected(|settings| settings.worktrees.suffix.clear()),
             "amux.opt.worktrees.suffix must not be empty"
         );
         assert_eq!(
             rejected(|settings| settings.search.project_depth = 0),
             "amux.opt.search.project_depth must be a positive number"
+        );
+        assert_eq!(
+            rejected(|settings| settings.mouse.scroll_lines = 0),
+            "amux.opt.mouse.scroll_lines must be a positive number"
         );
         assert_eq!(
             rejected(|settings| settings.images.memory_mb = 0),
@@ -375,12 +434,33 @@ mod tests {
             rejected(|settings| settings.images.client_memory_mb = 0),
             "amux.opt.images.client_memory_mb must be a positive number"
         );
+        assert_eq!(
+            rejected(|settings| settings.clipboard.command = Some(Vec::new())),
+            "amux.opt.clipboard.command must name a program"
+        );
+        assert_eq!(
+            rejected(|settings| settings.clipboard.command = Some(vec![String::new()])),
+            "amux.opt.clipboard.command must name a program"
+        );
 
         let named = Settings {
             name: Some("desk".into()),
             ..Settings::default()
         };
         assert_eq!(named.validate(), Ok(()));
+    }
+
+    #[test]
+    fn panes_may_keep_up_to_100_000_lines_of_history() {
+        assert_eq!(Settings::default().pane.scrollback, 2_000);
+        let longest = Settings {
+            pane: PaneSettings {
+                scrollback: 100_000,
+                ..PaneSettings::default()
+            },
+            ..Settings::default()
+        };
+        assert_eq!(longest.validate(), Ok(()));
     }
 
     #[test]

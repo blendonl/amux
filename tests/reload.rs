@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use amux::protocol::{SessionCommand, WindowSummary};
-use common::{lua, window_summary, Listing, TestServer, TIMEOUT};
+use common::{lua, screen_row, window_summary, Listing, TestServer, TIMEOUT};
 use nix::sys::signal::{kill, Signal};
 
 const RELOADED: &str = "config reloaded";
@@ -281,6 +281,31 @@ fn config_reload_prints_what_it_did() {
         server.run_ok(&["config", "reload"]),
         format!("{RELOADED}; restart required for amux.opt.lan\n")
     );
+}
+
+#[tokio::test]
+async fn a_reload_rebinds_copy_keys_of_a_pane_already_in_copy_mode() {
+    let server = TestServer::start();
+    let mut client = server.client().await;
+    client.new_session(Some("s")).await;
+    client.wait_for_text("$").await;
+    client
+        .command(SessionCommand::CopyMode { page_up: false })
+        .await;
+    client.type_text("j").await;
+    client
+        .wait_for_screen("the cursor one line down", |screen| {
+            screen_row(screen, 0).ends_with("[2/24]")
+        })
+        .await;
+
+    append(&server, "amux.keymap.set(\"copy\", \"j\", \"cancel\")");
+    let reloaded = reload(&server, Trigger::Command).unwrap();
+    assert!(reloaded.contains(RELOADED), "{reloaded}");
+    client.type_text("j").await;
+    client
+        .wait_for_screen("the live pane", |screen| screen_row(screen, 0) == "$")
+        .await;
 }
 
 #[test]

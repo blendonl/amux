@@ -38,13 +38,14 @@ The tables are:
 
 - `root`: keys that act as soon as they are typed, without the prefix. Empty by default. Everything else reaches the pane byte for byte, and only a lone `Escape` is ever held back, when a root binding starts with it (`M-h` does).
 - `prefix`: the key after the prefix. The defaults are the keys in the [README](../README.md#windows-and-panes). A key it doesn't bind is dropped, and the prefix itself, when it isn't bound here, sends a literal prefix.
-- `prompt`: the rename and `amux.prompt` prompts. It binds prompt actions by name: `submit`, `cancel`, `delete_backward`, `delete_forward`, `delete_line`, `cursor_left`, `cursor_right`, `cursor_start` and `cursor_end`.
+- `prompt`: the rename and `amux.prompt` prompts. It binds prompt actions by name: `submit`, `cancel`, `delete_backward`, `delete_forward`, `delete_line`, `cursor_left`, `cursor_right`, `cursor_start` and `cursor_end`. The search prompt of [copy mode](#copy-mode) uses it too, from the config of the server that holds the session.
 - `tree`: the `Ctrl-b s s` tree. It binds tree actions by name: `down`, `up`, `top`, `bottom`, `collapse`, `expand`, `pick` and `cancel`.
 - `picker`: the `Ctrl-b s p` and `Ctrl-b s w` lists (see [Search](#search)). It binds picker actions by name: `down`, `up`, `pick`, `cancel`, `delete_backward`, `delete_word` and `delete_line`, and a key it doesn't bind types into the query.
+- `copy`: [copy mode](#copy-mode), read by the server that holds the session. It binds copy actions by name.
 - `search`: the submap behind `Ctrl-b s`, a custom table amux starts with. It binds `p` to `search_projects`, `w` to `search_worktrees` and `s` to `cluster_tree`.
 - Any other name is a custom table, created by its first `set`. `switch_table(name)` reads the next key from it, then goes back to `root`. `Backspace`, when the table doesn't bind it, goes back to the table whose key switched here, or to `root` from the first one.
 
-In the `prompt`, `tree` and `picker` tables, a modified key that isn't bound acts like the plain key, so `C-Left` moves like `Left`. Text pasted with bracketed paste (`ESC[200~ … ESC[201~`) always goes to the pane whole: root and prefix bindings don't fire inside a paste, and a paste right after the prefix cancels the prefix.
+In the `prompt`, `tree`, `picker` and `copy` tables, a modified key that isn't bound acts like the plain key, so `C-Left` moves like `Left`. Text pasted with bracketed paste (`ESC[200~ … ESC[201~`) always goes to the pane whole, unless the pane is in [copy mode](#copy-mode): root and prefix bindings don't fire inside a paste, and a paste right after the prefix cancels the prefix.
 
 ```lua
 amux.opt.prefix = "C-a"
@@ -75,7 +76,7 @@ amux.keymap.set("prefix", "s f", amux.action.search_projects())
 - The keys of a sequence are separated by spaces, and `Space` names the space bar. Every key but the last has to be a submap. The last is bound in the submap they lead to, so `"g s"` binds `s` in `git`.
 - `set` makes a key that isn't bound yet into a new submap named after its table and key, so `"g l L"` above creates `git l` and binds `l` in `git` to it. Bind the key to `switch_table` yourself first, as with `git`, for a name and a description of your own.
 - A sequence through a key that is bound to anything else is an error, such as `d in the prefix table is bound to detach, not to a submap`. `get` returns `nil` for it and `del` fails.
-- `root`, `prefix` and custom tables take sequences. The `prompt`, `tree` and `picker` tables bind single keys.
+- `root`, `prefix` and custom tables take sequences. The `prompt`, `tree`, `picker` and `copy` tables bind single keys.
 - The which-key popup shows a submap as a group, and `Backspace` goes back to the table before it.
 
 ## amux.action
@@ -103,6 +104,9 @@ amux.keymap.set("prefix", "s f", amux.action.search_projects())
 | `switch_table(name)`        | Reads the next key from table `name`                   |
 | `reload_config()`           | Reloads the config here and on this machine's server   |
 | `which_key(name)`           | Shows the keys of table `name` at once, then reads the next key from it, `Ctrl-b ?` shows the prefix table |
+| `copy_mode()`               | Puts the active pane in [copy mode](#copy-mode), `Ctrl-b [` |
+| `copy_mode_page_up()`       | Puts the active pane in copy mode a page up, or turns a page up in copy mode. It has no key |
+| `paste_buffer()`            | Types the text last copied in copy mode into the active pane, `Ctrl-b ]` |
 
 ## Functions as bindings
 
@@ -146,6 +150,68 @@ amux.keymap.set("prefix", "f", function(ctx)
     on_submit = function(text) amux.switch(text) end,
   }
 end)
+```
+
+## Copy mode
+
+The `copy` table holds the keys of [copy mode](../README.md#copy-mode). The server that holds the session reads it from its own config, as it does the pane border colours, and a reload changes it in panes that are already in copy mode. It binds single keys to these actions:
+
+| Action                      | Does                                                 | Keys              |
+| --------------------------- | ---------------------------------------------------- | ----------------- |
+| `cursor_left`               | Moves the cursor left                                | `h`, `Left`       |
+| `cursor_down`               | Moves the cursor down                                | `j`, `Down`       |
+| `cursor_up`                 | Moves the cursor up                                  | `k`, `Up`         |
+| `cursor_right`              | Moves the cursor right                               | `l`, `Right`      |
+| `next_word`                 | Start of the next word                               | `w`               |
+| `previous_word`             | Start of this or the previous word                   | `b`               |
+| `next_word_end`             | End of this or the next word                         | `e`               |
+| `next_space`                | `next_word` for words that only spaces separate      | `W`               |
+| `previous_space`            | `previous_word` for words that only spaces separate  | `B`               |
+| `next_space_end`            | `next_word_end` for words that only spaces separate  | `E`               |
+| `start_of_line`             | First column                                         | `0`, `Home`       |
+| `back_to_indentation`       | First character of the line                          | `^`               |
+| `end_of_line`               | Last character of the line                           | `$`, `End`        |
+| `history_top`               | First line of the history                            | `g`               |
+| `history_bottom`            | Last line of the screen                              | `G`               |
+| `top_line`                  | Top line of the pane                                 | `H`               |
+| `middle_line`               | Middle line of the pane                              | `M`               |
+| `bottom_line`               | Bottom line of the pane                              | `L`               |
+| `scroll_up`                 | Scrolls up a line                                    | `C-y`             |
+| `scroll_down`               | Scrolls down a line                                  | `C-e`             |
+| `halfpage_up`               | Scrolls up half a page                               | `C-u`             |
+| `halfpage_down`             | Scrolls down half a page                             | `C-d`             |
+| `page_up`                   | Scrolls up a page                                    | `PageUp`          |
+| `page_down`                 | Scrolls down a page                                  | `PageDown`, `C-f` |
+| `refresh_from_pane`         | Takes a new copy of the pane, as far from the bottom | `r`               |
+| `begin_selection`           | Starts selecting characters at the cursor            | `v`, `Space`      |
+| `select_line`               | Starts selecting whole lines at the cursor           | `V`               |
+| `other_end`                 | Moves the cursor to the other end of the selection   | `o`               |
+| `clear_selection`           | Clears the selection                                 |                   |
+| `copy_selection_and_cancel` | Copies the selection and leaves copy mode            | `y`, `Enter`      |
+| `clear_selection_or_cancel` | Clears the selection, or leaves when there is none   | `Escape`          |
+| `cancel`                    | Leaves copy mode                                     | `q`, `C-c`        |
+| `search_forward`            | Opens the prompt to search down the history          | `/`               |
+| `search_backward`           | Opens the prompt to search up the history            | `?`               |
+| `search_again`              | Goes to the next match in the search's direction     | `n`               |
+| `search_reverse`            | Goes to the next match in the other direction        | `N`               |
+
+The digits `1` to `9` start a count that repeats the next action, and `0` adds to a count once one has started. They aren't in the table. A key the table doesn't bind does nothing, and pasted text goes into the search prompt while it is open and is dropped otherwise.
+
+`begin_selection` and `select_line` start a new selection at the cursor, even while one shows, and `refresh_from_pane` clears it. The selection is drawn in the `copy_selection` [theme](#the-theme) slot. `copy_selection_and_cancel` sends the text to the clipboard of the client that pressed the key, as set in [Clipboard](#clipboard), and keeps it in the server's paste buffer, which `paste_buffer()` types into the active pane.
+
+`search_forward` and `search_backward` open a prompt on the bottom row of the pane, edited with the `prompt` table of the server's config, not the client's. `submit` searches and `cancel` closes only the prompt. A count before them goes to that match, and a count before `search_again` or `search_reverse` repeats it. The search is literal and smart-case: it ignores case unless the text holds a capital letter. It looks at each line on its own and wraps around the ends of the history. The prompt and the `search hit BOTTOM` and `pattern not found` messages are drawn in the `copy_prompt` theme slot.
+
+```lua
+amux.keymap.set("copy", "K", "halfpage_up")
+amux.keymap.set("copy", "J", "halfpage_down")
+amux.keymap.del("copy", "C-c")
+amux.keymap.set("copy", "Escape", "cancel")
+amux.keymap.set("root", "S-PageUp", amux.action.copy_mode_page_up())
+amux.keymap.set("root", "M-p", amux.action.paste_buffer())
+amux.opt.theme.copy_position = { fg = "black", bg = "cyan" }
+amux.opt.theme.copy_selection = { fg = "black", bg = "yellow" }
+amux.opt.theme.copy_prompt = { fg = "white", bg = "blue" }
+amux.keymap.set("prompt", "C-w", "delete_line")
 ```
 
 ## Which key
@@ -211,6 +277,40 @@ amux.opt.images.client = "off"
 amux.opt.images.client_memory_mb = 64
 ```
 
+## Clipboard
+
+Text that amux copies, such as a selection yanked in copy mode, goes to the clipboard of the client that copied it. The client writes it to its terminal, runs a command with it, or both.
+
+| Option    | Default | Is                                                                                         |
+| --------- | ------- | ------------------------------------------------------------------------------------------ |
+| `osc52`   | `true`  | Whether the client writes the text to its terminal as an OSC 52 sequence, which puts it on the clipboard of the machine the terminal runs on, over SSH too |
+| `command` | none    | A program and its arguments, run on the client's machine with the text on standard input, such as `{ "wl-copy" }`, `{ "xclip", "-selection", "clipboard" }` or `{ "pbcopy" }`. Its output is thrown away, and when it can't start or fails, the error shows on the status row |
+
+Both live under `amux.opt.clipboard`, and the client reads them, so a reload applies them to the next copy. Copied text past 1 MiB is cut off.
+
+Most terminals take OSC 52, among them kitty, ghostty, WezTerm, foot, Alacritty and the amux app. Some, such as GNOME Terminal, ignore it, and iTerm2 only takes it once you allow it in its settings; set `command` for those. On Android, the app's terminal takes OSC 52 sequences long enough for the whole 1 MiB. Android's clipboard is the limit there: it moves the text between processes in one transaction of about 1 MB, so it can turn down a copy of a few hundred KB or more, and the app then shows a short message and leaves the clipboard as it was.
+
+```lua
+amux.opt.clipboard.command = { "wl-copy" }
+```
+
+## Mouse
+
+The server that holds the session reads these, and a reload applies them at once. The [README](../README.md#windows-and-panes) describes what the mouse does.
+
+| Option           | Default | Is                                                                                         |
+| ---------------- | ------- | ------------------------------------------------------------------------------------------ |
+| `scroll`         | `true`  | Whether the terminal reports the mouse to amux in every window, so the wheel scrolls a pane's history and dragging selects text in [copy mode](#copy-mode). With `false`, it reports the mouse only while a window has more than one pane or the active pane is in copy mode |
+| `scroll_lines`   | `3`     | How many lines each turn of the wheel scrolls, in copy mode and as `Up` and `Down` keys to a program in the alternate screen |
+| `escape_time_ms` | `25`    | How long a lone `Escape` that could start a mouse report waits for the rest of it          |
+
+All of them live under `amux.opt.mouse`. On Android, a swipe on the terminal scrolls like the wheel.
+
+```lua
+amux.opt.mouse.scroll_lines = 5
+amux.opt.mouse.scroll = false
+```
+
 ## The status bar
 
 | Option                | Default                  | Is                                                                 |
@@ -269,8 +369,11 @@ Each slot under `amux.opt.theme` is a style: `fg`, `bg`, `bold`, `dim`, `italic`
 | `overlay_border`       | The reconnecting overlay's border                      | plain                |
 | `pane_border`          | Pane borders, drawn by the host                        | plain                |
 | `pane_border_active`   | The active pane's border, drawn by the host            | green                |
+| `copy_position`        | The `[line/total]` position in copy mode, drawn by the host | black on yellow |
+| `copy_selection`       | The selection in copy mode, drawn by the host          | reverse              |
+| `copy_prompt`          | The search prompt and its messages in copy mode, drawn by the host | black on yellow |
 
-The pane border slots come from the server's config, since the host draws the borders. Everything else comes from the client's.
+The pane border and copy mode slots come from the server's config, since the host draws them. Everything else comes from the client's.
 
 ## The Android keyboard
 
