@@ -7,12 +7,23 @@ fn next_id() -> u64 {
     NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+#[allow(missing_docs)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VisibleRow<'a> {
+    pub id: u64,
+    pub stamp: u64,
+    pub cells: &'a [crate::Cell],
+    pub wrapped: bool,
+    pub has_placeholders: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Row {
     cells: Vec<crate::Cell>,
     used: usize,
     wrapped: bool,
     id: u64,
+    stamp: u64,
     has_placeholders: bool,
 }
 
@@ -23,7 +34,18 @@ impl Row {
             used: 0,
             wrapped: false,
             id: next_id(),
+            stamp: 0,
             has_placeholders: false,
+        }
+    }
+
+    pub fn visible(&self) -> VisibleRow<'_> {
+        VisibleRow {
+            id: self.id,
+            stamp: self.stamp,
+            cells: &self.cells,
+            wrapped: self.wrapped,
+            has_placeholders: self.has_placeholders,
         }
     }
 
@@ -37,6 +59,10 @@ impl Row {
         self.used = self.used.max(end.min(self.cells.len()));
     }
 
+    fn restamp(&mut self) {
+        self.stamp = self.stamp.wrapping_add(1);
+    }
+
     pub fn id(&self) -> u64 {
         self.id
     }
@@ -46,10 +72,14 @@ impl Row {
     }
 
     pub fn mark_placeholders(&mut self) {
-        self.has_placeholders = true;
+        if !self.has_placeholders {
+            self.restamp();
+            self.has_placeholders = true;
+        }
     }
 
     pub fn mark_graphic(&mut self, cols: std::ops::Range<u16>) {
+        self.restamp();
         for cell in self
             .cells
             .iter_mut()
@@ -70,6 +100,7 @@ impl Row {
     }
 
     pub fn clear(&mut self, attrs: crate::attrs::Attrs) {
+        self.restamp();
         let used = if attrs == crate::attrs::Attrs::default() {
             0
         } else {
@@ -92,17 +123,20 @@ impl Row {
     }
 
     pub fn get_mut(&mut self, col: u16) -> Option<&mut crate::Cell> {
+        self.restamp();
         self.mark_used(usize::from(col) + 1);
         self.cells.get_mut(usize::from(col))
     }
 
     pub fn insert(&mut self, i: u16, cell: crate::Cell) {
+        self.restamp();
         self.cells.insert(usize::from(i), cell);
         self.used = self.cells.len();
         self.wrapped = false;
     }
 
     pub fn remove(&mut self, i: u16) {
+        self.restamp();
         self.clear_wide(i);
         self.cells.remove(usize::from(i));
         self.used = self.cells.len();
@@ -110,6 +144,7 @@ impl Row {
     }
 
     pub fn erase(&mut self, i: u16, attrs: crate::attrs::Attrs) {
+        self.restamp();
         let wide = self.cells[usize::from(i)].is_wide();
         self.clear_wide(i);
         self.cells[usize::from(i)].clear(attrs);
@@ -122,6 +157,7 @@ impl Row {
     }
 
     pub fn truncate(&mut self, len: u16) {
+        self.restamp();
         self.cells.truncate(usize::from(len));
         self.used = self.used.min(self.cells.len());
         self.wrapped = false;
@@ -132,13 +168,17 @@ impl Row {
     }
 
     pub fn resize(&mut self, len: u16) {
+        self.restamp();
         self.cells.resize(usize::from(len), crate::Cell::new());
         self.used = self.used.min(self.cells.len());
         self.wrapped = false;
     }
 
     pub fn wrap(&mut self, wrap: bool) {
-        self.wrapped = wrap;
+        if self.wrapped != wrap {
+            self.restamp();
+            self.wrapped = wrap;
+        }
     }
 
     pub fn wrapped(&self) -> bool {
@@ -146,6 +186,7 @@ impl Row {
     }
 
     pub fn clear_wide(&mut self, col: u16) {
+        self.restamp();
         let cell = &self.cells[usize::from(col)];
         let other = if cell.is_wide() {
             &mut self.cells[usize::from(col + 1)]
