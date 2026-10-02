@@ -17,12 +17,13 @@ use super::mouse::InputEvent;
 use super::pane::{Pane, PaneObserver, PaneSpec};
 use super::render::{Frame, Viewer};
 use super::window::Window;
+use crate::keys::KeyDecoder;
 use crate::project::ProjectId;
 use crate::protocol::{
     ClientTerminal, SessionCommand, SessionId, SessionInfo, SessionState, Size, Split,
     WindowSummary,
 };
-use crate::settings::Settings;
+use crate::settings::{Keymap, Settings};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
@@ -41,6 +42,7 @@ impl Binding {
 #[derive(Clone)]
 pub struct SessionHost {
     pub settings: watch::Receiver<Arc<Settings>>,
+    pub keymap: watch::Receiver<Arc<Keymap>>,
     pub hooks: HookSink,
     pub images: Arc<ImageStore>,
 }
@@ -55,6 +57,7 @@ pub struct Session {
     env: Vec<(String, String)>,
     binding: Option<Binding>,
     settings: watch::Receiver<Arc<Settings>>,
+    keymap: watch::Receiver<Arc<Keymap>>,
     hooks: HookSink,
     images: Arc<ImageStore>,
     terminals: Mutex<Terminals>,
@@ -74,6 +77,7 @@ impl Session {
     ) -> Result<Arc<Self>> {
         let SessionHost {
             settings,
+            keymap,
             hooks,
             images,
         } = host;
@@ -87,6 +91,7 @@ impl Session {
             env: env.to_vec(),
             binding,
             settings,
+            keymap,
             hooks,
             images,
             terminals: Mutex::new(Terminals::default()),
@@ -237,9 +242,10 @@ impl Session {
 
     pub fn resize(&self, size: Size) {
         let mut windows = self.state();
-        windows.size = size.clamped();
-        for window in &windows.list {
-            window.resize(windows.size);
+        let size = size.clamped();
+        windows.size = size;
+        for window in &mut windows.list {
+            window.resize(size);
         }
         windows.redraw();
     }
@@ -255,13 +261,17 @@ impl Session {
         )
     }
 
-    pub fn input(&self, event: InputEvent) {
+    pub fn input(&self, event: InputEvent, keys: &mut KeyDecoder, timed_out: bool) {
+        let keymap = self.keymap();
         let mut windows = self.state();
         let size = windows.size;
         match event {
             InputEvent::Bytes(bytes) => {
-                if let Some(window) = windows.active_window() {
-                    window.write_input(bytes);
+                let redraw = windows
+                    .active_window_mut()
+                    .is_some_and(|window| window.keys(keys, &bytes, timed_out, &keymap.copy));
+                if redraw {
+                    windows.redraw();
                 }
             }
             InputEvent::Mouse(event) => {
@@ -311,6 +321,16 @@ impl Session {
                 self.remove_window(active)
             }
             SessionCommand::RenameWindow(name) => self.rename_window(None, name),
+            SessionCommand::CopyMode { page_up } => {
+                let mut windows = self.state();
+                let size = windows.size;
+                windows
+                    .active_window_mut()
+                    .ok_or_else(ended)?
+                    .copy_mode(size, page_up);
+                windows.redraw();
+                Ok(())
+            }
         }
     }
 
@@ -472,6 +492,10 @@ impl Session {
         Arc::clone(&self.settings.borrow())
     }
 
+    fn keymap(&self) -> Arc<Keymap> {
+        Arc::clone(&self.keymap.borrow())
+    }
+
     fn touch(&self) {
         *lock(&self.last_activity) = SystemTime::now();
         self.activity.notify_one();
@@ -488,7 +512,7 @@ impl PaneObserver for Session {
         let windows = self.state();
         if windows
             .active_window()
-            .is_some_and(|window| window.contains(pane))
+            .is_some_and(|window| window.shows_output_of(pane))
         {
             windows.redraw();
         }
@@ -804,6 +828,7 @@ mod tests {
             None,
             SessionHost {
                 settings: watch::channel(Arc::new(settings)).1,
+                keymap: watch::channel(Arc::new(Keymap::default())).1,
                 hooks: HookSink::default(),
                 images: Arc::new(ImageStore::new(1 << 20)),
             },

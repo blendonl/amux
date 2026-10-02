@@ -201,6 +201,18 @@ impl Grid {
         self.scrollback_offset = rows.min(self.scrollback.len());
     }
 
+    pub fn history_len(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    pub fn line(&self, line: usize) -> Option<&crate::row::Row> {
+        if line < self.scrollback.len() {
+            self.scrollback.get(line)
+        } else {
+            self.rows.get(line - self.scrollback.len())
+        }
+    }
+
     pub fn write_contents(&self, contents: &mut String) {
         let mut wrapping = false;
         for row in self.visible_rows() {

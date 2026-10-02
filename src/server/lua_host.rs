@@ -18,9 +18,9 @@ use super::connection::Origin;
 use super::session::Session;
 use super::Server;
 use crate::cluster::{Cluster, StateSource};
-use crate::lua::{self, ConfigPaths, LuaHooks, Process, SYSTEM_INIT};
+use crate::lua::{self, ConfigPaths, Loaded, LuaHooks, Process, SYSTEM_INIT};
 use crate::protocol::{Event, ServerStatus, SessionCommand, SessionId, SessionInfo, StateEvent};
-use crate::settings::Settings;
+use crate::settings::{Keymap, Settings};
 
 const QUEUE_CAPACITY: usize = 1024;
 const MAX_DEPTH: u32 = 3;
@@ -169,7 +169,22 @@ struct Envelope {
 
 enum Job {
     Event(Envelope),
-    Reload(oneshot::Sender<Result<Settings>>),
+    Reload(oneshot::Sender<Result<HostConfig>>),
+}
+
+#[derive(Debug)]
+pub struct HostConfig {
+    pub settings: Settings,
+    pub keymap: Keymap,
+}
+
+impl HostConfig {
+    fn of(loaded: &Loaded) -> Self {
+        Self {
+            settings: loaded.settings.clone(),
+            keymap: loaded.keymap.clone(),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -185,11 +200,11 @@ pub struct LuaHost {
 }
 
 impl LuaHost {
-    pub fn start(paths: ConfigPaths) -> Result<(Settings, Self)> {
+    pub fn start(paths: ConfigPaths) -> Result<(HostConfig, Self)> {
         let (events, inbox) = mpsc::sync_channel(QUEUE_CAPACITY);
         let (outbox, requests) = unbounded_channel();
         let state = Arc::new(OnceLock::new());
-        let (loaded, settings) = mpsc::channel();
+        let (loaded, config) = mpsc::channel();
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let shared = Arc::clone(&state);
         thread::Builder::new()
@@ -198,7 +213,7 @@ impl LuaHost {
                 tracing::dispatcher::with_default(&dispatch, || {
                     match lua::load(&paths, Process::Server) {
                         Ok(config) => {
-                            if loaded.send(Ok(config.settings.clone())).is_ok() {
+                            if loaded.send(Ok(HostConfig::of(&config))).is_ok() {
                                 let hooks = LuaHooks::new(config);
                                 serve(hooks, &paths, &inbox, &outbox, &shared);
                             }
@@ -210,11 +225,11 @@ impl LuaHost {
                 });
             })
             .context("starting the lua hook thread")?;
-        let settings = settings
+        let config = config
             .recv()
             .map_err(|_| anyhow!("the lua hook thread stopped while loading the config"))??;
         Ok((
-            settings,
+            config,
             Self {
                 events,
                 requests,
@@ -237,9 +252,9 @@ fn serve(
             Job::Reload(reply) => {
                 let paths = paths.refreshed(Path::new(SYSTEM_INIT));
                 let reloaded = lua::load(&paths, Process::Server).map(|config| {
-                    let settings = config.settings.clone();
+                    let reloaded = HostConfig::of(&config);
                     hooks = LuaHooks::new(config);
-                    settings
+                    reloaded
                 });
                 let _ = reply.send(reloaded);
             }
@@ -286,7 +301,7 @@ impl HookSink {
         self.send(event, DEPTH.get());
     }
 
-    pub async fn reload(&self) -> Result<Settings> {
+    pub async fn reload(&self) -> Result<HostConfig> {
         let jobs = self.0.get().cloned().context("no lua host is running")?;
         let (reply, reloaded) = oneshot::channel();
         tokio::task::spawn_blocking(move || jobs.send(Job::Reload(reply)))
@@ -521,9 +536,11 @@ mod tests {
     use crate::cluster::{ClusterOptions, NoiseKey, TrustStore};
     use crate::discovery::DiscoveryOptions;
     use crate::identity::{Incarnation, ServerId, ServerIdentity};
+    use crate::keys::Key;
     use crate::lua::{EVENTS, INIT_FILE};
     use crate::project::Registry;
     use crate::protocol::{Size, Version};
+    use crate::settings::CopyAction;
 
     const WAIT: Duration = Duration::from_secs(10);
     const POLL: Duration = Duration::from_millis(10);
@@ -601,11 +618,11 @@ mod tests {
         fs::write(&init, source).unwrap();
         let paths = ConfigPaths::new(dir.path().to_owned(), Some(init));
         let logs = Logs::default();
-        let (settings, host) =
+        let (config, host) =
             tracing::subscriber::with_default(logs.subscriber(), || LuaHost::start(paths)).unwrap();
         Hosted {
             dir,
-            settings,
+            settings: config.settings,
             host,
             logs,
         }
@@ -882,11 +899,16 @@ mod tests {
         fs::write(
             &init,
             "amux.opt.window.base_index = 1\n\
+             amux.keymap.set('copy', 'x', 'cancel')\n\
              amux.on('session_created', function() amux.kill_session('second') end)",
         )
         .unwrap();
-        let settings = sink.reload().await.unwrap();
-        assert_eq!(settings.window.base_index, 1);
+        let reloaded = sink.reload().await.unwrap();
+        assert_eq!(reloaded.settings.window.base_index, 1);
+        assert_eq!(
+            reloaded.keymap.copy.get(&Key::char('x')),
+            Some(&CopyAction::Cancel)
+        );
         hosted.feed(created("work"), 0);
         assert_eq!(hosted.next_request(), request(kill_session("second"), 1));
 
@@ -931,7 +953,10 @@ mod tests {
         };
         Server::new(
             identity,
-            settings,
+            HostConfig {
+                settings,
+                keymap: Keymap::default(),
+            },
             ConfigPaths::new(dir.to_owned(), Some(dir.join(INIT_FILE))),
             registry,
             options,

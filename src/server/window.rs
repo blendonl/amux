@@ -4,13 +4,15 @@ use anyhow::{anyhow, Result};
 use tracing::{debug, warn};
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
+use super::copy::{CopyMode, Outcome, Snapshot};
 use super::graphics::place::Placements;
 use super::layout::{Layout, PaneId, Rect, Side, SplitDirection};
 use super::mouse::MouseEvent;
 use super::pane::Pane;
-use super::render::{self, Frame, InputModes, Screens, Viewer};
+use super::render::{self, CopyView, Frame, InputModes, Screens, Viewer};
+use crate::keys::KeyDecoder;
 use crate::protocol::{ClientTerminal, Direction, Size, Split, WindowSummary};
-use crate::settings::Settings;
+use crate::settings::{CopyAction, Settings, Table};
 
 pub struct Window {
     index: usize,
@@ -18,6 +20,7 @@ pub struct Window {
     layout: Layout,
     panes: BTreeMap<PaneId, Pane>,
     active: PaneId,
+    copy: BTreeMap<PaneId, CopyMode>,
 }
 
 impl Window {
@@ -28,6 +31,7 @@ impl Window {
             layout: Layout::new(id),
             panes: BTreeMap::from([(id, pane)]),
             active: id,
+            copy: BTreeMap::new(),
         }
     }
 
@@ -64,12 +68,8 @@ impl Window {
     ) -> Result<()> {
         let mut layout = self.layout.clone();
         layout.split(self.active, new, split_direction(split), size)?;
-        let rect = layout
-            .rects(size)
-            .into_iter()
-            .find(|(id, _)| *id == new)
-            .map(|(_, rect)| rect)
-            .ok_or_else(|| anyhow!("pane {new} was not placed"))?;
+        let rect =
+            pane_rect(&layout, new, size).ok_or_else(|| anyhow!("pane {new} was not placed"))?;
         let pane = spawn(rect_size(rect))?;
         self.layout = layout;
         self.panes.insert(new, pane);
@@ -81,6 +81,7 @@ impl Window {
     pub fn remove(&mut self, pane: PaneId, size: Size) -> Option<Pane> {
         let position = self.layout.panes().iter().position(|id| *id == pane)?;
         self.layout.remove(pane);
+        self.copy.remove(&pane);
         let removed = self.panes.remove(&pane);
         if self.active == pane {
             if let Some(&next) = self.layout.panes().get(position.saturating_sub(1)) {
@@ -91,13 +92,16 @@ impl Window {
         removed
     }
 
-    pub fn resize(&self, size: Size) {
+    pub fn resize(&mut self, size: Size) {
         for (id, rect) in self.layout.rects(size) {
             let Some(pane) = self.panes.get(&id) else {
                 continue;
             };
             if let Err(err) = pane.resize(rect_size(rect)) {
                 warn!(pane = %id, "resizing the pane failed: {err:#}");
+            }
+            if let Some(copy) = self.copy.get_mut(&id) {
+                copy.resize(rect_size(rect));
             }
         }
     }
@@ -119,6 +123,74 @@ impl Window {
 
     pub fn active_pane(&self) -> PaneId {
         self.active
+    }
+
+    pub fn shows_output_of(&self, pane: PaneId) -> bool {
+        self.contains(pane) && !self.copy.contains_key(&pane)
+    }
+
+    pub fn copy_mode(&mut self, size: Size, page_up: bool) {
+        let id = self.active;
+        if let Some(copy) = self.copy.get_mut(&id) {
+            if page_up {
+                copy.page_up();
+            }
+            return;
+        }
+        let Some(pane) = self.panes.get(&id) else {
+            return;
+        };
+        let Some(rect) = pane_rect(&self.layout, id, size) else {
+            return;
+        };
+        let mut copy = CopyMode::new(Snapshot::new(pane.snapshot()), rect_size(rect));
+        if page_up {
+            copy.page_up();
+        }
+        self.copy.insert(id, copy);
+    }
+
+    pub fn keys(
+        &mut self,
+        keys: &mut KeyDecoder,
+        bytes: &[u8],
+        timed_out: bool,
+        bindings: &Table<CopyAction>,
+    ) -> bool {
+        let id = self.active;
+        let Some(copy) = self.copy.get_mut(&id) else {
+            let mut input = keys.take_pending();
+            input.extend_from_slice(bytes);
+            if !input.is_empty() {
+                self.write_input_to(id, input);
+            }
+            return false;
+        };
+        keys.push(bytes);
+        let mut redraw = false;
+        while let Some(decoded) = keys
+            .next_key()
+            .or_else(|| timed_out.then(|| keys.time_out()).flatten())
+        {
+            redraw = true;
+            match copy.press(&decoded, bindings) {
+                Outcome::Stay => {}
+                Outcome::Refresh => {
+                    if let Some(pane) = self.panes.get(&id) {
+                        copy.refresh(Snapshot::new(pane.snapshot()));
+                    }
+                }
+                Outcome::Exit => {
+                    self.copy.remove(&id);
+                    let rest = keys.take_pending();
+                    if !rest.is_empty() {
+                        self.write_input_to(id, rest);
+                    }
+                    break;
+                }
+            }
+        }
+        redraw
     }
 
     pub fn pane_at(&self, index: usize) -> Result<PaneId> {
@@ -156,10 +228,6 @@ impl Window {
         }
     }
 
-    pub fn write_input(&self, bytes: Vec<u8>) {
-        self.write_input_to(self.active, bytes);
-    }
-
     pub fn write_input_to(&self, id: PaneId, bytes: Vec<u8>) {
         let Some(pane) = self.panes.get(&id) else {
             return;
@@ -179,6 +247,9 @@ impl Window {
             return false;
         };
         let focused = event.is_click() && self.focus(id);
+        if self.copy.contains_key(&id) {
+            return focused;
+        }
         if let Some(pane) = self.panes.get(&id) {
             let (mode, encoding) = pane.with_screen(|screen| {
                 (
@@ -214,6 +285,10 @@ impl Screens for Window {
     ) -> Option<R> {
         self.panes.get(&pane).map(|pane| pane.with_pane(read))
     }
+
+    fn copy_view(&self, pane: PaneId) -> Option<CopyView<'_>> {
+        self.copy.get(&pane).map(CopyMode::view)
+    }
 }
 
 fn report_clicks(modes: &mut InputModes, several_panes: bool) {
@@ -227,6 +302,14 @@ fn report_clicks(modes: &mut InputModes, several_panes: bool) {
     if modes.mouse_protocol_mode != MouseProtocolMode::None {
         modes.mouse_protocol_encoding = MouseProtocolEncoding::Sgr;
     }
+}
+
+fn pane_rect(layout: &Layout, pane: PaneId, size: Size) -> Option<Rect> {
+    layout
+        .rects(size)
+        .into_iter()
+        .find(|(id, _)| *id == pane)
+        .map(|(_, rect)| rect)
 }
 
 fn split_direction(split: Split) -> SplitDirection {

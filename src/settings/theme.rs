@@ -31,6 +31,7 @@ pub struct Theme {
     pub overlay_border: StyleSpec,
     pub pane_border: StyleSpec,
     pub pane_border_active: StyleSpec,
+    pub copy_position: StyleSpec,
 }
 
 impl Default for Theme {
@@ -74,6 +75,7 @@ impl Default for Theme {
                 fg: Some(Color::GREEN),
                 ..StyleSpec::EMPTY
             },
+            copy_position: StyleSpec::colors(Color::BLACK, Color::YELLOW),
         }
     }
 }

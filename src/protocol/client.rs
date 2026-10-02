@@ -369,6 +369,7 @@ pub enum SessionCommand {
     KillPane,
     KillWindow,
     RenameWindow(String),
+    CopyMode { page_up: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

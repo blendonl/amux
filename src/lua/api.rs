@@ -11,8 +11,8 @@ use super::runtime::Process;
 use super::{client, from_lua, function, server};
 use crate::keys::{parse_sequence, spell_sequence, Key};
 use crate::settings::{
-    Binding, CallbackId, Keymap, PickerAction, PromptAction, Table as Bindings, TreeAction,
-    PICKER_TABLE, PREFIX_TABLE, PROMPT_TABLE, ROOT_TABLE, TREE_TABLE,
+    Binding, CallbackId, CopyAction, Keymap, PickerAction, PromptAction, Table as Bindings,
+    TreeAction, COPY_TABLE, PICKER_TABLE, PREFIX_TABLE, PROMPT_TABLE, ROOT_TABLE, TREE_TABLE,
 };
 
 const SET_OPTIONS: [&str; 1] = ["desc"];
@@ -163,6 +163,11 @@ fn keymap(lua: &Lua, constructors: Table) -> mlua::Result<Table> {
                         let action = panel_action::<PickerAction>(&table, value)?;
                         bind(&mut registry(lua)?.keymap.picker, key, action, description);
                     }
+                    COPY_TABLE => {
+                        let key = single_key(&table, &keys)?;
+                        let action = panel_action::<CopyAction>(&table, value)?;
+                        bind(&mut registry(lua)?.keymap.copy, key, action, description);
+                    }
                     "" => return Err(mlua::Error::runtime("a keymap table needs a name")),
                     name => {
                         let bound = bound(lua, &constructors, value)?;
@@ -200,6 +205,7 @@ fn keymap(lua: &Lua, constructors: Table) -> mlua::Result<Table> {
                 PROMPT_TABLE => keymap.prompt.remove(&single_key(&table, &keys)?).is_some(),
                 TREE_TABLE => keymap.tree.remove(&single_key(&table, &keys)?).is_some(),
                 PICKER_TABLE => keymap.picker.remove(&single_key(&table, &keys)?).is_some(),
+                COPY_TABLE => keymap.copy.remove(&single_key(&table, &keys)?).is_some(),
                 name => {
                     let (key, path) = split_sequence(&keys);
                     let removed = keymap
@@ -228,6 +234,7 @@ fn keymap(lua: &Lua, constructors: Table) -> mlua::Result<Table> {
                 PROMPT_TABLE => to_lua(lua, keymap.prompt.get(&single_key(&table, &keys)?)),
                 TREE_TABLE => to_lua(lua, keymap.tree.get(&single_key(&table, &keys)?)),
                 PICKER_TABLE => to_lua(lua, keymap.picker.get(&single_key(&table, &keys)?)),
+                COPY_TABLE => to_lua(lua, keymap.copy.get(&single_key(&table, &keys)?)),
                 name => {
                     let (key, path) = split_sequence(&keys);
                     let bound = keymap
@@ -252,6 +259,7 @@ fn keymap(lua: &Lua, constructors: Table) -> mlua::Result<Table> {
                 PROMPT_TABLE => keymap.prompt.clear(),
                 TREE_TABLE => keymap.tree.clear(),
                 PICKER_TABLE => keymap.picker.clear(),
+                COPY_TABLE => keymap.copy.clear(),
                 ROOT_TABLE => clear_bindings(callbacks, &mut keymap.root),
                 PREFIX_TABLE => clear_bindings(callbacks, &mut keymap.prefix),
                 name => {
@@ -511,11 +519,16 @@ mod tests {
              amux.keymap.set('tree', 'x', 'cancel')\n\
              amux.keymap.set('picker', 'C-j', 'down')\n\
              amux.keymap.del('picker', 'C-u')\n\
-             assert(amux.keymap.get('picker', 'Enter') == 'pick')",
+             assert(amux.keymap.get('picker', 'Enter') == 'pick')\n\
+             amux.keymap.set('copy', 'C-k', 'halfpage_up')\n\
+             amux.keymap.del('copy', 'q')\n\
+             assert(amux.keymap.get('copy', 'g') == 'history_top')",
         )
         .keymap;
         assert_eq!(keymap.picker.get(&key("C-j")), Some(&PickerAction::Down));
         assert_eq!(keymap.picker.get(&key("C-u")), None);
+        assert_eq!(keymap.copy.get(&key("C-k")), Some(&CopyAction::HalfpageUp));
+        assert_eq!(keymap.copy.get(&key("q")), None);
         for (notation, binding) in [
             ("|", Binding::SplitPane(Split::LeftRight)),
             ("D", Binding::Detach),
@@ -566,11 +579,15 @@ mod tests {
              keymap.set('gone', 'x', 'detach')\n\
              keymap.clear('gone')\n\
              keymap.clear('tree')\n\
-             keymap.set('tree', 'j', 'down')",
+             keymap.set('tree', 'j', 'down')\n\
+             assert(keymap.get('copy', 'Escape') == 'cancel')\n\
+             keymap.clear('copy')\n\
+             assert(keymap.get('copy', 'q') == nil)",
         )
         .keymap;
         assert_eq!(keymap.prefix.get(&key("&")), None);
-        assert_eq!(keymap.prefix.iter().count(), 27);
+        assert_eq!(keymap.prefix.iter().count(), 28);
+        assert_eq!(keymap.copy.iter().count(), 0);
         assert_eq!(keymap.prompt.get(&key("C-u")), None);
         assert_eq!(keymap.custom["resize"].iter().count(), 0);
         assert!(!keymap.custom.contains_key("gone"));
@@ -665,6 +682,10 @@ mod tests {
                 "init.lua:1: the tree table binds single keys, not the sequence g g",
             ),
             (
+                "amux.keymap.set('copy', 'g g', 'history_top')",
+                "init.lua:1: the copy table binds single keys, not the sequence g g",
+            ),
+            (
                 "amux.keymap.del('prefix', 'z z')",
                 "init.lua:1: z z is not bound in the prefix table",
             ),
@@ -741,7 +762,7 @@ mod tests {
                  new_window, next_window, previous_window, select_window, split_pane, \
                  next_pane, select_pane, kill_pane, kill_window, rename_window, \
                  rename_session, cluster_tree, search_projects, search_worktrees, switch_table, \
-                 reload_config, which_key"
+                 reload_config, which_key, copy_mode, copy_mode_page_up"
             ),
             "{error}"
         );
@@ -757,6 +778,11 @@ mod tests {
         let error = failure("amux.keymap.set('prompt', 'x', 'zoom')");
         assert!(
             error.contains("init.lua:1: invalid prompt action: unknown variant `zoom`, expected one of `submit`"),
+            "{error}"
+        );
+        let error = failure("amux.keymap.set('copy', 'x', 'detach')");
+        assert!(
+            error.contains("init.lua:1: invalid copy action: unknown variant `detach`, expected one of `cursor_left`"),
             "{error}"
         );
     }
@@ -783,6 +809,10 @@ mod tests {
             (
                 "amux.keymap.set('tree', 'x', function() end)",
                 "init.lua:1: the tree table binds action names, not a function",
+            ),
+            (
+                "amux.keymap.set('copy', 'x', function() end)",
+                "init.lua:1: the copy table binds action names, not a function",
             ),
             (
                 "amux.keymap.set('', 'x', 'detach')",
@@ -838,7 +868,7 @@ mod tests {
     #[test]
     fn every_action_constructor_is_exposed() {
         let names = variants::<Binding>();
-        assert_eq!(names.len(), 19);
+        assert_eq!(names.len(), 21);
         assert!(names.contains(&"switch_table"));
         assert!(!names.contains(&"callback"));
         let loaded = loaded("");
