@@ -51,6 +51,7 @@ class MainActivity : Activity() {
     private var session: TerminalSession? = null
     private var service: AmuxService? = null
     private var bound = false
+    private var visible = false
     private var attachWhenReady = true
     private var suspended = false
     private var userlandFailureShown = false
@@ -63,6 +64,7 @@ class MainActivity : Activity() {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             val connected = (binder as AmuxService.LocalBinder).service
             service = connected
+            connected.appVisible = visible
             connected.observe(serverObserver)
         }
 
@@ -97,6 +99,8 @@ class MainActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
+        visible = true
+        service?.appVisible = true
         mainThread.removeCallbacks(suspendInBackground)
         if (!suspended) return
         suspended = false
@@ -109,6 +113,8 @@ class MainActivity : Activity() {
     }
 
     override fun onStop() {
+        visible = false
+        service?.appVisible = false
         mainThread.postDelayed(suspendInBackground, BACKGROUND_GRACE.inWholeMilliseconds)
         super.onStop()
     }
