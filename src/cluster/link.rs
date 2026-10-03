@@ -640,6 +640,7 @@ impl LinkStats {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::time::SystemTime;
 
     use tokio::io::{duplex, split, DuplexStream, ReadHalf, WriteHalf};
     use tokio::sync::broadcast;
@@ -648,13 +649,14 @@ mod tests {
     use crate::cluster::channel::CREDIT_BYTES;
     use crate::cluster::noise;
     use crate::cluster::{
-        Channel, ChannelEnd, ClusterOptions, NoiseKey, TrustStore, Voucher, CREDIT_WINDOW,
+        Channel, ChannelEnd, ClusterOptions, NoiseKey, Origin, Peer, StatusSummary, Target,
+        TrustStore, Voucher, CREDIT_WINDOW,
     };
     use crate::identity::{Incarnation, ServerIdentity};
     use crate::protocol::{
         read_message, ChannelId, ClientMessage, Duplex, Event, ServerMessage, ServerState,
-        ServerStatus, SessionId, SessionInfo, Snapshot, StateEvent, TcpKind, Version,
-        WindowSummary, PROTOCOL_MAJOR,
+        ServerStatus, ServerView, SessionId, SessionInfo, Snapshot, StateEvent, TcpKind, Version,
+        Via, WindowSummary, PROTOCOL_MAJOR,
     };
     use crate::settings::DiscoverySettings;
 
@@ -1311,6 +1313,193 @@ mod tests {
             higher.cluster.view()[0].status,
             ServerStatus::Offline { stopped: true, .. }
         ));
+    }
+
+    fn measure(link: &Link<Reader, Writer>, latency: Duration) {
+        link.lanes.stats.lock().latency = Some(latency);
+    }
+
+    fn peer_named(name: &str) -> Peer {
+        Peer {
+            name: name.into(),
+            version: None,
+            last_seen: None,
+            stopped: false,
+            state: None,
+        }
+    }
+
+    fn gossiped(name: &str) -> Origin {
+        Origin::Gossiped { name: name.into() }
+    }
+
+    fn target(
+        origin: Origin,
+        peer: Option<ServerId>,
+        verified: bool,
+        incompatible: Option<Version>,
+    ) -> Target {
+        Target {
+            incompatible,
+            ..Target::new(origin, peer, verified, SystemTime::now())
+        }
+    }
+
+    fn summary_from_view(servers: &[ServerView], host: &str) -> StatusSummary {
+        let latency = servers
+            .iter()
+            .filter(|server| server.name == host)
+            .find_map(|server| match server.status {
+                ServerStatus::Online { latency } => latency,
+                _ => None,
+            });
+        StatusSummary {
+            latency: latency
+                .map(|latency| Duration::from_millis(latency.as_millis().try_into().unwrap())),
+            offline: servers
+                .iter()
+                .filter(|server| matches!(server.status, ServerStatus::Offline { .. }))
+                .map(|server| server.name.clone())
+                .collect(),
+        }
+    }
+
+    fn kind(status: &ServerStatus) -> &'static str {
+        match status {
+            ServerStatus::Local => "local",
+            ServerStatus::Online { .. } => "online",
+            ServerStatus::Offline { .. } => "offline",
+            ServerStatus::Incompatible { .. } => "incompatible",
+        }
+    }
+
+    #[tokio::test]
+    async fn the_status_summary_matches_the_cluster_view() {
+        let ours = node(LOWER, "ours").build();
+        let (_raw, link) = raw_peer(&ours, PIPE_CAPACITY).await;
+        let future = Version {
+            release: "9.0.0".into(),
+            major: PROTOCOL_MAJOR + 1,
+            minor: 0,
+        };
+        let [attic, bench, cellar, twin, gone] = [
+            "000000000000000000000000000000a1",
+            "000000000000000000000000000000b1",
+            "000000000000000000000000000000c1",
+            "000000000000000000000000000000d1",
+            "000000000000000000000000000000e1",
+        ]
+        .map(|id| id.parse::<ServerId>().unwrap());
+        {
+            let mut members = ours.cluster.members();
+            for (id, name) in [
+                (attic, "attic"),
+                (bench, "bench"),
+                (cellar, "cellar"),
+                (twin, "raw"),
+            ] {
+                members.peers.insert(id, peer_named(name));
+            }
+            let hidden = Origin::Discovered {
+                name: "hall".into(),
+                via: Via::Lan,
+            };
+            let targets = [
+                (
+                    "ssh:bench",
+                    target(gossiped("bench"), Some(bench), true, Some(future.clone())),
+                ),
+                (
+                    "exec:cellar",
+                    target(
+                        gossiped("cellar"),
+                        Some(cellar),
+                        false,
+                        Some(future.clone()),
+                    ),
+                ),
+                (
+                    "ssh:cellar",
+                    target(gossiped("cellar"), Some(cellar), true, None),
+                ),
+                ("ssh:den", target(gossiped("den"), None, false, None)),
+                (
+                    "ssh:eaves",
+                    target(gossiped("eaves"), None, false, Some(future.clone())),
+                ),
+                ("ssh:gone", target(gossiped("gone"), Some(gone), true, None)),
+                ("lan:hall", target(hidden, None, false, None)),
+                (
+                    "ssh:here",
+                    Target {
+                        is_self: true,
+                        ..target(gossiped("here"), None, true, None)
+                    },
+                ),
+            ];
+            for (address, target) in targets {
+                members.targets.insert(address.to_owned(), target);
+            }
+        }
+        let matches_the_view = || {
+            let servers = ours.cluster.view();
+            for host in ["raw", "attic", "bench", "den", "eaves", "nowhere"] {
+                assert_eq!(
+                    ours.cluster.status_summary(host),
+                    summary_from_view(&servers, host),
+                    "{host}"
+                );
+            }
+            servers
+        };
+
+        let servers = matches_the_view();
+        measure(&link, Duration::from_micros(12_345));
+        matches_the_view();
+
+        let kinds: Vec<(&str, &str)> = servers
+            .iter()
+            .map(|server| (server.name.as_str(), kind(&server.status)))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("attic", "offline"),
+                ("bench", "incompatible"),
+                ("cellar", "offline"),
+                ("den", "offline"),
+                ("eaves", "incompatible"),
+                ("gone", "offline"),
+                ("raw", "online"),
+                ("raw", "offline"),
+            ]
+        );
+        assert_eq!(
+            ours.cluster.status_summary("raw"),
+            StatusSummary {
+                latency: Some(Duration::from_millis(12)),
+                offline: ["attic", "cellar", "den", "gone", "raw"]
+                    .map(String::from)
+                    .to_vec(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn two_pongs_within_the_same_millisecond_give_an_equal_status() {
+        let ours = node(LOWER, "ours").build();
+        let (_raw, link) = raw_peer(&ours, PIPE_CAPACITY).await;
+
+        measure(&link, Duration::from_micros(12_100));
+        let first = ours.cluster.status_summary("raw");
+        measure(&link, Duration::from_micros(12_900));
+        let second = ours.cluster.status_summary("raw");
+        measure(&link, Duration::from_micros(13_000));
+        let third = ours.cluster.status_summary("raw");
+
+        assert_eq!(first, second);
+        assert_eq!(first.latency, Some(Duration::from_millis(12)));
+        assert_eq!(third.latency, Some(Duration::from_millis(13)));
     }
 
     #[tokio::test]
