@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
 
@@ -23,7 +24,7 @@ use crate::settings::PaneSettings;
 const READ_BUFFER_LEN: usize = 16 * 1024;
 
 pub trait PaneObserver: Send + Sync {
-    fn pane_output(&self, pane: PaneId);
+    fn pane_output(&self, live: &AtomicBool);
     fn pane_exited(&self, pane: PaneId, exit: Option<ExitStatus>);
 }
 
@@ -44,6 +45,7 @@ pub struct Pane {
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     parser: Arc<Mutex<vt100::Parser<PaneCallbacks>>>,
     images: Option<PaneImages>,
+    live: Arc<AtomicBool>,
 }
 
 impl Pane {
@@ -80,6 +82,7 @@ impl Pane {
             spec.settings.scrollback,
             callbacks,
         )));
+        let live = Arc::new(AtomicBool::new(false));
 
         spawn_output_pump(
             reader,
@@ -89,6 +92,7 @@ impl Pane {
                 parser: Arc::clone(&parser),
                 observer: spec.observer,
                 graphics,
+                live: Arc::clone(&live),
             },
         );
 
@@ -98,7 +102,17 @@ impl Pane {
             killer: Mutex::new(killer),
             parser,
             images,
+            live,
         })
+    }
+
+    pub fn set_live(&self, live: bool) {
+        self.live.store(live, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub fn is_live(&self) -> bool {
+        self.live.load(Ordering::Relaxed)
     }
 
     pub fn kill(&self) {
@@ -238,6 +252,7 @@ struct OutputSinks {
     parser: Arc<Mutex<vt100::Parser<PaneCallbacks>>>,
     observer: Weak<dyn PaneObserver>,
     graphics: Option<PaneGraphics>,
+    live: Arc<AtomicBool>,
 }
 
 impl OutputSinks {
@@ -262,7 +277,7 @@ fn spawn_output_pump(
                 Ok(len) => {
                     sinks.process(&buffer[..len]);
                     if let Some(observer) = sinks.observer.upgrade() {
-                        observer.pane_output(sinks.pane);
+                        observer.pane_output(&sinks.live);
                     }
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
@@ -317,7 +332,7 @@ mod tests {
     struct Quiet;
 
     impl PaneObserver for Quiet {
-        fn pane_output(&self, _: PaneId) {}
+        fn pane_output(&self, _: &AtomicBool) {}
         fn pane_exited(&self, _: PaneId, _: Option<ExitStatus>) {}
     }
 
