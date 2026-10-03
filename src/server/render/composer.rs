@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::grid::{BorderLook, Cell, Grid};
+use super::images::ImageCache;
 use super::{cursor_in, images, paint_copy, Frame, InputModes, Screens, Viewer, COPY_MODES};
 use crate::protocol::Size;
 use crate::server::layout::{Border, Layout, PaneId, Rect};
@@ -37,7 +38,7 @@ struct PaneCache {
     rect: Rect,
     source: Option<Source>,
     rows: Vec<Option<(u64, u64)>>,
-    image_rows: Vec<u16>,
+    images: ImageCache,
 }
 
 impl Default for Composer {
@@ -125,7 +126,7 @@ impl Composer {
                         rect,
                         viewer,
                         &mut frame.images,
-                        &mut cache.image_rows,
+                        &mut cache.images,
                     );
                     (pane == active).then(|| {
                         (
@@ -200,7 +201,7 @@ impl PaneCache {
         self.rect = rect;
         self.source = source;
         self.rows.clear();
-        self.image_rows.clear();
+        self.images.forget_rows();
     }
 
     fn paint_rows(&mut self, grid: &mut Grid, screen: &vt100::Screen) {
@@ -217,7 +218,7 @@ impl PaneCache {
             let index = usize::from(offset);
             let unchanged = self.rows.get(index) == Some(&key)
                 && !visible.is_some_and(|visible| visible.has_placeholders)
-                && !self.image_rows.contains(&offset);
+                && !self.images.covers(offset);
             if unchanged {
                 continue;
             }
