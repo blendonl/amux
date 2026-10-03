@@ -127,3 +127,29 @@ fn reversed_or_empty_ranges_have_no_text() {
     assert_eq!(screen.line_contents_between(2, 1, 2, 1), "");
     assert_eq!(screen.line_contents_between(3, 0, 9, 1), "4\n5\n");
 }
+
+#[test]
+fn a_line_is_the_row_its_cells_are_read_from() {
+    let mut parser = parser(2, 6, 10, "abcdef\r\n日x\r\nz");
+    parser.screen_mut().set_size(2, 8);
+    let screen = parser.screen();
+    assert_eq!(screen.history_len(), 1);
+    for line in 0..4 {
+        let row = screen.line(line);
+        assert_eq!(row.is_none(), line == 3, "line {line}");
+        let cells = row.map_or(&[][..], |row| row.cells);
+        assert_eq!(cells.len(), [6, 8, 8, 0][line], "line {line}");
+        for col in 0..10 {
+            assert_eq!(
+                cells.get(usize::from(col)),
+                screen.line_cell(line, col),
+                "line {line}, col {col}"
+            );
+        }
+        assert_eq!(
+            row.is_some_and(|row| row.wrapped),
+            screen.line_wrapped(line)
+        );
+    }
+    assert_eq!(screen.line(2).map(|row| row.id), screen.row_ids().nth(1));
+}

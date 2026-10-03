@@ -559,6 +559,12 @@ impl Screen {
 
     #[allow(missing_docs)]
     #[must_use]
+    pub fn line(&self, line: usize) -> Option<crate::VisibleRow<'_>> {
+        self.grid().line(line).map(crate::row::Row::visible)
+    }
+
+    #[allow(missing_docs)]
+    #[must_use]
     pub fn line_wrapped(&self, line: usize) -> bool {
         self.grid().line(line).is_some_and(crate::row::Row::wrapped)
     }

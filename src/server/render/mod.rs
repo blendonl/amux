@@ -188,11 +188,22 @@ pub fn compose(
 }
 
 fn paint_copy(grid: &mut Grid, view: &CopyView<'_>, rect: Rect, settings: &Settings) {
-    grid.paint_with(rect, |row, col| {
-        view.screen
-            .line_cell(view.top + usize::from(row), col)
-            .map(images::text_cell)
-    });
+    for offset in 0..rect.rows {
+        let line = view.screen.line(view.top + usize::from(offset));
+        let convert = if line.is_some_and(|line| line.has_placeholders) {
+            images::text_cell
+        } else {
+            Cell::from_vt100
+        };
+        let cells = line.map_or(&[][..], |line| line.cells);
+        grid.paint_row(
+            rect.row.saturating_add(offset),
+            rect.col,
+            rect.cols,
+            cells,
+            convert,
+        );
+    }
     let selected = settings.theme.copy_selection.into();
     for (row, cols) in &view.selection {
         let cols = rect.col.saturating_add(cols.start)..rect.col.saturating_add(cols.end);
@@ -209,14 +220,8 @@ fn paint_copy(grid: &mut Grid, view: &CopyView<'_>, rect: Rect, settings: &Setti
     if let Some(status) = &view.status {
         let style = settings.theme.copy_prompt.into();
         let row = rect.bottom().saturating_sub(1);
-        grid.paint_with(
-            Rect {
-                row,
-                rows: 1,
-                ..rect
-            },
-            |_, _| Some(Cell::blank(style)),
-        );
+        grid.paint_row(row, rect.col, rect.cols, &[], Cell::from_vt100);
+        grid.restyle(row, rect.col..rect.right(), rect, style);
         grid.write_text(row, rect.col, rect, &status.text, style);
     }
 }
