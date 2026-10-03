@@ -16,7 +16,7 @@ use super::lua_host::{HookEvent, HookSink};
 use super::mouse::InputEvent;
 use super::pane::{Pane, PaneObserver, PaneSpec};
 use super::paste::PasteBuffer;
-use super::render::{Frame, Viewer};
+use super::render::{Composer, Frame, Viewer};
 use super::window::Window;
 use crate::keys::KeyDecoder;
 use crate::project::ProjectId;
@@ -255,14 +255,14 @@ impl Session {
         windows.redraw();
     }
 
-    pub fn frame(&self, viewer: Viewer<'_>) -> Option<Frame> {
+    pub fn frame<'c>(&self, composer: &'c mut Composer, viewer: Viewer<'_>) -> Option<&'c Frame> {
         let settings = self.settings();
         let windows = self.state();
         windows.signals.as_ref()?;
         Some(
             windows
                 .active_window()?
-                .compose(windows.size, &settings, viewer),
+                .compose(composer, windows.size, &settings, viewer),
         )
     }
 
