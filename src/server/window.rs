@@ -153,8 +153,15 @@ impl Window {
         self.active
     }
 
-    pub fn shows_output_of(&self, pane: PaneId) -> bool {
-        self.contains(pane) && !self.copy.contains_key(&pane)
+    pub fn set_live(&self, shown: bool) {
+        for (id, pane) in &self.panes {
+            pane.set_live(shown && !self.copy.contains_key(id));
+        }
+    }
+
+    #[cfg(test)]
+    pub fn live_panes(&self) -> Vec<bool> {
+        self.panes.values().map(Pane::is_live).collect()
     }
 
     pub fn copy_mode(&mut self, size: Size, page_up: bool) {
