@@ -46,6 +46,7 @@ use terminal::RawTerminal;
 const SERVER_START_ATTEMPTS: u32 = 50;
 const SERVER_STOP_ATTEMPTS: u32 = 250;
 const SERVER_POLL: Duration = Duration::from_millis(20);
+const QUEUED_SERVER_MESSAGES: usize = 4;
 
 pub type ServerConnection = Duplex<ServerMessage, ClientMessage>;
 
@@ -569,7 +570,7 @@ pub async fn connect_stream(socket: &Path) -> Result<UnixStream> {
 
 fn into_connection(stream: UnixStream) -> ServerConnection {
     let (reader, writer) = stream.into_split();
-    protocol::duplex(reader, writer)
+    protocol::duplex_with(reader, writer, QUEUED_SERVER_MESSAGES)
 }
 
 fn terminate_incompatible(stream: &UnixStream) -> Result<()> {

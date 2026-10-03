@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
+use nix::sys::socket::{setsockopt, sockopt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{broadcast, watch, Mutex as AsyncMutex, Notify};
@@ -58,6 +59,7 @@ use session::{Binding, Session, SessionHost};
 
 const LOG_FILTER_ENV: &str = "AMUX_LOG";
 const EVENT_CAPACITY: usize = 256;
+const CLIENT_SEND_BUFFER_LEN: usize = 32 * 1024;
 
 pub async fn run(socket: &Path, config: Option<&Path>) -> Result<()> {
     init_logging();
@@ -165,6 +167,9 @@ pub async fn run(socket: &Path, config: Option<&Path>) -> Result<()> {
 
 async fn serve(server: Arc<Server>, mut stream: UnixStream) -> Result<()> {
     let role = protocol::accept(&mut stream, &Version::current(), &server.identity.name).await?;
+    if role == Some(Role::Client) {
+        let _ = setsockopt(&stream, sockopt::SndBuf, &CLIENT_SEND_BUFFER_LEN);
+    }
     let (reader, writer) = stream.into_split();
     match role {
         Some(Role::Client) => {

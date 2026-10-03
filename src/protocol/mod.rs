@@ -52,7 +52,17 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (incoming_sender, incoming) = mpsc::channel(INCOMING_CAPACITY);
+    duplex_with(reader, writer, INCOMING_CAPACITY)
+}
+
+pub fn duplex_with<In, Out, R, W>(reader: R, writer: W, incoming_capacity: usize) -> Duplex<In, Out>
+where
+    In: DeserializeOwned + Send + 'static,
+    Out: Serialize + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (incoming_sender, incoming) = mpsc::channel(incoming_capacity);
     let (outgoing, outgoing_receiver) = mpsc::channel(OUTGOING_CAPACITY);
     tokio::spawn(pump_incoming(reader, incoming_sender));
     tokio::spawn(pump_outgoing(writer, outgoing_receiver));
@@ -777,5 +787,34 @@ mod tests {
             .unwrap();
 
         assert_eq!(server.incoming.recv().await, Some(ClientMessage::Detach));
+    }
+
+    #[tokio::test]
+    async fn a_duplex_reads_ahead_only_as_far_as_its_incoming_capacity() {
+        let (mut raw, client_end) = byte_pipe(1 << 16);
+        let (reader, writer) = split(client_end);
+        let mut client: Duplex<ServerMessage, ClientMessage> = duplex_with(reader, writer, 4);
+        let sent: Vec<ServerMessage> = (0..8)
+            .map(|index| ServerMessage::Output(vec![index; 100]))
+            .collect();
+        for message in &sent {
+            write_message(&mut raw, message).await.unwrap();
+        }
+
+        let filled = async {
+            while client.incoming.capacity() > 0 {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), filled)
+            .await
+            .expect("the incoming queue never filled");
+        assert_eq!(client.incoming.len(), 4);
+
+        let mut received = Vec::new();
+        for _ in &sent {
+            received.push(client.incoming.recv().await.unwrap());
+        }
+        assert_eq!(received, sent);
     }
 }
