@@ -6,6 +6,47 @@ use super::{ImageUse, Viewer};
 use crate::server::graphics::place::{PaneSpan, PlacementId, PlacementKind, Placements};
 use crate::server::layout::Rect;
 
+#[derive(Default)]
+pub struct ImageCache {
+    rows: Vec<u16>,
+    spans: Vec<PaneSpan>,
+    spans_key: Option<SpansKey>,
+    row_ids: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpansKey {
+    revision: u64,
+    size: (u16, u16),
+    alternate: bool,
+}
+
+impl ImageCache {
+    pub fn covers(&self, row: u16) -> bool {
+        self.rows.contains(&row)
+    }
+
+    pub fn forget_rows(&mut self) {
+        self.rows.clear();
+    }
+
+    fn refresh_spans(&mut self, placements: &Placements, screen: &vt100::Screen) {
+        let key = SpansKey {
+            revision: placements.revision(),
+            size: screen.size(),
+            alternate: screen.alternate_screen(),
+        };
+        if self.spans_key == Some(key) && screen.row_ids().eq(self.row_ids.iter().copied()) {
+            return;
+        }
+        self.spans_key = Some(key);
+        self.row_ids.clear();
+        self.row_ids.extend(screen.row_ids());
+        self.spans.clear();
+        self.spans.extend(placements.spans(screen));
+    }
+}
+
 pub fn paint(
     grid: &mut Grid,
     screen: &vt100::Screen,
@@ -13,9 +54,9 @@ pub fn paint(
     rect: Rect,
     viewer: Viewer<'_>,
     uses: &mut Vec<ImageUse>,
-    image_rows: &mut Vec<u16>,
+    cache: &mut ImageCache,
 ) {
-    image_rows.clear();
+    cache.rows.clear();
     let mut resolver = Resolver {
         screen,
         placements: placements.filter(|_| viewer.graphics),
@@ -31,7 +72,7 @@ pub fn paint(
         .placements
         .filter(|placements| !placements.is_empty())
     {
-        paint_spans(grid, screen, placements, rect, viewer, uses, image_rows);
+        paint_spans(grid, screen, placements, rect, viewer, uses, cache);
     }
 }
 
@@ -57,10 +98,11 @@ fn paint_spans(
     rect: Rect,
     viewer: Viewer<'_>,
     uses: &mut Vec<ImageUse>,
-    image_rows: &mut Vec<u16>,
+    cache: &mut ImageCache,
 ) {
+    cache.refresh_spans(placements, screen);
     let mut shown: Option<(PlacementId, bool)> = None;
-    for span in placements.spans(screen) {
+    for &span in &cache.spans {
         let visible = match shown {
             Some((placement, visible)) if placement == span.placement => visible,
             _ => {
@@ -75,7 +117,7 @@ fn paint_spans(
         if !visible {
             continue;
         }
-        image_rows.push(span.row);
+        cache.rows.push(span.row);
         let cells = screen
             .visible_row(span.row)
             .map_or(&[][..], |row| row.cells);
@@ -707,6 +749,33 @@ mod tests {
     }
 
     #[test]
+    fn recomposing_a_still_image_allocates_nothing() {
+        let mut panes = Panes::side_by_side();
+        let settings = Arc::new(Settings::default());
+        let mut composer = Composer::default();
+        panes.feed(LEFT, "text\x1b[2;3H");
+        panes.transmit(LEFT, "i=1,C=1", 30, 40);
+        panes.feed(RIGHT, &sixel(30, 40));
+        let mut recompose = |panes: &Panes| {
+            let frame = composer.compose(
+                &panes.layout,
+                WINDOW,
+                LEFT,
+                &panes.parsers,
+                &settings,
+                graphics(),
+            );
+            frame.images.len()
+        };
+        assert_eq!(recompose(&panes), 2);
+        recompose(&panes);
+
+        let before = allocations();
+        assert_eq!(recompose(&panes), 2);
+        assert_eq!(allocations() - before, 0);
+    }
+
+    #[test]
     fn painting_a_pane_without_images_allocates_nothing() {
         let panes = Panes::side_by_side();
         let parser = panes.parsers[&LEFT].lock().unwrap();
@@ -721,7 +790,7 @@ mod tests {
             rect,
             graphics(),
             &mut uses,
-            &mut Vec::new(),
+            &mut ImageCache::default(),
         );
         assert_eq!(allocations() - before, 0);
     }

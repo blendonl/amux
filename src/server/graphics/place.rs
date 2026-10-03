@@ -18,6 +18,7 @@ pub const ASSUMED_CELL_PIXELS: CellPixels = CellPixels {
 const MAX_PARENT_HOPS: usize = 8;
 
 static NEXT_PLACEMENT: AtomicU64 = AtomicU64::new(1);
+static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PlacementId(pub u64);
@@ -143,6 +144,7 @@ pub struct Placements {
     images: PaneImages,
     main: Vec<Placement>,
     alt: Vec<Placement>,
+    revision: u64,
 }
 
 impl Placements {
@@ -151,7 +153,12 @@ impl Placements {
             images,
             main: Vec::new(),
             alt: Vec::new(),
+            revision: next_revision(),
         }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn place(
@@ -239,6 +246,7 @@ impl Placements {
         let old = replaced.map(|at| list.remove(at));
         let at = list.partition_point(|other| other.paints_before(&placement));
         list.insert(at, placement);
+        self.revision = next_revision();
         if let Some(old) = old.filter(|old| old.display != display) {
             self.images.release_display(old.display);
         }
@@ -295,6 +303,7 @@ impl Placements {
         let list = self.list_mut(buffer);
         let at = list.partition_point(|other| other.paints_before(&placement));
         list.insert(at, placement);
+        self.revision = next_revision();
         self.remove(buffer, covered, false);
         Ok(())
     }
@@ -378,6 +387,7 @@ impl Placements {
         }
         let rows = RowMap::new(screen);
         let mut dead = Vec::new();
+        let mut grown = false;
         for placement in list.iter_mut() {
             let Position::Rows {
                 anchors,
@@ -386,7 +396,9 @@ impl Placements {
             else {
                 continue;
             };
+            let anchored = anchors.len();
             adopt(anchors, pending_tail, &rows, screen);
+            grown |= anchors.len() != anchored;
             let shown = match placement.kind {
                 PlacementKind::Kitty => anchors.iter().any(|&(id, _)| rows.row(id).is_some()),
                 PlacementKind::Sixel => marks(&rows, placement, screen).next().is_some(),
@@ -394,6 +406,9 @@ impl Placements {
             if !shown {
                 dead.push(placement.serial);
             }
+        }
+        if grown {
+            self.revision = next_revision();
         }
         if !dead.is_empty() {
             self.remove(buffer, dead, false);
@@ -455,11 +470,17 @@ impl Placements {
     }
 
     fn remove(&mut self, buffer: Buffer, mut doomed: Vec<PlacementId>, mut free: bool) {
-        let Self { images, main, alt } = self;
+        let Self {
+            images,
+            main,
+            alt,
+            revision,
+        } = self;
         let list = match buffer {
             Buffer::Main => main,
             Buffer::Alt => alt,
         };
+        let placed = list.len();
         while !doomed.is_empty() {
             let mut children = Vec::new();
             list.retain(|placement| {
@@ -479,7 +500,14 @@ impl Placements {
             doomed = children;
             free = true;
         }
+        if list.len() != placed {
+            *revision = next_revision();
+        }
     }
+}
+
+fn next_revision() -> u64 {
+    NEXT_REVISION.fetch_add(1, Ordering::Relaxed)
 }
 
 pub fn active_buffer(screen: &vt100::Screen) -> Buffer {
@@ -1743,6 +1771,36 @@ pub mod tests {
         assert_eq!(found(&terminal, 7, 3), None);
         terminal.output("\x1b[?47l");
         assert_eq!(found(&terminal, 7, 3), Some(third));
+    }
+
+    #[test]
+    fn the_revision_changes_only_when_the_placements_do() {
+        let mut terminal = Terminal::new(5, 10);
+        let revision = |terminal: &Terminal| {
+            lock(&terminal.parser)
+                .callbacks()
+                .placements()
+                .unwrap()
+                .revision()
+        };
+        let image = terminal.image(1, 10, 20);
+        let empty = revision(&terminal);
+        terminal.output("text\r\n");
+        assert_eq!(revision(&terminal), empty);
+
+        terminal.place(image, "a=p,i=1,p=1,r=3").unwrap();
+        let placed = revision(&terminal);
+        assert_ne!(placed, empty);
+        terminal.output("more text\x1b[H");
+        assert_eq!(revision(&terminal), placed);
+        terminal.output("\x1b[5H\r\n\r\n");
+        assert_eq!(revision(&terminal), placed);
+
+        terminal.output("\x1b[2J");
+        let cleared = revision(&terminal);
+        assert_ne!(cleared, placed);
+        terminal.output("\x1b[2J");
+        assert_eq!(revision(&terminal), cleared);
     }
 
     #[test]

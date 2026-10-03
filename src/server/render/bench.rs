@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::hint::black_box;
 use std::sync::{mpsc, Arc, Mutex};
@@ -26,6 +26,8 @@ const KEYSTROKES_PER_LINE: usize = 150;
 const PROMPT: &str = "$ ";
 const CLEAR_THE_PROMPT_LINE: &str = "\r\x1b[K$ ";
 const FILLER: &str = "the quick brown fox jumps over the lazy dog ";
+const IMAGE_PIXELS: u32 = 200;
+static NOTHING_HIDDEN: BTreeSet<u32> = BTreeSet::new();
 
 struct Terminal {
     layout: Layout,
@@ -34,6 +36,7 @@ struct Terminal {
     settings: Arc<Settings>,
     composer: Composer,
     differ: GridDiffer,
+    shows_images: bool,
 }
 
 impl Terminal {
@@ -51,6 +54,14 @@ impl Terminal {
             settings: Arc::new(settings),
             composer: Composer::default(),
             differ: GridDiffer::new(WINDOW),
+            shows_images: false,
+        }
+    }
+
+    fn showing_images() -> Self {
+        Self {
+            shows_images: true,
+            ..Self::new()
         }
     }
 
@@ -65,7 +76,10 @@ impl Terminal {
             PANE,
             &self.parsers,
             &self.settings,
-            Viewer::text(),
+            Viewer {
+                graphics: self.shows_images,
+                hidden: &NOTHING_HIDDEN,
+            },
         );
         self.differ.diff(frame)
     }
@@ -141,12 +155,14 @@ fn seq_lines(next: &mut usize, count: usize) -> String {
     lines
 }
 
-#[test]
-#[ignore = "a benchmark; scripts/bench runs it"]
-fn bench_keystroke_frame() {
-    let mut terminal = Terminal::new();
-    terminal.output(full_screen().as_bytes());
-    terminal.frame();
+fn image_over_the_screen() -> String {
+    let pixels = "AAAA".repeat(usize::try_from(IMAGE_PIXELS * IMAGE_PIXELS).unwrap_or_default());
+    format!(
+        "\x1b7\x1b[10;50H\x1b_Ga=T,q=2,C=1,f=24,s={IMAGE_PIXELS},v={IMAGE_PIXELS};{pixels}\x1b\\\x1b8"
+    )
+}
+
+fn keystroke_frames(terminal: &mut Terminal) -> Vec<Sample> {
     let mut samples = Vec::with_capacity(MEASURED_FRAMES);
     for keystroke in 0..WARMUP_FRAMES + MEASURED_FRAMES {
         if keystroke % KEYSTROKES_PER_LINE == KEYSTROKES_PER_LINE - 1 {
@@ -158,7 +174,26 @@ fn bench_keystroke_frame() {
             samples.push(sample);
         }
     }
-    report("keystroke frame", samples);
+    samples
+}
+
+#[test]
+#[ignore = "a benchmark; scripts/bench runs it"]
+fn bench_keystroke_frame() {
+    let mut terminal = Terminal::new();
+    terminal.output(full_screen().as_bytes());
+    terminal.frame();
+    report("keystroke frame", keystroke_frames(&mut terminal));
+}
+
+#[test]
+#[ignore = "a benchmark; scripts/bench runs it"]
+fn bench_image_keystroke_frame() {
+    let mut terminal = Terminal::showing_images();
+    terminal.output(full_screen().as_bytes());
+    terminal.output(image_over_the_screen().as_bytes());
+    terminal.frame();
+    report("image keystroke", keystroke_frames(&mut terminal));
 }
 
 #[test]
