@@ -14,16 +14,15 @@ pub fn paint(
     viewer: Viewer<'_>,
     uses: &mut Vec<ImageUse>,
 ) {
-    let (screen_rows, _) = screen.size();
     let mut resolver = Resolver {
         screen,
         placements: placements.filter(|_| viewer.graphics),
         viewer,
         last: None,
     };
-    for row in 0..rect.rows.min(screen_rows) {
-        if screen.row_has_placeholders(row) {
-            rewrite_row(grid, screen, row, rect, &mut resolver, uses);
+    for (row, visible) in (0..rect.rows).zip(screen.visible_rows()) {
+        if visible.has_placeholders {
+            rewrite_row(grid, visible.cells, row, rect, &mut resolver, uses);
         }
     }
     if let Some(placements) = resolver
@@ -73,12 +72,15 @@ fn paint_spans(
         if !visible {
             continue;
         }
+        let cells = screen
+            .visible_row(span.row)
+            .map_or(&[][..], |row| row.cells);
         match (span.kind, span.under_text) {
-            (PlacementKind::Sixel, _) => paint_where(grid, screen, &span, rect, |cell| {
+            (PlacementKind::Sixel, _) => paint_where(grid, cells, &span, rect, |cell| {
                 cell.is_some_and(vt100::Cell::is_graphic)
             }),
             (PlacementKind::Kitty, true) => {
-                paint_where(grid, screen, &span, rect, |cell| cell.is_none_or(is_blank));
+                paint_where(grid, cells, &span, rect, |cell| cell.is_none_or(is_blank));
             }
             (PlacementKind::Kitty, false) => {
                 grid.paint_image(&window_span(&span, rect, 0, span.cols), rect);
@@ -89,15 +91,15 @@ fn paint_spans(
 
 fn paint_where(
     grid: &mut Grid,
-    screen: &vt100::Screen,
+    cells: &[vt100::Cell],
     span: &PaneSpan,
     rect: Rect,
     shows: impl Fn(Option<&vt100::Cell>) -> bool,
 ) {
     let mut start = None;
     for offset in 0..=span.cols {
-        let free =
-            offset < span.cols && shows(screen.cell(span.row, span.col.saturating_add(offset)));
+        let col = usize::from(span.col.saturating_add(offset));
+        let free = offset < span.cols && shows(cells.get(col));
         match (free, start) {
             (true, None) => start = Some(offset),
             (false, Some(first)) => {
@@ -126,18 +128,14 @@ fn window_span(span: &PaneSpan, rect: Rect, skip: u16, cols: u16) -> ImageSpan {
 
 fn rewrite_row(
     grid: &mut Grid,
-    screen: &vt100::Screen,
+    cells: &[vt100::Cell],
     row: u16,
     rect: Rect,
     resolver: &mut Resolver<'_>,
     uses: &mut Vec<ImageUse>,
 ) {
-    let (_, screen_cols) = screen.size();
     let mut decoder = RowDecoder::default();
-    for col in 0..rect.cols.min(screen_cols) {
-        let Some(cell) = screen.cell(row, col) else {
-            continue;
-        };
+    for (col, cell) in (0..rect.cols).zip(cells) {
         let Some(placeholder) = decoder.decode(cell) else {
             continue;
         };

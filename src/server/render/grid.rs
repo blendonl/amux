@@ -175,18 +175,53 @@ impl Grid {
         self.index(row, col).map(|index| &self.cells[index])
     }
 
-    pub fn paint(&mut self, screen: &vt100::Screen, rect: Rect) {
-        self.paint_with(rect, |row, col| screen.cell(row, col).map(Cell::from_vt100));
+    pub fn row(&self, row: u16) -> Option<&[Cell]> {
+        let width = usize::from(self.size.cols);
+        let start = usize::from(row) * width;
+        (row < self.size.rows).then(|| &self.cells[start..start + width])
     }
 
-    pub fn paint_with(&mut self, rect: Rect, cell_at: impl Fn(u16, u16) -> Option<Cell>) {
-        let area = self.clip(rect);
-        for row in 0..area.rows {
-            for col in 0..area.cols {
-                let cell = cell_at(row, col);
-                self.set(area.row + row, area.col + col, cell.unwrap_or_default());
-            }
-            self.repair_wide_cells(area.row + row, area.col, area.right());
+    pub fn paint(&mut self, screen: &vt100::Screen, rect: Rect) {
+        let mut rows = screen.visible_rows();
+        for offset in 0..rect.rows {
+            let cells = rows.next().map_or(&[][..], |row| row.cells);
+            self.paint_row(
+                rect.row.saturating_add(offset),
+                rect.col,
+                rect.cols,
+                cells,
+                Cell::from_vt100,
+            );
+        }
+    }
+
+    pub fn paint_row(
+        &mut self,
+        row: u16,
+        col: u16,
+        width: u16,
+        cells: &[vt100::Cell],
+        convert: impl Fn(&vt100::Cell) -> Cell,
+    ) {
+        let area = self.clip(Rect {
+            row,
+            col,
+            rows: 1,
+            cols: width,
+        });
+        if area.rows == 0 || area.cols == 0 {
+            return;
+        }
+        let width = usize::from(area.cols);
+        let start = usize::from(area.row) * usize::from(self.size.cols) + usize::from(area.col);
+        for (index, target) in self.cells[start..start + width].iter_mut().enumerate() {
+            *target = match cells.get(index) {
+                Some(source) if is_orphaned(cells, index, width) => {
+                    Cell::blank(convert(source).style())
+                }
+                Some(source) => convert(source),
+                None => Cell::default(),
+            };
         }
     }
 
@@ -364,6 +399,20 @@ impl Grid {
 
     fn style_at(&self, row: u16, col: u16) -> Style {
         self.cell(row, col).map(Cell::style).unwrap_or_default()
+    }
+}
+
+fn is_orphaned(cells: &[vt100::Cell], index: usize, width: usize) -> bool {
+    let cell = &cells[index];
+    if cell.is_wide() {
+        index + 1 >= width
+            || !cells
+                .get(index + 1)
+                .is_some_and(vt100::Cell::is_wide_continuation)
+    } else if cell.is_wide_continuation() {
+        index == 0 || !cells.get(index - 1).is_some_and(vt100::Cell::is_wide)
+    } else {
+        false
     }
 }
 
