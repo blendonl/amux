@@ -504,7 +504,7 @@ impl Relay {
             return;
         }
         self.output.extend_from_slice(bytes);
-        self.chrome_dirty = true;
+        self.chrome_dirty |= self.overlays_session();
     }
 
     fn copy(&mut self, text: String) {
@@ -793,17 +793,28 @@ impl Relay {
         }
     }
 
+    fn overlays_session(&self) -> bool {
+        self.which_key.is_some()
+            || self.reconnecting.is_some()
+            || self.panel.is_some()
+            || self.borrows_last_row()
+    }
+
     fn which_key_area(&self) -> Rect {
         let mut area = self.above_status();
-        let borrows_last_row = self.notice.is_some()
+        if self.borrows_last_row() {
+            area.rows = area.rows.saturating_sub(1);
+        }
+        area
+    }
+
+    fn borrows_last_row(&self) -> bool {
+        let shown_on_last_row = self.notice.is_some()
             || self
                 .panel
                 .as_ref()
                 .is_some_and(|panel| panel.placement() == Some(Placement::StatusRow));
-        if !self.settings.status.enabled && borrows_last_row {
-            area.rows = area.rows.saturating_sub(1);
-        }
-        area
+        !self.settings.status.enabled && shown_on_last_row
     }
 
     fn above_status(&self) -> Rect {
@@ -1176,6 +1187,19 @@ mod tests {
         assert_eq!(row_text(&parser, 0), "hello");
         assert_eq!(parser.screen().cursor_position(), (0, 5));
         assert_eq!(relay.label(), "work");
+    }
+
+    #[test]
+    fn host_output_alone_writes_only_the_host_bytes() {
+        let (mut relay, mut parser) = relay_on("laptop");
+        relay.server_message(Some(state("work", 1)));
+        relay.server_message(Some(ServerMessage::Error("boom".into())));
+        assert_eq!(bottom(&mut relay, &mut parser), "boom");
+
+        let output = b"\x1b[1;1Hhello".to_vec();
+        relay.server_message(Some(ServerMessage::Output(output.clone())));
+        relay.server_message(Some(ServerMessage::Output(output.clone())));
+        assert_eq!(relay.take_output(), [output.clone(), output].concat());
     }
 
     #[test]
@@ -2003,6 +2027,42 @@ mod tests {
         relay.input(b"\x03");
         assert_eq!(relay.take_messages(), vec![ClientMessage::Redraw]);
         assert!(relay.take_output().is_empty());
+    }
+
+    fn without_the_status_bar() -> (Relay, vt100::Parser) {
+        let mut settings = Settings::default();
+        settings.status.enabled = false;
+        (
+            relay_with(settings, Keymap::default()),
+            terminal(SIZE.rows, SIZE.cols),
+        )
+    }
+
+    fn output_on_the_last_row() -> ServerMessage {
+        ServerMessage::Output(format!("\x1b[{};1Hbottom\x1b[1;1H", SIZE.rows).into_bytes())
+    }
+
+    #[test]
+    fn a_notice_on_the_borrowed_last_row_is_drawn_again_over_host_output() {
+        let (mut relay, mut parser) = without_the_status_bar();
+        relay.server_message(Some(ServerMessage::Error("boom".into())));
+        assert_eq!(bottom(&mut relay, &mut parser), "boom");
+
+        relay.server_message(Some(output_on_the_last_row()));
+        assert_eq!(bottom(&mut relay, &mut parser), "boom");
+        assert_eq!(parser.screen().cursor_position(), (0, 0));
+    }
+
+    #[test]
+    fn a_prompt_on_the_borrowed_last_row_is_drawn_again_over_host_output() {
+        let (mut relay, mut parser) = without_the_status_bar();
+        relay.server_message(Some(state("work", 1)));
+        relay.input(b"\x02,");
+        assert_eq!(bottom(&mut relay, &mut parser), "rename window: vim");
+
+        relay.server_message(Some(output_on_the_last_row()));
+        assert_eq!(bottom(&mut relay, &mut parser), "rename window: vim");
+        assert_eq!(parser.screen().cursor_position(), (BOTTOM, 18));
     }
 
     #[test]
