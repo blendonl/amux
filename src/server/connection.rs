@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 
 use super::forward::{self, Host, Opening};
 use super::mouse::{InputEvent, MouseDecoder};
-use super::render::GridDiffer;
+use super::render::{Composer, GridDiffer};
 use super::session::Session;
 use super::status::StatusFeed;
 use super::upload::{Turn, Uploader};
@@ -386,6 +386,7 @@ async fn attach(
     )
     .await?;
     let mut cluster = StatusFeed::new(server, origin);
+    let mut composer = Composer::default();
     let mut differ = GridDiffer::new(*size);
     let mut uploader = Uploader::new(
         Arc::clone(server.images()),
@@ -426,11 +427,11 @@ async fn attach(
                         let interval = settings.session.frame_interval();
                         pace.as_mut().reset(pacer.sent(Instant::now(), interval));
                         uploader.set_budget(settings.images.client_memory_bytes());
-                        let Some(frame) = session.frame(uploader.viewer()) else {
+                        let Some(frame) = session.frame(&mut composer, uploader.viewer()) else {
                             continue;
                         };
                         uploader.frame(&frame.images);
-                        let output = differ.diff(&frame);
+                        let output = differ.diff(frame);
                         if !output.is_empty() {
                             permit.send(ServerMessage::Output(output));
                         }
