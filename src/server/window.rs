@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use tracing::{debug, warn};
@@ -10,7 +11,7 @@ use super::layout::{Layout, PaneId, Rect, Side, SplitDirection};
 use super::mouse::{MouseEvent, Wheel};
 use super::pane::Pane;
 use super::paste;
-use super::render::{self, CopyView, Frame, InputModes, Screens, Viewer};
+use super::render::{Composer, CopyView, Frame, InputModes, Screens, Viewer};
 use crate::keys::KeyDecoder;
 use crate::protocol::{ClientTerminal, Direction, Size, Split, WindowSummary};
 use crate::settings::{Keymap, MouseSettings, Settings};
@@ -120,7 +121,7 @@ impl Window {
             if let Err(err) = pane.resize(rect_size(rect)) {
                 warn!(pane = %id, "resizing the pane failed: {err:#}");
             }
-            if let Some(copy) = self.copy.get_mut(&id) {
+            if let Some(copy) = copy_mut(&mut self.copy, id) {
                 copy.resize(rect_size(rect));
             }
         }
@@ -135,8 +136,14 @@ impl Window {
         }
     }
 
-    pub fn compose(&self, size: Size, settings: &Settings, viewer: Viewer<'_>) -> Frame {
-        let mut frame = render::compose(&self.layout, size, self.active, self, settings, viewer);
+    pub fn compose<'c>(
+        &self,
+        composer: &'c mut Composer,
+        size: Size,
+        settings: &Arc<Settings>,
+        viewer: Viewer<'_>,
+    ) -> &'c Frame {
+        let frame = composer.compose(&self.layout, size, self.active, self, settings, viewer);
         let clicks = self.panes.len() > 1 || self.copy.contains_key(&self.active);
         report_mouse(&mut frame.modes, settings.mouse.scroll, clicks);
         frame
@@ -146,13 +153,20 @@ impl Window {
         self.active
     }
 
-    pub fn shows_output_of(&self, pane: PaneId) -> bool {
-        self.contains(pane) && !self.copy.contains_key(&pane)
+    pub fn set_live(&self, shown: bool) {
+        for (id, pane) in &self.panes {
+            pane.set_live(shown && !self.copy.contains_key(id));
+        }
+    }
+
+    #[cfg(test)]
+    pub fn live_panes(&self) -> Vec<bool> {
+        self.panes.values().map(Pane::is_live).collect()
     }
 
     pub fn copy_mode(&mut self, size: Size, page_up: bool) {
         let id = self.active;
-        if let Some(copy) = self.copy.get_mut(&id) {
+        if let Some(copy) = copy_mut(&mut self.copy, id) {
             if page_up {
                 copy.page_up();
             }
@@ -179,7 +193,7 @@ impl Window {
         keymap: &Keymap,
     ) -> Handled {
         let id = self.active;
-        let Some(copy) = self.copy.get_mut(&id) else {
+        let Some(copy) = copy_mut(&mut self.copy, id) else {
             let mut input = keys.take_pending();
             input.extend_from_slice(bytes);
             if !input.is_empty() {
@@ -302,7 +316,7 @@ impl Window {
         }
         if let Some(wheel) = event.wheel() {
             redraw |= self.wheel(id, rect, event, wheel, settings);
-        } else if let Some(copy) = self.copy.get_mut(&id) {
+        } else if let Some(copy) = copy_mut(&mut self.copy, id) {
             if event.is_left_press() {
                 copy.click(row, col);
                 redraw = true;
@@ -325,7 +339,7 @@ impl Window {
         settings: &MouseSettings,
     ) -> bool {
         let lines = usize::from(settings.scroll_lines);
-        if let Some(copy) = self.copy.get_mut(&id) {
+        if let Some(copy) = copy_mut(&mut self.copy, id) {
             if copy.scroll(wheel, lines) == Outcome::Exit {
                 self.copy.remove(&id);
             }
@@ -374,7 +388,7 @@ impl Window {
         let inside = clamp_into(event, rect);
         let row = i32::from(event.row) - i32::from(rect.row);
         let col = inside.col - rect.col;
-        if let Some(copy) = self.copy.get_mut(&drag.pane) {
+        if let Some(copy) = copy_mut(&mut self.copy, drag.pane) {
             if !releasing {
                 copy.drag(row, col);
                 return Handled {
@@ -481,6 +495,12 @@ fn mouse_level(mode: MouseProtocolMode) -> u8 {
         MouseProtocolMode::ButtonMotion => 3,
         MouseProtocolMode::AnyMotion => 4,
     }
+}
+
+fn copy_mut(copy: &mut BTreeMap<PaneId, CopyMode>, pane: PaneId) -> Option<&mut CopyMode> {
+    let mode = copy.get_mut(&pane)?;
+    mode.touch();
+    Some(mode)
 }
 
 fn browse(pane: &Pane, rect: Rect) -> CopyMode {

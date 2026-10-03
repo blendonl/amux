@@ -559,6 +559,12 @@ impl Screen {
 
     #[allow(missing_docs)]
     #[must_use]
+    pub fn line(&self, line: usize) -> Option<crate::VisibleRow<'_>> {
+        self.grid().line(line).map(crate::row::Row::visible)
+    }
+
+    #[allow(missing_docs)]
+    #[must_use]
     pub fn line_wrapped(&self, line: usize) -> bool {
         self.grid().line(line).is_some_and(crate::row::Row::wrapped)
     }
@@ -636,6 +642,19 @@ impl Screen {
     #[allow(missing_docs)]
     pub fn row_ids(&self) -> impl Iterator<Item = u64> + '_ {
         self.grid().visible_rows().map(crate::row::Row::id)
+    }
+
+    #[allow(missing_docs)]
+    pub fn visible_rows(
+        &self,
+    ) -> impl Iterator<Item = crate::VisibleRow<'_>> + '_ {
+        self.grid().visible_rows().map(crate::row::Row::visible)
+    }
+
+    #[allow(missing_docs)]
+    #[must_use]
+    pub fn visible_row(&self, row: u16) -> Option<crate::VisibleRow<'_>> {
+        self.grid().visible_row(row).map(crate::row::Row::visible)
     }
 
     #[allow(missing_docs)]
@@ -843,6 +862,13 @@ impl Screen {
             .try_into()
             // width() can only return 0, 1, or 2
             .unwrap();
+
+        if width == 1
+            && c != PLACEHOLDER
+            && self.grid_mut().print_narrow(c, attrs)
+        {
+            return;
+        }
 
         // it doesn't make any sense to wrap if the last column in a row
         // didn't already have contents. don't try to handle the case where a

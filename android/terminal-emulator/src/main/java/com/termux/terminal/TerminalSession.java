@@ -1,4 +1,4 @@
-// Modified by amux: 64 KiB process queues and receive buffer
+// Modified by amux: 64 KiB process queues and read buffers, and at most one pending MSG_NEW_INPUT, whose handler drains up to 256 KiB through InputDrain before one screen update
 package com.termux.terminal;
 
 import android.annotation.SuppressLint;
@@ -33,6 +33,7 @@ public final class TerminalSession extends TerminalOutput {
 
     private static final int MSG_NEW_INPUT = 1;
     private static final int MSG_PROCESS_EXITED = 4;
+    private static final int INPUT_DRAIN_LIMIT = 256 * 1024;
 
     public final String mHandle = UUID.randomUUID().toString();
 
@@ -48,6 +49,7 @@ public final class TerminalSession extends TerminalOutput {
      * writing to the {@link #mTerminalFileDescriptor}.
      */
     final ByteQueue mTerminalToProcessIOQueue = new ByteQueue(64 * 1024);
+    private final InputDrain mInputDrain = new InputDrain(mProcessToTerminalIOQueue, 64 * 1024, INPUT_DRAIN_LIMIT);
     /** Buffer to write translate code points into utf8 before writing to mTerminalToProcessIOQueue */
     private final byte[] mUtf8InputBuffer = new byte[5];
 
@@ -134,12 +136,12 @@ public final class TerminalSession extends TerminalOutput {
             @Override
             public void run() {
                 try (InputStream termIn = new FileInputStream(terminalFileDescriptorWrapped)) {
-                    final byte[] buffer = new byte[4096];
+                    final byte[] buffer = new byte[64 * 1024];
                     while (true) {
                         int read = termIn.read(buffer);
                         if (read == -1) return;
                         if (!mProcessToTerminalIOQueue.write(buffer, 0, read)) return;
-                        mMainThreadHandler.sendEmptyMessage(MSG_NEW_INPUT);
+                        if (mInputDrain.shouldPost()) mMainThreadHandler.sendEmptyMessage(MSG_NEW_INPUT);
                     }
                 } catch (Exception e) {
                     // Ignore, just shutting down.
@@ -336,14 +338,14 @@ public final class TerminalSession extends TerminalOutput {
     @SuppressLint("HandlerLeak")
     class MainThreadHandler extends Handler {
 
-        final byte[] mReceiveBuffer = new byte[64 * 1024];
+        private final InputDrain.Consumer mAppend = (buffer, length) -> mEmulator.append(buffer, length);
 
         @Override
         public void handleMessage(Message msg) {
-            int bytesRead = mProcessToTerminalIOQueue.read(mReceiveBuffer, false);
-            if (bytesRead > 0) {
-                mEmulator.append(mReceiveBuffer, bytesRead);
-                notifyScreenUpdate();
+            int bytesRead = mInputDrain.drain(mAppend);
+            if (bytesRead > 0) notifyScreenUpdate();
+            if (msg.what == MSG_NEW_INPUT && bytesRead >= INPUT_DRAIN_LIMIT && mInputDrain.shouldPost()) {
+                sendEmptyMessage(MSG_NEW_INPUT);
             }
 
             if (msg.what == MSG_PROCESS_EXITED) {

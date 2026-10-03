@@ -1,4 +1,4 @@
-// Modified by amux: owns the kitty image bitmap cache, resends the pty size when the cell pixel size changes and reads placeholder cells as spaces
+// Modified by amux: owns the kitty image bitmap cache, which decodes on a background thread, resends the pty size when the cell pixel size changes, reads placeholder cells as spaces and rebuilds the accessibility text at most every 300 ms
 package com.termux.view;
 
 import android.annotation.SuppressLint;
@@ -44,6 +44,9 @@ import com.termux.terminal.TerminalEmulator;
 import com.termux.terminal.TerminalSession;
 import com.termux.view.textselection.TextSelectionCursorController;
 
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
+
 /** View displaying and interacting with a {@link TerminalSession}. */
 public final class TerminalView extends View {
 
@@ -57,7 +60,10 @@ public final class TerminalView extends View {
 
     public TerminalRenderer mRenderer;
 
-    private final BitmapCache<Bitmap> mBitmapCache = new BitmapCache<>(BitmapCache.DEFAULT_CAPACITY, new BitmapDecoder());
+    private static final Executor IMAGE_DECODER = Executors.newSingleThreadExecutor();
+
+    private final BitmapCache<Bitmap> mBitmapCache = new BitmapCache<>(BitmapCache.DEFAULT_CAPACITY, new BitmapDecoder(),
+        IMAGE_DECODER, this::post, this::invalidate);
 
     public TerminalViewClient mClient;
 
@@ -128,6 +134,11 @@ public final class TerminalView extends View {
     private String[] mAutoFillHints = new String[0];
 
     private final boolean mAccessibilityEnabled;
+    private final Runnable mAccessibilityTextUpdate = this::updateAccessibilityText;
+    private boolean mAccessibilityTextPending;
+    private long mAccessibilityTextUpdatedAt;
+
+    private static final long ACCESSIBILITY_TEXT_INTERVAL_MS = 300;
 
     private static final String LOG_TAG = "TerminalView";
 
@@ -484,7 +495,24 @@ public final class TerminalView extends View {
         mEmulator.clearScrollCounter();
 
         invalidate();
-        if (mAccessibilityEnabled) setContentDescription(getText());
+        if (mAccessibilityEnabled) scheduleAccessibilityText();
+    }
+
+    private void scheduleAccessibilityText() {
+        if (mAccessibilityTextPending) return;
+        final long wait = mAccessibilityTextUpdatedAt + ACCESSIBILITY_TEXT_INTERVAL_MS - SystemClock.uptimeMillis();
+        if (wait <= 0) {
+            updateAccessibilityText();
+            return;
+        }
+        mAccessibilityTextPending = true;
+        postDelayed(mAccessibilityTextUpdate, wait);
+    }
+
+    private void updateAccessibilityText() {
+        mAccessibilityTextPending = false;
+        mAccessibilityTextUpdatedAt = SystemClock.uptimeMillis();
+        if (mEmulator != null) setContentDescription(getText());
     }
 
     /** This must be called by the hosting activity in {@link Activity#onContextMenuClosed(Menu)}

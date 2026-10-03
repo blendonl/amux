@@ -3,6 +3,8 @@ package io.github.blendonl.amux.keyboard
 class Latch {
     enum class State { OFF, ONE_SHOT, LOCKED }
 
+    data class Look(val state: State, val held: Boolean)
+
     var state = State.OFF
         private set
     var held = false
@@ -11,6 +13,9 @@ class Latch {
 
     val active: Boolean
         get() = held || state != State.OFF
+
+    val look: Look
+        get() = Look(state, held)
 
     fun press() {
         held = true

@@ -19,7 +19,7 @@ android {
         }
 
         ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
+            abiFilters += providers.gradleProperty("amux.abis").map { it.split(',') }.getOrElse(listOf("arm64-v8a", "x86_64"))
         }
     }
 

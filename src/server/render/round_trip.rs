@@ -5,7 +5,7 @@ use vt100::{Color, MouseProtocolEncoding, MouseProtocolMode};
 
 use super::grid::Cell;
 use super::placeholder::{ImageSpan, DIACRITICS, PLACEHOLDER};
-use super::{compose, Frame, GraphicsParser, GridDiffer, InputModes, Viewer};
+use super::{compose, Composer, Frame, GraphicsParser, GridDiffer, InputModes, Viewer};
 use crate::protocol::Size;
 use crate::server::graphics::store::ImageStore;
 use crate::server::layout::{Layout, PaneId, Rect, SplitDirection};
@@ -737,6 +737,69 @@ fn random_updates_always_reproduce_the_frame() {
             }
         }
         client.assert_shows(&frame);
+    }
+}
+
+#[test]
+fn a_reused_composer_sends_the_same_bytes_as_a_fresh_one() {
+    let mut random = Random(0x6a09_e667_f3bc_c908);
+    let mut window = Window::three_panes();
+    let mut settings = Arc::new(Settings::default());
+    let mut composer = Composer::default();
+    let mut reused = Client::new(WINDOW);
+    let mut fresh = Client::new(WINDOW);
+    let sizes = [
+        WINDOW,
+        Size { rows: 7, cols: 23 },
+        Size { rows: 15, cols: 45 },
+        Size { rows: 12, cols: 21 },
+    ];
+    let mut size = WINDOW;
+
+    for step in 0..500 {
+        for pane in [A, B, C] {
+            if random.below(3) > 0 {
+                let input = random_input(&mut random, window.rect(pane));
+                window.feed(pane, &input);
+            }
+        }
+        let pane = [A, B, C][random.below(3) as usize];
+        match random.below(24) {
+            0 => window.active = pane,
+            1 => {
+                size = sizes[random.below(4) as usize];
+                reused = Client::new(size);
+                fresh = Client::new(size);
+            }
+            2 => window.feed(pane, "\x1b[?1049h\x1b[Halternate"),
+            3 => window.feed(pane, "\x1b[?1049l"),
+            4 => window.feed(pane, &"\r\n".repeat(random.below(20) as usize)),
+            5 => window.feed(pane, "\x1b[2;4r\x1b[4H\r\n\r\nregion\x1b[r"),
+            6 => settings = Arc::new(Settings::default()),
+            _ => {}
+        }
+        let frame = composer.compose(
+            &window.layout,
+            size,
+            window.active,
+            &window.panes,
+            &settings,
+            Viewer::text(),
+        );
+        let sent = reused.show(frame);
+        let expected = fresh.show(&compose(
+            &window.layout,
+            size,
+            window.active,
+            &window.panes,
+            &settings,
+            Viewer::text(),
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&sent),
+            String::from_utf8_lossy(&expected),
+            "step {step}"
+        );
     }
 }
 

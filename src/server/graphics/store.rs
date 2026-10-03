@@ -168,16 +168,28 @@ impl ImageStore {
         Some(entry.animation.clone())
     }
 
-    pub fn revision(&self, key: ImageKey) -> Option<u64> {
+    pub fn touch(&self, key: ImageKey) -> bool {
+        let mut state = self.lock();
+        let clock = state.tick();
+        let Some(entry) = state.images.get_mut(&key) else {
+            return false;
+        };
+        entry.used = clock;
+        true
+    }
+
+    pub fn read<T>(&self, read: impl FnOnce(&StoreView<'_>) -> T) -> T {
         let state = self.lock();
-        state
-            .images
-            .get(&key)
-            .map(|entry| entry.animation.revision())
+        read(&StoreView { state: &state })
+    }
+
+    #[cfg(test)]
+    pub fn revision(&self, key: ImageKey) -> Option<u64> {
+        self.read(|view| view.revision(key))
     }
 
     pub fn is_displayed(&self, display: u32) -> bool {
-        self.lock().displays.contains_key(&display)
+        self.read(|view| view.is_displayed(display))
     }
 
     #[cfg(test)]
@@ -247,6 +259,27 @@ impl ImageStore {
 
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+pub struct StoreView<'a> {
+    state: &'a State,
+}
+
+impl StoreView<'_> {
+    pub fn image(&self, key: ImageKey) -> Option<&ImageData> {
+        self.state.images.get(&key).map(|entry| &entry.data)
+    }
+
+    pub fn revision(&self, key: ImageKey) -> Option<u64> {
+        self.state
+            .images
+            .get(&key)
+            .map(|entry| entry.animation.revision())
+    }
+
+    pub fn is_displayed(&self, display: u32) -> bool {
+        self.state.displays.contains_key(&display)
     }
 }
 
@@ -542,7 +575,7 @@ impl PaneImages {
     }
 
     pub fn is_stored(&self, key: ImageKey) -> bool {
-        self.store.get(key).is_some()
+        self.store.touch(key)
     }
 
     pub fn free(&self, buffer: Buffer, name: Name) -> bool {
@@ -758,6 +791,24 @@ mod tests {
         insert(7);
         assert_eq!(keys(&store), [fifth.0, sixth.0, 7]);
         assert_eq!(used(&store), 300);
+    }
+
+    #[test]
+    fn an_image_checked_as_stored_is_kept_over_older_ones() {
+        let store = store(300);
+        let pane = store.open_pane();
+        let insert = |id| pane.insert(Buffer::Main, id, 0, image(100)).unwrap().key;
+        let drawn = insert(1);
+        let second = insert(2);
+        let third = insert(3);
+        assert!(pane.is_stored(drawn));
+
+        let fourth = insert(4);
+        assert_eq!(keys(&store), [drawn.0, third.0, fourth.0]);
+        assert!(!pane.is_stored(second));
+        assert!(pane.is_stored(drawn));
+        insert(5);
+        assert_eq!(keys(&store), [drawn.0, fourth.0, 5]);
     }
 
     #[test]

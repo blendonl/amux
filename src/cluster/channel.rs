@@ -1,16 +1,18 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{anyhow, bail, Result};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, Notify, Semaphore};
+use tokio::sync::{mpsc, Notify};
 use tracing::{debug, warn};
 
-use crate::protocol::{ChannelId, ClientMessage, Duplex, PeerMessage, ServerMessage};
+use crate::protocol::{ChannelId, ClientMessage, Duplex, ImageOp, PeerMessage, ServerMessage};
 
 pub const CREDIT_WINDOW: u32 = 4;
+pub(super) const CREDIT_BYTES: usize = 128 * 1024;
+const SMALL_MESSAGE_LEN: usize = 64;
 const QUEUE_CAPACITY: usize = 64;
 const QUEUE_BYTES: usize = 16 * 1024 * 1024;
 const HOST_LANE_CAPACITY: usize = 1;
@@ -36,6 +38,7 @@ impl fmt::Display for ChannelEnd {
 
 pub(super) struct Channels {
     bulk: mpsc::Sender<PeerMessage>,
+    interactive: mpsc::Sender<PeerMessage>,
     control: mpsc::Sender<PeerMessage>,
     stop: Arc<Notify>,
     table: Mutex<Table>,
@@ -56,17 +59,19 @@ struct Opened {
 
 struct Hosted {
     inbound: QueueSender<ClientMessage>,
-    credit: Arc<Semaphore>,
+    credit: Arc<HostCredit>,
 }
 
 impl Channels {
     pub fn new(
         bulk: mpsc::Sender<PeerMessage>,
+        interactive: mpsc::Sender<PeerMessage>,
         control: mpsc::Sender<PeerMessage>,
         stop: Arc<Notify>,
     ) -> Arc<Self> {
         Arc::new(Self {
             bulk,
+            interactive,
             control,
             stop,
             table: Mutex::default(),
@@ -98,7 +103,7 @@ impl Channels {
             end,
             channels: Arc::clone(self),
         };
-        self.bulk
+        self.interactive
             .send(PeerMessage::ChannelOpen { id, first })
             .await
             .map_err(|_| anyhow!("the link is down"))?;
@@ -120,7 +125,7 @@ impl Channels {
             });
             return None;
         }
-        let credit = Arc::new(Semaphore::new(CREDIT_WINDOW as usize));
+        let credit = Arc::new(HostCredit::default());
         {
             let mut table = self.table();
             if table.down || table.hosted.contains_key(&id) {
@@ -193,9 +198,7 @@ impl Channels {
 
     pub fn credit(&self, id: ChannelId, credit: u32) {
         if let Some(hosted) = self.table().hosted.get(&id) {
-            let window = CREDIT_WINDOW as usize;
-            let room = window.saturating_sub(hosted.credit.available_permits());
-            hosted.credit.add_permits((credit as usize).min(room));
+            hosted.credit.refund(credit);
         }
     }
 
@@ -239,16 +242,16 @@ impl Channels {
         self: Arc<Self>,
         id: ChannelId,
         mut outgoing: mpsc::Receiver<ServerMessage>,
-        credit: Arc<Semaphore>,
+        credit: Arc<HostCredit>,
     ) {
         loop {
-            let Ok(permit) = credit.acquire().await else {
+            if !credit.room().await {
                 return;
-            };
-            permit.forget();
+            }
             let Some(message) = outgoing.recv().await else {
                 break;
             };
+            credit.spend(approx_len(&message));
             let message = PeerMessage::ChannelToClient { id, message };
             if self.bulk.send(message).await.is_err() {
                 return;
@@ -307,7 +310,7 @@ impl Channel {
             message,
         };
         self.channels
-            .bulk
+            .interactive
             .send(message)
             .await
             .map_err(|_| anyhow!("the link is down"))
@@ -331,6 +334,84 @@ impl Drop for Channel {
             });
             debug!(id = %self.id, "channel closed");
         }
+    }
+}
+
+#[derive(Default)]
+struct HostCredit {
+    credit: Mutex<Credit>,
+    freed: Notify,
+}
+
+impl HostCredit {
+    async fn room(&self) -> bool {
+        loop {
+            {
+                let credit = self.lock();
+                if credit.closed {
+                    return false;
+                }
+                if credit.has_room() {
+                    return true;
+                }
+            }
+            self.freed.notified().await;
+        }
+    }
+
+    fn spend(&self, len: usize) {
+        self.lock().spend(len);
+    }
+
+    fn refund(&self, credit: u32) {
+        self.lock().refund(credit);
+        self.freed.notify_one();
+    }
+
+    fn close(&self) {
+        self.lock().closed = true;
+        self.freed.notify_one();
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Credit> {
+        self.credit.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+#[derive(Default)]
+struct Credit {
+    in_flight: VecDeque<usize>,
+    bytes: usize,
+    closed: bool,
+}
+
+impl Credit {
+    fn has_room(&self) -> bool {
+        self.in_flight.len() < CREDIT_WINDOW as usize && self.bytes < CREDIT_BYTES
+    }
+
+    fn spend(&mut self, len: usize) {
+        self.in_flight.push_back(len);
+        self.bytes += len;
+    }
+
+    fn refund(&mut self, credit: u32) {
+        for _ in 0..credit {
+            let Some(len) = self.in_flight.pop_front() else {
+                return;
+            };
+            self.bytes -= len;
+        }
+    }
+}
+
+fn approx_len(message: &ServerMessage) -> usize {
+    match message {
+        ServerMessage::Output(bytes) => bytes.len(),
+        ServerMessage::Image(ImageOp::Transmit { data, .. } | ImageOp::Frame { data, .. }) => {
+            data.len()
+        }
+        _ => SMALL_MESSAGE_LEN,
     }
 }
 
@@ -414,5 +495,37 @@ async fn feed<T>(mut queue: QueueReceiver<T>, sender: mpsc::Sender<T>) {
         if sender.send(item).await.is_err() {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_credit_frees_the_oldest_message_first() {
+        let mut credit = Credit::default();
+        credit.spend(CREDIT_BYTES);
+        credit.spend(1);
+        credit.spend(1);
+        assert!(!credit.has_room());
+
+        credit.refund(1);
+
+        assert!(credit.has_room());
+        assert_eq!(credit.bytes, 2);
+        assert_eq!(credit.in_flight, [1, 1]);
+    }
+
+    #[test]
+    fn a_credit_beyond_what_is_in_flight_is_ignored() {
+        let mut credit = Credit::default();
+        credit.spend(10);
+
+        credit.refund(CREDIT_WINDOW + 1);
+
+        assert_eq!(credit.bytes, 0);
+        assert!(credit.in_flight.is_empty());
+        assert!(credit.has_room());
     }
 }

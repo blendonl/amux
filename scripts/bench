@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+warn() {
+  printf 'bench: %s\n' "$*" >&2
+}
+
+governor_file=/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+if [ -r "$governor_file" ]; then
+  governor=$(cat "$governor_file")
+  [ "$governor" = performance ] ||
+    warn "the CPU governor is $governor, not performance, so expect noisy numbers"
+else
+  warn "can't read $governor_file, so the CPU governor may add noise"
+fi
+
+cd "$(git rev-parse --show-toplevel)"
+cargo test --release --lib bench_ -- --ignored --nocapture --test-threads=1
+cargo test --release -p vt100 --test throughput -- --ignored --nocapture
+cargo test --release --test bench -- --ignored --nocapture --test-threads=1 "$@"

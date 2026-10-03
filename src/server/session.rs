@@ -1,6 +1,6 @@
 use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::SystemTime;
 
@@ -16,7 +16,7 @@ use super::lua_host::{HookEvent, HookSink};
 use super::mouse::InputEvent;
 use super::pane::{Pane, PaneObserver, PaneSpec};
 use super::paste::PasteBuffer;
-use super::render::{Frame, Viewer};
+use super::render::{Composer, Frame, Viewer};
 use super::window::Window;
 use crate::keys::KeyDecoder;
 use crate::project::ProjectId;
@@ -65,6 +65,7 @@ pub struct Session {
     paste: Arc<PasteBuffer>,
     terminals: Mutex<Terminals>,
     terminal: watch::Sender<Option<ClientTerminal>>,
+    frames: Arc<FrameSignal>,
     windows: Mutex<Windows>,
 }
 
@@ -85,6 +86,7 @@ impl Session {
             images,
             paste,
         } = host;
+        let frames = Arc::new(FrameSignal::new());
         let session = Arc::new(Self {
             id,
             name: Mutex::new(name),
@@ -101,7 +103,8 @@ impl Session {
             paste,
             terminals: Mutex::new(Terminals::default()),
             terminal: watch::channel(None).0,
-            windows: Mutex::new(Windows::new(size.clamped())),
+            frames: Arc::clone(&frames),
+            windows: Mutex::new(Windows::new(size.clamped(), frames)),
         });
         session.open_window()?;
         Ok(session)
@@ -158,10 +161,7 @@ impl Session {
     }
 
     pub fn subscribe(&self) -> watch::Receiver<()> {
-        match &self.state().signals {
-            Some(signals) => signals.frames.subscribe(),
-            None => closed(),
-        }
+        self.frames.subscribe()
     }
 
     pub fn watch_windows(&self) -> watch::Receiver<()> {
@@ -255,14 +255,14 @@ impl Session {
         windows.redraw();
     }
 
-    pub fn frame(&self, viewer: Viewer<'_>) -> Option<Frame> {
+    pub fn frame<'c>(&self, composer: &'c mut Composer, viewer: Viewer<'_>) -> Option<&'c Frame> {
         let settings = self.settings();
         let windows = self.state();
         windows.signals.as_ref()?;
         Some(
             windows
                 .active_window()?
-                .compose(windows.size, &settings, viewer),
+                .compose(composer, windows.size, &settings, viewer),
         )
     }
 
@@ -535,14 +535,10 @@ impl Session {
 }
 
 impl PaneObserver for Session {
-    fn pane_output(&self, pane: PaneId) {
+    fn pane_output(&self, live: &AtomicBool) {
         self.touch();
-        let windows = self.state();
-        if windows
-            .active_window()
-            .is_some_and(|window| window.shows_output_of(pane))
-        {
-            windows.redraw();
+        if live.load(Ordering::Relaxed) {
+            self.frames.signal();
         }
     }
 
@@ -654,6 +650,7 @@ struct Windows {
     active: usize,
     size: Size,
     next_pane: u32,
+    frames: Arc<FrameSignal>,
     signals: Option<Signals>,
 }
 
@@ -669,20 +666,43 @@ struct RemovedPane {
 }
 
 struct Signals {
-    frames: watch::Sender<()>,
     windows: watch::Sender<()>,
     status: watch::Sender<()>,
 }
 
+struct FrameSignal(Mutex<Option<watch::Sender<()>>>);
+
+impl FrameSignal {
+    fn new() -> Self {
+        Self(Mutex::new(Some(watch::channel(()).0)))
+    }
+
+    fn signal(&self) {
+        if let Some(frames) = &*lock(&self.0) {
+            frames.send_replace(());
+        }
+    }
+
+    fn subscribe(&self) -> watch::Receiver<()> {
+        lock(&self.0)
+            .as_ref()
+            .map_or_else(closed, watch::Sender::subscribe)
+    }
+
+    fn close(&self) {
+        lock(&self.0).take();
+    }
+}
+
 impl Windows {
-    fn new(size: Size) -> Self {
+    fn new(size: Size, frames: Arc<FrameSignal>) -> Self {
         Self {
             list: Vec::new(),
             active: 0,
             size,
             next_pane: 0,
+            frames,
             signals: Some(Signals {
-                frames: watch::channel(()).0,
                 windows: watch::channel(()).0,
                 status: watch::channel(()).0,
             }),
@@ -769,7 +789,7 @@ impl Windows {
         }
         let removed = self.list.remove(position);
         if self.list.is_empty() {
-            self.signals = None;
+            self.end();
             return Some(removed);
         }
         if self.active > position || (self.active == position && position > 0) {
@@ -781,14 +801,24 @@ impl Windows {
     }
 
     fn close(&mut self) -> Vec<Window> {
-        self.signals = None;
+        self.end();
         std::mem::take(&mut self.list)
     }
 
-    fn redraw(&self) {
-        if let Some(signals) = &self.signals {
-            signals.frames.send_replace(());
+    fn end(&mut self) {
+        self.signals = None;
+        self.frames.close();
+    }
+
+    fn refresh_live(&self) {
+        for (position, window) in self.list.iter().enumerate() {
+            window.set_live(position == self.active);
         }
+    }
+
+    fn redraw(&self) {
+        self.refresh_live();
+        self.frames.signal();
     }
 
     fn active_changed(&self) {
@@ -803,8 +833,8 @@ impl Windows {
     }
 
     fn structure_changed(&self) {
+        self.redraw();
         if let Some(signals) = &self.signals {
-            signals.frames.send_replace(());
             signals.windows.send_replace(());
             signals.status.send_replace(());
         }
@@ -863,6 +893,48 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn live(session: &Session) -> Vec<Vec<bool>> {
+        session
+            .state()
+            .list
+            .iter()
+            .map(Window::live_panes)
+            .collect()
+    }
+
+    #[test]
+    fn live_flags_follow_the_active_window_and_copy_mode() {
+        let session = spawn(WindowSettings::default());
+        assert_eq!(live(&session), [[true]]);
+        session
+            .run(SessionCommand::SplitPane(Split::LeftRight))
+            .unwrap();
+        assert_eq!(live(&session), [[true, true]]);
+
+        session.run(SessionCommand::NewWindow).unwrap();
+        assert_eq!(live(&session), [vec![false, false], vec![true]]);
+        session
+            .run(SessionCommand::CopyMode { page_up: false })
+            .unwrap();
+        assert_eq!(live(&session), [vec![false, false], vec![false]]);
+
+        session.run(SessionCommand::PreviousWindow).unwrap();
+        assert_eq!(live(&session), [vec![true, true], vec![false]]);
+        session.run(SessionCommand::NextWindow).unwrap();
+        assert_eq!(live(&session), [vec![false, false], vec![false]]);
+        session.input(
+            InputEvent::Bytes(b"q".to_vec()),
+            &mut KeyDecoder::default(),
+            false,
+        );
+        assert_eq!(live(&session), [vec![false, false], vec![true]]);
+
+        session.run(SessionCommand::KillWindow).unwrap();
+        assert_eq!(live(&session), [[true, true]]);
+        session.kill();
+        assert!(session.subscribe().has_changed().is_err());
     }
 
     fn listed(session: &Session) -> Vec<(usize, String)> {

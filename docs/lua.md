@@ -311,6 +311,14 @@ amux.opt.mouse.scroll_lines = 5
 amux.opt.mouse.scroll = false
 ```
 
+## Frames
+
+The server that holds the session sends each attached client at most one frame every `amux.opt.session.frame_interval_ms`, `8` by default, so a program that prints without pause costs one screen update per interval rather than one per write. A frame after a quiet spell longer than the interval goes out at once, so a keystroke is never held back. `0` sends every change as soon as the client can take it, and the most is `1000`. A reload applies it from the next frame.
+
+```lua
+amux.opt.session.frame_interval_ms = 16
+```
+
 ## The status bar
 
 | Option                | Default                  | Is                                                                 |

@@ -6,9 +6,10 @@ mod peer;
 use std::io;
 
 use anyhow::{bail, Result};
+use postcard::ser_flavors::Flavor;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -32,6 +33,10 @@ pub use peer::{
 };
 
 const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
+const FRAME_HEADER_LEN: usize = 4;
+const BATCH_LEN: usize = 64 * 1024;
+const KEPT_BUFFER_LEN: usize = 1024 * 1024;
+pub(crate) const READ_BUFFER_LEN: usize = 64 * 1024;
 const INCOMING_CAPACITY: usize = 64;
 const OUTGOING_CAPACITY: usize = 1;
 
@@ -59,7 +64,98 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    write_frame(writer, &encode(message)?).await
+    let mut frame = Vec::new();
+    encode_frame_into(&mut frame, message)?;
+    send_frames(writer, &frame).await
+}
+
+pub(crate) fn encode_frame_into<T: Serialize>(frames: &mut Vec<u8>, message: &T) -> Result<()> {
+    let start = frames.len();
+    frames.extend_from_slice(&[0; FRAME_HEADER_LEN]);
+    match append_payload(frames, start, message) {
+        Ok(len) => {
+            frames[start..start + FRAME_HEADER_LEN].copy_from_slice(&len.to_be_bytes());
+            Ok(())
+        }
+        Err(err) => {
+            frames.truncate(start);
+            Err(err)
+        }
+    }
+}
+
+fn append_payload<T: Serialize>(frames: &mut Vec<u8>, start: usize, message: &T) -> Result<u32> {
+    postcard::serialize_with_flavor(message, AppendTo(frames))?;
+    let len = u32::try_from(frames.len() - start - FRAME_HEADER_LEN)?;
+    if len > MAX_FRAME_LEN {
+        bail!("outgoing frame of {len} bytes exceeds the {MAX_FRAME_LEN} byte limit");
+    }
+    Ok(len)
+}
+
+struct AppendTo<'a>(&'a mut Vec<u8>);
+
+impl Flavor for AppendTo<'_> {
+    type Output = ();
+
+    #[inline(always)]
+    fn try_extend(&mut self, bytes: &[u8]) -> postcard::Result<()> {
+        self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn try_push(&mut self, byte: u8) -> postcard::Result<()> {
+        self.0.push(byte);
+        Ok(())
+    }
+
+    fn finalize(self) -> postcard::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct FrameBatch {
+    frames: Vec<u8>,
+}
+
+impl FrameBatch {
+    pub fn fill<T: Serialize>(
+        &mut self,
+        first: T,
+        mut next: impl FnMut() -> Option<T>,
+    ) -> Result<()> {
+        encode_frame_into(&mut self.frames, &first)?;
+        while self.frames.len() < BATCH_LEN {
+            let Some(message) = next() else {
+                break;
+            };
+            encode_frame_into(&mut self.frames, &message)?;
+        }
+        Ok(())
+    }
+
+    pub async fn write_to<W>(&mut self, writer: &mut W) -> Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let sent = send_frames(writer, &self.frames).await;
+        self.frames.clear();
+        if self.frames.capacity() > KEPT_BUFFER_LEN {
+            self.frames = Vec::new();
+        }
+        sent
+    }
+}
+
+async fn send_frames<W>(writer: &mut W, frames: &[u8]) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(frames).await?;
+    writer.flush().await?;
+    Ok(())
 }
 
 pub(crate) fn encode<T: Serialize>(message: &T) -> Result<Vec<u8>> {
@@ -75,10 +171,10 @@ pub(crate) async fn write_frame<W>(writer: &mut W, payload: &[u8]) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    writer.write_u32(u32::try_from(payload.len())?).await?;
-    writer.write_all(payload).await?;
-    writer.flush().await?;
-    Ok(())
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+    frame.extend_from_slice(&u32::try_from(payload.len())?.to_be_bytes());
+    frame.extend_from_slice(payload);
+    send_frames(writer, &frame).await
 }
 
 pub async fn read_message<R, T>(reader: &mut R) -> Result<Option<T>>
@@ -96,37 +192,53 @@ pub(crate) async fn read_frame<R>(reader: &mut R) -> Result<Option<Vec<u8>>>
 where
     R: AsyncRead + Unpin,
 {
+    let mut payload = Vec::new();
+    Ok(read_frame_into(reader, &mut payload)
+        .await?
+        .then_some(payload))
+}
+
+pub(crate) async fn read_frame_into<R>(reader: &mut R, payload: &mut Vec<u8>) -> Result<bool>
+where
+    R: AsyncRead + Unpin,
+{
     let len = match reader.read_u32().await {
         Ok(len) => len,
-        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
         Err(err) => return Err(err.into()),
     };
     if len > MAX_FRAME_LEN {
         bail!("incoming frame of {len} bytes exceeds the {MAX_FRAME_LEN} byte limit");
     }
-    let mut payload = vec![0; len as usize];
-    reader.read_exact(&mut payload).await?;
-    Ok(Some(payload))
+    if payload.capacity() > KEPT_BUFFER_LEN {
+        *payload = Vec::new();
+    }
+    payload.clear();
+    payload.resize(len as usize, 0);
+    reader.read_exact(payload).await?;
+    Ok(true)
 }
 
-async fn pump_incoming<R, T>(mut reader: R, sender: mpsc::Sender<T>)
+async fn pump_incoming<R, T>(reader: R, sender: mpsc::Sender<T>)
 where
     R: AsyncRead + Unpin,
     T: DeserializeOwned,
 {
+    let mut reader = BufReader::with_capacity(READ_BUFFER_LEN, reader);
+    let mut payload = Vec::new();
     loop {
         let frame = tokio::select! {
-            frame = read_frame(&mut reader) => frame,
+            frame = read_frame_into(&mut reader, &mut payload) => frame,
             () = sender.closed() => return,
         };
-        let payload = match frame {
-            Ok(Some(payload)) => payload,
-            Ok(None) => return,
+        match frame {
+            Ok(true) => {}
+            Ok(false) => return,
             Err(err) => {
                 debug!("reading a frame failed: {err:#}");
                 return;
             }
-        };
+        }
         match postcard::from_bytes(&payload) {
             Ok(message) => {
                 if sender.send(message).await.is_err() {
@@ -146,16 +258,15 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
+    let mut batch = FrameBatch::default();
     while let Some(message) = receiver.recv().await {
-        let payload = match encode(&message) {
-            Ok(payload) => payload,
-            Err(err) => {
-                warn!("closing the connection, a message failed to encode: {err:#}");
-                return;
-            }
-        };
-        if let Err(err) = write_frame(&mut writer, &payload).await {
+        let filled = batch.fill(message, || receiver.try_recv().ok());
+        if let Err(err) = batch.write_to(&mut writer).await {
             debug!("writing a frame failed: {err:#}");
+            return;
+        }
+        if let Err(err) = filled {
+            warn!("closing the connection, a message failed to encode: {err:#}");
             return;
         }
     }
@@ -165,10 +276,99 @@ where
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
 
     use tokio::io::{duplex as byte_pipe, split};
 
     use super::*;
+
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: usize,
+        flushes: usize,
+        written: Vec<u8>,
+    }
+
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let writer = self.get_mut();
+            writer.writes += 1;
+            writer.written.extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.get_mut().flushes += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn decode_all<T: DeserializeOwned>(mut frames: &[u8]) -> Vec<T> {
+        let mut received = Vec::new();
+        while let Some(message) = read_message(&mut frames).await.unwrap() {
+            received.push(message);
+        }
+        received
+    }
+
+    async fn pumped(sent: &[ServerMessage]) -> CountingWriter {
+        let (sender, receiver) = mpsc::channel(sent.len());
+        for message in sent {
+            sender.send(message.clone()).await.unwrap();
+        }
+        drop(sender);
+        let mut writer = CountingWriter::default();
+        pump_outgoing(&mut writer, receiver).await;
+        writer
+    }
+
+    #[tokio::test]
+    async fn queued_messages_leave_in_one_write_and_decode_in_order() {
+        let sent: Vec<ServerMessage> = (0..10)
+            .map(|index| ServerMessage::Output(vec![index; 100]))
+            .collect();
+
+        let writer = pumped(&sent).await;
+
+        assert_eq!((writer.writes, writer.flushes), (1, 1));
+        assert_eq!(decode_all::<ServerMessage>(&writer.written).await, sent);
+    }
+
+    #[tokio::test]
+    async fn queued_messages_past_the_batch_size_take_another_write() {
+        let frame = |index| ServerMessage::Image(ImageOp::Delete { key: index });
+        let large = |index| ServerMessage::Clipboard("x".repeat(BATCH_LEN / 2 + index));
+        let sent = vec![large(0), frame(1), large(2), frame(3)];
+
+        let writer = pumped(&sent).await;
+
+        assert_eq!((writer.writes, writer.flushes), (2, 2));
+        assert_eq!(decode_all::<ServerMessage>(&writer.written).await, sent);
+    }
+
+    #[tokio::test]
+    async fn a_single_frame_leaves_in_one_write() {
+        let mut writer = CountingWriter::default();
+
+        write_message(&mut writer, &ClientMessage::Input(b"ls\r".to_vec()))
+            .await
+            .unwrap();
+
+        assert_eq!((writer.writes, writer.flushes), (1, 1));
+        assert_eq!(
+            decode_all::<ClientMessage>(&writer.written).await,
+            [ClientMessage::Input(b"ls\r".to_vec())]
+        );
+    }
 
     #[tokio::test]
     async fn messages_survive_a_round_trip() {
@@ -432,6 +632,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn output_and_input_travel_as_raw_bytes() {
+        assert_eq!(
+            postcard::to_stdvec(&ClientMessage::Input(b"ls\r".to_vec())).unwrap(),
+            [12, 3, b'l', b's', b'\r']
+        );
+        let output: Vec<u8> = (0..200).collect();
+        assert_eq!(
+            postcard::to_stdvec(&ServerMessage::Output(output.clone())).unwrap(),
+            [[6, 200, 1].as_slice(), &output].concat()
+        );
+    }
+
     #[tokio::test]
     async fn clipboard_text_survives_a_round_trip() {
         let (mut server, mut client) = byte_pipe(1024);
@@ -494,6 +707,22 @@ mod tests {
 
         let result = read_message::<_, ServerMessage>(&mut server).await;
         assert!(result.is_err());
+
+        let mut frames = Vec::new();
+        encode_frame_into(&mut frames, &ClientMessage::Detach).unwrap();
+        let queued = frames.clone();
+        let oversized = ServerMessage::Image(ImageOp::Transmit {
+            key: 1,
+            format: ImageFormat::Png,
+            width: 1,
+            height: 1,
+            compressed: true,
+            total: MAX_FRAME_LEN,
+            data: vec![0; MAX_FRAME_LEN as usize],
+            last: true,
+        });
+        assert!(encode_frame_into(&mut frames, &oversized).is_err());
+        assert_eq!(frames, queued);
     }
 
     fn connected_pair() -> (

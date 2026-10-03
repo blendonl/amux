@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 
 use super::forward::{self, Host, Opening};
 use super::mouse::{InputEvent, MouseDecoder};
-use super::render::GridDiffer;
+use super::render::{Composer, GridDiffer};
 use super::session::Session;
 use super::status::StatusFeed;
 use super::upload::{Turn, Uploader};
@@ -386,6 +386,7 @@ async fn attach(
     )
     .await?;
     let mut cluster = StatusFeed::new(server, origin);
+    let mut composer = Composer::default();
     let mut differ = GridDiffer::new(*size);
     let mut uploader = Uploader::new(
         Arc::clone(server.images()),
@@ -404,26 +405,33 @@ async fn attach(
     let mut keys = KeyDecoder::default();
     let escape = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(escape);
+    let mut pacer = FramePacer::new(Instant::now());
+    let pace = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(pace);
     let mut dirty = true;
 
     loop {
         if let Some(job) = uploader.take_job() {
             derivations.spawn_blocking(move || job.run());
         }
+        let frame_due = dirty && pacer.due(Instant::now());
         tokio::select! {
-            permit = client.outgoing.reserve(), if dirty || uploader.has_work() => {
+            permit = client.outgoing.reserve(), if frame_due || uploader.has_work() => {
                 let Ok(permit) = permit else {
                     return Ok(Outcome::Detached);
                 };
-                match uploader.choose(dirty) {
+                match uploader.choose(frame_due) {
                     Some(Turn::Frame) => {
                         dirty = false;
-                        uploader.set_budget(server.settings().images.client_memory_bytes());
-                        let Some(frame) = session.frame(uploader.viewer()) else {
+                        let settings = server.settings();
+                        let interval = settings.session.frame_interval();
+                        pace.as_mut().reset(pacer.sent(Instant::now(), interval));
+                        uploader.set_budget(settings.images.client_memory_bytes());
+                        let Some(frame) = session.frame(&mut composer, uploader.viewer()) else {
                             continue;
                         };
                         uploader.frame(&frame.images);
-                        let output = differ.diff(&frame);
+                        let output = differ.diff(frame);
                         if !output.is_empty() {
                             permit.send(ServerMessage::Output(output));
                         }
@@ -443,6 +451,7 @@ async fn attach(
                 }
                 dirty = true;
             }
+            () = &mut pace, if dirty && !frame_due => {}
             Some(finished) = derivations.join_next(), if !derivations.is_empty() => {
                 match finished {
                     Ok(finished) => uploader.finish(finished),
@@ -546,6 +555,25 @@ async fn attach(
     }
 }
 
+struct FramePacer {
+    next_frame: Instant,
+}
+
+impl FramePacer {
+    fn new(now: Instant) -> Self {
+        Self { next_frame: now }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        now >= self.next_frame
+    }
+
+    fn sent(&mut self, now: Instant, interval: Duration) -> Instant {
+        self.next_frame = now + interval;
+        self.next_frame
+    }
+}
+
 fn resize_to_latest(session: &Session, size: Size) {
     if session.size() != size {
         session.resize(size);
@@ -557,4 +585,47 @@ pub async fn send(outgoing: &mpsc::Sender<ServerMessage>, message: ServerMessage
         .send(message)
         .await
         .map_err(|_| anyhow!("the client disconnected"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const INTERVAL: Duration = Duration::from_millis(8);
+
+    #[test]
+    fn the_first_frame_is_due_at_once() {
+        let now = Instant::now();
+        assert!(FramePacer::new(now).due(now));
+    }
+
+    #[test]
+    fn a_sent_frame_holds_the_next_one_for_the_interval() {
+        let start = Instant::now();
+        let mut pacer = FramePacer::new(start);
+        assert_eq!(pacer.sent(start, INTERVAL), start + INTERVAL);
+        assert!(!pacer.due(start));
+        assert!(!pacer.due(start + INTERVAL - Duration::from_micros(1)));
+        assert!(pacer.due(start + INTERVAL));
+    }
+
+    #[test]
+    fn a_frame_after_a_quiet_spell_is_due_at_once() {
+        let start = Instant::now();
+        let mut pacer = FramePacer::new(start);
+        pacer.sent(start, INTERVAL);
+        let keystroke = start + 10 * INTERVAL;
+        assert!(pacer.due(keystroke));
+
+        pacer.sent(keystroke, INTERVAL);
+        assert!(!pacer.due(keystroke + INTERVAL / 2));
+    }
+
+    #[test]
+    fn a_zero_interval_never_holds_a_frame() {
+        let start = Instant::now();
+        let mut pacer = FramePacer::new(start);
+        assert_eq!(pacer.sent(start, Duration::ZERO), start);
+        assert!(pacer.due(start));
+    }
 }

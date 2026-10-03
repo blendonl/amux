@@ -1,4 +1,4 @@
-// Modified by amux: hides kitty placeholder glyphs and draws their images after the text
+// Modified by amux: hides kitty placeholder glyphs and draws their images after the text, and measures each non-ASCII code point once through CodePointWidths
 package com.termux.view;
 
 import android.graphics.Bitmap;
@@ -35,6 +35,7 @@ public final class TerminalRenderer {
     final int mFontLineSpacingAndAscent;
 
     private final float[] asciiMeasures = new float[127];
+    private final CodePointWidths mCodePointWidths = new CodePointWidths();
 
     private final ImagePainter mImagePainter;
 
@@ -116,8 +117,8 @@ public final class TerminalRenderer {
                 // This could happen for some fonts which are not truly monospace, or for more exotic characters such as
                 // smileys which android font renders as wide.
                 // If this is detected, we draw this code point scaled to match what wcwidth() expects.
-                final float measuredCodePointWidth = placeholder ? codePointWcWidth * mFontWidth : (codePoint < asciiMeasures.length) ? asciiMeasures[codePoint] : mTextPaint.measureText(line,
-                    currentCharIndex, charsForCodePoint);
+                final float measuredCodePointWidth = placeholder ? codePointWcWidth * mFontWidth : (codePoint < asciiMeasures.length) ? asciiMeasures[codePoint] : measure(line,
+                    currentCharIndex, charsForCodePoint, codePoint);
                 final boolean fontWidthMismatch = Math.abs(measuredCodePointWidth / mFontWidth - codePointWcWidth) > 0.01;
 
                 if (style != lastRunStyle || insideCursor != lastRunInsideCursor || insideSelection != lastRunInsideSelection || fontWidthMismatch || lastRunFontWidthMismatch) {
@@ -165,6 +166,15 @@ public final class TerminalRenderer {
         }
 
         mImagePainter.paint(mEmulator, canvas, bitmaps, topRow, selectionY1, selectionY2, selectionX1, selectionX2);
+    }
+
+    private float measure(char[] line, int index, int count, int codePoint) {
+        float width = mCodePointWidths.get(codePoint);
+        if (Float.isNaN(width)) {
+            width = mTextPaint.measureText(line, index, count);
+            mCodePointWidths.put(codePoint, width);
+        }
+        return width;
     }
 
     private void drawTextRun(Canvas canvas, char[] text, int[] palette, float y, int startColumn, int runWidthColumns,
