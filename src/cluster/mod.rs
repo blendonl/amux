@@ -176,6 +176,12 @@ struct Found {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusSummary {
+    pub latency: Option<Duration>,
+    pub offline: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Forgotten {
     pub name: String,
     pub id: Option<ServerId>,
@@ -249,6 +255,18 @@ impl Target {
 
     fn is_hidden(&self) -> bool {
         self.is_discovered() && !self.verified
+    }
+
+    fn server_status(&self) -> ServerStatus {
+        match &self.incompatible {
+            Some(version) => ServerStatus::Incompatible {
+                version: version.clone(),
+            },
+            None => ServerStatus::Offline {
+                last_seen: None,
+                stopped: false,
+            },
+        }
     }
 
     fn is_dialable(&self) -> bool {
@@ -530,22 +548,8 @@ impl Cluster {
             .peers
             .iter()
             .map(|(id, peer)| {
-                let target = members
-                    .targets
-                    .iter()
-                    .filter(|(_, target)| target.peer == Some(*id))
-                    .min_by_key(|(_, target)| !target.verified);
-                let incompatible = target.and_then(|(_, target)| target.incompatible.clone());
-                let status = match (members.links.get(id), incompatible) {
-                    (Some(link), _) => ServerStatus::Online {
-                        latency: link.handle.stats.latency(),
-                    },
-                    (None, Some(version)) => ServerStatus::Incompatible { version },
-                    (None, None) => ServerStatus::Offline {
-                        last_seen: peer.last_seen,
-                        stopped: peer.stopped,
-                    },
-                };
+                let target = members.target_of(*id);
+                let status = members.peer_status(*id, peer, target.map(|(_, target)| target));
                 let state = peer
                     .state
                     .as_ref()
@@ -567,35 +571,45 @@ impl Cluster {
 
         servers.extend(
             members
-                .targets
-                .iter()
-                .filter(|(_, target)| {
-                    !target.is_self
-                        && !target.is_hidden()
-                        && target
-                            .peer
-                            .is_none_or(|id| !members.peers.contains_key(&id))
-                })
+                .peerless_targets()
                 .map(|(address, target)| ServerView {
                     id: target.peer,
                     name: target.name().to_owned(),
                     address: Some(address.clone()),
                     version: target.incompatible.clone(),
-                    status: match &target.incompatible {
-                        Some(version) => ServerStatus::Incompatible {
-                            version: version.clone(),
-                        },
-                        None => ServerStatus::Offline {
-                            last_seen: None,
-                            stopped: false,
-                        },
-                    },
+                    status: target.server_status(),
                     sessions: Vec::new(),
                     projects: Vec::new(),
                 }),
         );
         servers.sort_by(|a, b| a.name.cmp(&b.name));
         servers
+    }
+
+    pub fn status_summary(&self, host: &str) -> StatusSummary {
+        let members = self.members();
+        let mut latency = None;
+        let mut offline = Vec::new();
+        for (id, peer) in &members.peers {
+            let target = members.target_of(*id).map(|(_, target)| target);
+            match members.peer_status(*id, peer, target) {
+                ServerStatus::Online {
+                    latency: Some(sample),
+                } if peer.name == host => latency = latency.or(Some(whole_millis(sample))),
+                ServerStatus::Offline { .. } => offline.push(peer.name.clone()),
+                _ => {}
+            }
+        }
+        offline.extend(
+            members
+                .peerless_targets()
+                .filter(|(_, target)| {
+                    matches!(target.server_status(), ServerStatus::Offline { .. })
+                })
+                .map(|(_, target)| target.name().to_owned()),
+        );
+        offline.sort_unstable();
+        StatusSummary { latency, offline }
     }
 
     pub fn links(&self) -> Vec<LinkInfo> {
@@ -1990,6 +2004,36 @@ impl Members {
             .any(|target| target.configured_name() == Some(name))
     }
 
+    fn target_of(&self, peer: ServerId) -> Option<(&String, &Target)> {
+        self.targets
+            .iter()
+            .filter(|(_, target)| target.peer == Some(peer))
+            .min_by_key(|(_, target)| !target.verified)
+    }
+
+    fn peer_status(&self, id: ServerId, peer: &Peer, target: Option<&Target>) -> ServerStatus {
+        if let Some(link) = self.links.get(&id) {
+            return ServerStatus::Online {
+                latency: link.handle.stats.latency(),
+            };
+        }
+        match target.and_then(|target| target.incompatible.clone()) {
+            Some(version) => ServerStatus::Incompatible { version },
+            None => ServerStatus::Offline {
+                last_seen: peer.last_seen,
+                stopped: peer.stopped,
+            },
+        }
+    }
+
+    fn peerless_targets(&self) -> impl Iterator<Item = (&String, &Target)> {
+        self.targets.iter().filter(|(_, target)| {
+            !target.is_self
+                && !target.is_hidden()
+                && target.peer.is_none_or(|id| !self.peers.contains_key(&id))
+        })
+    }
+
     fn is_absent(&self, peer: ServerId) -> bool {
         let mut discovered = self
             .targets
@@ -2074,6 +2118,10 @@ fn changes_only_activity(state: &ServerState, event: &StateEvent) -> bool {
             && known.project == *project
             && known.branch == *branch
     })
+}
+
+fn whole_millis(latency: Duration) -> Duration {
+    Duration::new(latency.as_secs(), latency.subsec_millis() * 1_000_000)
 }
 
 fn is_shareable(address: &str) -> bool {

@@ -604,24 +604,12 @@ impl Server {
     }
 
     fn cluster_status(&self, host: &str) -> ClusterStatus {
-        let peers = self.cluster.view();
-        let latency = peers
-            .iter()
-            .filter(|peer| peer.name == host)
-            .find_map(|peer| match peer.status {
-                ServerStatus::Online { latency } => latency,
-                _ => None,
-            });
-        let offline = peers
-            .into_iter()
-            .filter(|peer| matches!(peer.status, ServerStatus::Offline { .. }))
-            .map(|peer| peer.name)
-            .collect();
+        let summary = self.cluster.status_summary(host);
         ClusterStatus {
             local: self.identity.name.clone(),
             host: host.to_owned(),
-            latency,
-            offline,
+            latency: summary.latency,
+            offline: summary.offline,
         }
     }
 
