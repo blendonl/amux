@@ -417,7 +417,7 @@ pub enum ClientMessage {
     },
     Debug(DebugCommand),
     KillServer,
-    Input(Vec<u8>),
+    Input(#[serde(with = "serde_bytes")] Vec<u8>),
     Resize(Size),
     Command(SessionCommand),
     Switch(Target),
@@ -478,7 +478,7 @@ pub enum ServerMessage {
     Project(ProjectCheckout),
     Links(Vec<LinkInfo>),
     Done,
-    Output(Vec<u8>),
+    Output(#[serde(with = "serde_bytes")] Vec<u8>),
     SessionState(SessionState),
     ClusterStatus(ClusterStatus),
     Reconnecting {

@@ -632,6 +632,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn output_and_input_travel_as_raw_bytes() {
+        assert_eq!(
+            postcard::to_stdvec(&ClientMessage::Input(b"ls\r".to_vec())).unwrap(),
+            [12, 3, b'l', b's', b'\r']
+        );
+        let output: Vec<u8> = (0..200).collect();
+        assert_eq!(
+            postcard::to_stdvec(&ServerMessage::Output(output.clone())).unwrap(),
+            [[6, 200, 1].as_slice(), &output].concat()
+        );
+    }
+
     #[tokio::test]
     async fn clipboard_text_survives_a_round_trip() {
         let (mut server, mut client) = byte_pipe(1024);
