@@ -179,10 +179,7 @@ impl Row {
         self.cells.truncate(usize::from(len));
         self.used = self.used.min(self.cells.len());
         self.wrapped = false;
-        let last_cell = &mut self.cells[usize::from(len) - 1];
-        if last_cell.is_wide() {
-            last_cell.clear(*last_cell.attrs());
-        }
+        self.clear_cut_wide();
     }
 
     pub fn resize(&mut self, len: u16) {
@@ -190,6 +187,15 @@ impl Row {
         self.cells.resize(usize::from(len), crate::Cell::new());
         self.used = self.used.min(self.cells.len());
         self.wrapped = false;
+        self.clear_cut_wide();
+    }
+
+    fn clear_cut_wide(&mut self) {
+        if let Some(last_cell) =
+            self.cells.last_mut().filter(|cell| cell.is_wide())
+        {
+            last_cell.clear(*last_cell.attrs());
+        }
     }
 
     pub fn wrap(&mut self, wrap: bool) {
