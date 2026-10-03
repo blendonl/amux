@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch, Notify};
@@ -17,8 +17,8 @@ use super::channel::Channels;
 use super::{Cluster, LinkGuard, Rejection, StateSource, TransportAuth};
 use crate::identity::ServerId;
 use crate::protocol::{
-    self, read_frame, write_message, Farewell, Hello, IncompatibleServer, PeerMessage, Refusal,
-    Role, Welcome,
+    self, read_frame, read_frame_into, write_message, Farewell, FrameBatch, Hello,
+    IncompatibleServer, PeerMessage, Refusal, Role, Welcome, READ_BUFFER_LEN,
 };
 use crate::settings::ClusterSettings;
 
@@ -392,6 +392,7 @@ where
         mut interactive,
         mut bulk,
     } = outbound;
+    let mut batch = FrameBatch::default();
     loop {
         let message = tokio::select! {
             biased;
@@ -401,7 +402,8 @@ where
                     return LinkEnd::Stopped;
                 }
                 while let Ok(message) = control.try_recv() {
-                    if let Err(err) = write_message(&mut writer, &message).await {
+                    let filled = batch.fill(message, || control.try_recv().ok());
+                    if let Err(err) = batch.write_to(&mut writer).await.and(filled) {
                         return LinkEnd::Failed(err.context("writing to the link"));
                     }
                 }
@@ -414,7 +416,14 @@ where
                 None => return LinkEnd::ServerGone,
             },
         };
-        if let Err(err) = write_message(&mut writer, &message).await {
+        let filled = batch.fill(message, || {
+            control
+                .try_recv()
+                .or_else(|_| interactive.try_recv())
+                .or_else(|_| bulk.try_recv())
+                .ok()
+        });
+        if let Err(err) = batch.write_to(&mut writer).await.and(filled) {
             return LinkEnd::Failed(err.context("writing to the link"));
         }
     }
@@ -432,7 +441,7 @@ struct Reader {
     channels: Arc<Channels>,
 }
 
-async fn read_frames<R>(mut reader: R, state: Reader) -> LinkEnd
+async fn read_frames<R>(reader: R, state: Reader) -> LinkEnd
 where
     R: AsyncRead + Unpin,
 {
@@ -443,12 +452,14 @@ where
         stats,
         channels,
     } = state;
+    let mut reader = BufReader::with_capacity(READ_BUFFER_LEN, reader);
+    let mut payload = Vec::new();
     loop {
-        let payload = match read_frame(&mut reader).await {
-            Ok(Some(payload)) => payload,
-            Ok(None) => return LinkEnd::Closed,
+        match read_frame_into(&mut reader, &mut payload).await {
+            Ok(true) => {}
+            Ok(false) => return LinkEnd::Closed,
             Err(err) => return LinkEnd::Failed(err.context("reading from the link")),
-        };
+        }
         stats.heard();
         let len = payload.len();
         let message = match postcard::from_bytes::<PeerMessage>(&payload) {
