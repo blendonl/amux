@@ -7,7 +7,7 @@ use super::connection::Origin;
 use super::graphics::animation::{Animation, Shape, Step};
 use super::graphics::derive::{self, Plan};
 use super::graphics::place::ASSUMED_CELL_PIXELS;
-use super::graphics::store::{Derived, ImageData, ImageStore};
+use super::graphics::store::{Derived, ImageData, ImageStore, StoreView};
 use super::render::{ImageUse, Viewer};
 use crate::protocol::{AnimationControl, CellPixels, FrameSpec, ImageOp};
 
@@ -53,7 +53,7 @@ struct Held {
 }
 
 impl Held {
-    fn moved(&self, store: &ImageStore) -> bool {
+    fn moved(&self, store: &StoreView<'_>) -> bool {
         self.shape
             .as_ref()
             .is_some_and(|shape| store.revision(self.shown.image) != Some(shape.revision()))
@@ -290,32 +290,36 @@ impl Uploader {
 
     pub fn frame(&mut self, images: &[ImageUse]) {
         self.clock += 1;
-        self.forget_dead();
-        self.forget_outdated();
-        self.current = images.iter().map(|shown| shown.key).collect();
-        let current = &self.current;
-        self.ready.retain(|key, _| current.contains(key));
-        self.jobs.retain(|job| current.contains(&job.key));
-        let running = self.running;
-        self.deriving
-            .retain(|key, _| current.contains(key) || Some(*key) == running);
-        for shown in images {
-            let (fresh, moved) = match self.held.get_mut(&shown.key) {
-                Some(held) => {
-                    held.used = self.clock;
-                    (!held.stale, held.moved(&self.store))
-                }
-                None => (false, false),
-            };
-            let waiting = self.queue.iter().any(|queued| queued.key == shown.key)
-                || self.upload.as_ref().map(Upload::key) == Some(shown.key)
-                || self.deriving.contains_key(&shown.key);
-            if !fresh && !waiting {
-                self.queue.push_back(*shown);
-            } else if fresh && moved && !waiting {
-                self.syncs.insert(shown.key);
+        Arc::clone(&self.store).read(|store| {
+            self.forget_dead(store);
+            self.forget_outdated(store);
+            if !self.shows_only(images) {
+                self.current = images.iter().map(|shown| shown.key).collect();
             }
-        }
+            let current = &self.current;
+            self.ready.retain(|key, _| current.contains(key));
+            self.jobs.retain(|job| current.contains(&job.key));
+            let running = self.running;
+            self.deriving
+                .retain(|key, _| current.contains(key) || Some(*key) == running);
+            for shown in images {
+                let (fresh, moved) = match self.held.get_mut(&shown.key) {
+                    Some(held) => {
+                        held.used = self.clock;
+                        (!held.stale, held.moved(store))
+                    }
+                    None => (false, false),
+                };
+                let waiting = self.queue.iter().any(|queued| queued.key == shown.key)
+                    || self.upload.as_ref().map(Upload::key) == Some(shown.key)
+                    || self.deriving.contains_key(&shown.key);
+                if !fresh && !waiting {
+                    self.queue.push_back(*shown);
+                } else if fresh && moved && !waiting {
+                    self.syncs.insert(shown.key);
+                }
+            }
+        });
     }
 
     pub fn has_work(&self) -> bool {
@@ -384,7 +388,7 @@ impl Uploader {
             if self
                 .held
                 .get(&key)
-                .is_some_and(|held| held.moved(&self.store))
+                .is_some_and(|held| self.store.read(|store| held.moved(store)))
             {
                 self.syncs.insert(key);
             }
@@ -555,13 +559,21 @@ impl Uploader {
         true
     }
 
-    fn forget_dead(&mut self) {
+    fn shows_only(&self, images: &[ImageUse]) -> bool {
+        images.iter().all(|shown| self.current.contains(&shown.key))
+            && self
+                .current
+                .iter()
+                .all(|key| images.iter().any(|shown| shown.key == *key))
+    }
+
+    fn forget_dead(&mut self, store: &StoreView<'_>) {
         let sending = self.upload.as_ref().map(Upload::key);
         let dead: Vec<u32> = self
             .held
             .keys()
             .copied()
-            .filter(|key| Some(*key) != sending && !self.store.is_displayed(*key))
+            .filter(|key| Some(*key) != sending && !store.is_displayed(*key))
             .collect();
         if dead.is_empty() {
             return;
@@ -572,7 +584,7 @@ impl Uploader {
         self.refused.clear();
     }
 
-    fn forget_outdated(&mut self) {
+    fn forget_outdated(&mut self, store: &StoreView<'_>) {
         if self.checked == self.cell {
             return;
         }
@@ -580,7 +592,7 @@ impl Uploader {
         let outdated: Vec<u32> = self
             .held
             .iter()
-            .filter(|(_, held)| held.made_for != self.made_for(&held.shown))
+            .filter(|(_, held)| held.made_for != self.made_for(store, &held.shown))
             .map(|(key, _)| *key)
             .collect();
         if !sending.is_some_and(|key| outdated.contains(&key)) {
@@ -593,9 +605,9 @@ impl Uploader {
         }
     }
 
-    fn made_for(&self, shown: &ImageUse) -> Option<CellPixels> {
-        let source = self.store.get(shown.image)?;
-        self.plan(shown, &source).map(|_| self.cell)
+    fn made_for(&self, store: &StoreView<'_>, shown: &ImageUse) -> Option<CellPixels> {
+        let source = store.image(shown.image)?;
+        self.plan(shown, source).map(|_| self.cell)
     }
 
     fn drop_held(&mut self, key: u32) {
