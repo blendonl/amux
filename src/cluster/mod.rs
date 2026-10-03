@@ -27,8 +27,8 @@ use crate::pairing::Pairing;
 use crate::protocol::{
     self, ClientMessage, DiscoveryStatus, DiscoveryView, Duplex, Event, Farewell, Hello, LinkInfo,
     LinkState, LinkTransport, PeerAddress, PeerMessage, PublicKey, Refusal, Role, ServerMessage,
-    ServerState, ServerStatus, ServerView, Snapshot, StateEvent, TcpKind, TrustUpdate, Version,
-    Via,
+    ServerState, ServerStatus, ServerView, SessionInfo, Snapshot, StateEvent, TcpKind, TrustUpdate,
+    Version, Via,
 };
 use crate::settings::ServerConfig;
 use crate::settings::{ClusterSettings, DiscoverySettings, SshSettings};
@@ -982,6 +982,7 @@ impl Cluster {
 
     pub fn discovered(self: &Arc<Self>, via: Via, candidates: Vec<Candidate>) {
         let mut added = Vec::new();
+        let mut updated = false;
         {
             let mut members = self.members();
             if members.stopping {
@@ -1017,19 +1018,23 @@ impl Cluster {
                                     name: found.candidate.name.clone(),
                                     via,
                                 };
+                                updated = true;
                             }
-                            Origin::Discovered { name, .. } => {
+                            Origin::Discovered { name, .. } if *name != found.candidate.name => {
                                 name.clone_from(&found.candidate.name);
+                                updated = true;
                             }
-                            Origin::Configured { .. } => {}
+                            Origin::Discovered { .. } | Origin::Configured { .. } => {}
                         }
-                        if let Some(id) = found.candidate.server {
-                            target.peer.get_or_insert(id);
+                        if target.peer.is_none() && found.candidate.server.is_some() {
+                            target.peer = found.candidate.server;
+                            updated = true;
                         }
                         target.last_seen = now;
                         if target.found.as_ref() != Some(&found) {
                             target.wake.notify_one();
                             woken.extend(target.peer);
+                            updated = true;
                         }
                         target.found = Some(found);
                     }
@@ -1054,6 +1059,7 @@ impl Cluster {
                     continue;
                 }
                 target.found = None;
+                updated = true;
                 if target.is_discovered() && !target.verified && !target.is_self {
                     gone.push(address.clone());
                 }
@@ -1070,8 +1076,10 @@ impl Cluster {
                 }
             }
         }
-        self.changed();
-        self.dirty.notify_one();
+        if updated || !added.is_empty() {
+            self.changed();
+            self.dirty.notify_one();
+        }
         for address in added {
             self.spawn_dial_loop(address);
         }
@@ -1235,7 +1243,7 @@ impl Cluster {
         }
     }
 
-    fn merge_trust(&self, sender: ServerId, update: &TrustUpdate) {
+    fn merge_trust(self: &Arc<Self>, sender: ServerId, update: &TrustUpdate) {
         let merged = {
             let mut members = self.members();
             if members.stopping {
@@ -1253,7 +1261,10 @@ impl Cluster {
             merged
         };
         if merged.changed {
-            self.trust_changed();
+            let cluster = Arc::clone(self);
+            tokio::task::spawn_blocking(move || cluster.keep_trust());
+            self.share_trust();
+            self.changed();
         }
         if !merged.forgotten.is_empty() {
             self.dirty.notify_one();
@@ -1262,11 +1273,15 @@ impl Cluster {
     }
 
     fn trust_changed(&self) {
+        self.keep_trust();
+        self.share_trust();
+        self.changed();
+    }
+
+    fn keep_trust(&self) {
         if let Err(err) = self.save_trust() {
             warn!("saving the trust store failed: {err:#}");
         }
-        self.share_trust();
-        self.changed();
     }
 
     fn share_trust(&self) {
@@ -1452,7 +1467,7 @@ impl Cluster {
     }
 
     fn apply_event(self: &Arc<Self>, peer: ServerId, event: Event) {
-        let gossip = {
+        let (gossip, worth_saving) = {
             let mut members = self.members();
             let Some(cached) = members
                 .peers
@@ -1469,10 +1484,13 @@ impl Cluster {
                 StateEvent::PeersChanged(peers) => Some(peers.clone()),
                 _ => None,
             };
+            let worth_saving = !changes_only_activity(&cached.state, &event.event);
             cached.state.apply(event.event);
-            gossip
+            (gossip, worth_saving)
         };
-        self.dirty.notify_one();
+        if worth_saving {
+            self.dirty.notify_one();
+        }
         if let Some(gossip) = gossip {
             self.learn(&gossip);
         }
@@ -1915,7 +1933,10 @@ impl Cluster {
         loop {
             self.dirty.notified().await;
             tokio::time::sleep(SAVE_DELAY).await;
-            self.save();
+            let cluster = Arc::clone(&self);
+            if let Err(err) = tokio::task::spawn_blocking(move || cluster.save()).await {
+                warn!("saving the cluster cache failed: {err}");
+            }
         }
     }
 
@@ -2031,6 +2052,28 @@ impl Drop for TransportGuard {
         self.cluster.members().transports -= 1;
         self.cluster.changed();
     }
+}
+
+fn changes_only_activity(state: &ServerState, event: &StateEvent) -> bool {
+    let StateEvent::SessionChanged(changed) = event else {
+        return false;
+    };
+    let SessionInfo {
+        id,
+        name,
+        windows,
+        attached_clients: _,
+        last_activity: _,
+        project,
+        branch,
+    } = changed;
+    state.sessions.iter().any(|known| {
+        known.id == *id
+            && known.name == *name
+            && known.windows == *windows
+            && known.project == *project
+            && known.branch == *branch
+    })
 }
 
 fn is_shareable(address: &str) -> bool {
@@ -2472,6 +2515,108 @@ mod tests {
         cluster.discovered(Via::Tailscale, Vec::new());
         cluster.discovered(Via::Tailscale, vec![candidate]);
         assert!(woken(cluster, "tcp://10.0.0.1:7447").await);
+    }
+
+    async fn saving_due(cluster: &Cluster) -> bool {
+        tokio::time::timeout(Duration::ZERO, cluster.dirty.notified())
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn only_a_discovery_that_changes_something_is_announced_and_saved() {
+        let desk = id(DESK);
+        let fixture = setup().server("desk", "tcp://10.0.0.1:7447").build();
+        let cluster = &fixture.cluster;
+        let mut changes = cluster.watch();
+        let candidate = found_on(desk, "desk", "tcp://10.0.0.1:7447");
+
+        cluster.discovered(Via::Tailscale, vec![candidate.clone()]);
+        assert!(changes.has_changed().unwrap());
+        assert!(saving_due(cluster).await);
+
+        changes.borrow_and_update();
+        cluster.discovered(Via::Tailscale, vec![candidate]);
+        assert!(!changes.has_changed().unwrap());
+        assert!(!saving_due(cluster).await);
+
+        cluster.discovered(Via::Tailscale, Vec::new());
+        assert!(changes.has_changed().unwrap());
+        assert!(saving_due(cluster).await);
+    }
+
+    fn session(name: &str, attached_clients: usize, active_at: u64) -> SessionInfo {
+        SessionInfo {
+            id: crate::protocol::SessionId(1),
+            name: name.into(),
+            windows: Vec::new(),
+            attached_clients,
+            last_activity: SystemTime::UNIX_EPOCH + Duration::from_secs(active_at),
+            project: None,
+            branch: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_change_of_activity_alone_is_applied_but_not_saved() {
+        let desk = id(DESK);
+        let fixture = setup().build();
+        let cluster = &fixture.cluster;
+        let incarnation = Incarnation::random().unwrap();
+        let state = ServerState {
+            sessions: vec![session("work", 0, 10)],
+            ..ServerState::default()
+        };
+        cluster.members().peers.insert(
+            desk,
+            Peer {
+                state: Some(CachedState {
+                    incarnation,
+                    seq: 1,
+                    state,
+                }),
+                ..peer_record("desk")
+            },
+        );
+        let change = |seq, session| Event {
+            incarnation,
+            seq,
+            event: StateEvent::SessionChanged(session),
+        };
+
+        cluster.apply_event(desk, change(2, session("work", 1, 20)));
+        assert!(!saving_due(cluster).await);
+        assert_eq!(cluster.view()[0].sessions, [session("work", 1, 20)]);
+
+        cluster.apply_event(desk, change(3, session("play", 1, 20)));
+        assert!(saving_due(cluster).await);
+        assert_eq!(cluster.view()[0].sessions, [session("play", 1, 20)]);
+    }
+
+    #[tokio::test]
+    async fn a_gossiped_trust_change_is_saved_in_the_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Setup {
+            state_dir: Some(dir.path().to_owned()),
+            ..setup()
+        }
+        .build();
+        let cluster = &fixture.cluster;
+        let update = TrustUpdate {
+            trusted: Vec::new(),
+            forgotten: vec![crate::protocol::ForgottenPeer {
+                id: id(DESK),
+                key: Some(PublicKey([1; 32])),
+            }],
+        };
+
+        cluster.merge_trust(id(LAPTOP), &update);
+
+        let path = dir.path().join(TRUST_FILE);
+        eventually("the gossiped tombstone on disk", || {
+            TrustStore::load(&path).is_ok_and(|saved| saved.is_forgotten(id(DESK), None))
+        })
+        .await;
     }
 
     #[tokio::test]
