@@ -4,6 +4,7 @@ mod selection;
 mod snapshot;
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use motion::Span;
 use search::{Direction, Prompt, Search};
@@ -17,6 +18,8 @@ use crate::protocol::Size;
 use crate::settings::{CopyAction, Keymap};
 
 const MAX_COUNT: usize = 99_999;
+
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Point {
@@ -33,6 +36,7 @@ pub enum Outcome {
 }
 
 pub struct CopyMode {
+    generation: u64,
     snapshot: Snapshot,
     size: Size,
     top: usize,
@@ -49,6 +53,7 @@ pub struct CopyMode {
 impl CopyMode {
     pub fn new(snapshot: Snapshot, size: Size) -> Self {
         let mut mode = Self {
+            generation: next_generation(),
             cursor: snapshot.cursor(),
             snapshot,
             size: size.clamped(),
@@ -64,6 +69,10 @@ impl CopyMode {
         mode.top = mode.bottom();
         mode.clamp();
         mode
+    }
+
+    pub fn touch(&mut self) {
+        self.generation = next_generation();
     }
 
     pub fn refresh(&mut self, snapshot: Snapshot) {
@@ -160,6 +169,7 @@ impl CopyMode {
     pub fn view(&self) -> CopyView<'_> {
         CopyView {
             screen: self.snapshot.screen(),
+            generation: self.generation,
             top: self.top,
             cursor: (
                 u16::try_from(self.cursor.line - self.top).unwrap_or(u16::MAX),
@@ -411,6 +421,10 @@ impl CopyMode {
     fn visible(&self) -> usize {
         (self.snapshot.lines() - self.top).min(self.rows())
     }
+}
+
+fn next_generation() -> u64 {
+    NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]

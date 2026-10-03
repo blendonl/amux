@@ -13,7 +13,9 @@ pub fn paint(
     rect: Rect,
     viewer: Viewer<'_>,
     uses: &mut Vec<ImageUse>,
+    image_rows: &mut Vec<u16>,
 ) {
+    image_rows.clear();
     let mut resolver = Resolver {
         screen,
         placements: placements.filter(|_| viewer.graphics),
@@ -29,7 +31,7 @@ pub fn paint(
         .placements
         .filter(|placements| !placements.is_empty())
     {
-        paint_spans(grid, screen, placements, rect, viewer, uses);
+        paint_spans(grid, screen, placements, rect, viewer, uses, image_rows);
     }
 }
 
@@ -55,6 +57,7 @@ fn paint_spans(
     rect: Rect,
     viewer: Viewer<'_>,
     uses: &mut Vec<ImageUse>,
+    image_rows: &mut Vec<u16>,
 ) {
     let mut shown: Option<(PlacementId, bool)> = None;
     for span in placements.spans(screen) {
@@ -72,6 +75,7 @@ fn paint_spans(
         if !visible {
             continue;
         }
+        image_rows.push(span.row);
         let cells = screen
             .visible_row(span.row)
             .map_or(&[][..], |row| row.cells);
@@ -279,7 +283,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{mpsc, Arc, Mutex};
 
-    use super::super::{compose, Frame, GraphicsParser};
+    use super::super::{compose, Composer, Frame, GraphicsParser};
     use super::*;
     use crate::protocol::Size;
     use crate::server::graphics::derive::{Look, Sizing};
@@ -667,6 +671,42 @@ mod tests {
     }
 
     #[test]
+    fn a_moved_image_leaves_no_cells_behind() {
+        let mut panes = Panes::side_by_side();
+        let settings = Arc::new(Settings::default());
+        let mut composer = Composer::default();
+        let mut recompose = |panes: &Panes| {
+            let frame = composer.compose(
+                &panes.layout,
+                WINDOW,
+                LEFT,
+                &panes.parsers,
+                &settings,
+                graphics(),
+            );
+            assert_eq!(*frame, panes.shown());
+            frame.clone()
+        };
+        panes.feed(LEFT, "text\x1b[2;3H");
+        panes.transmit(LEFT, "i=1,p=1,C=1", 30, 40);
+        let placed = recompose(&panes);
+        assert_eq!(row_text(&placed, 1), "..###.....│..........");
+        assert_eq!(row_text(&placed, 2), "..###.....│..........");
+
+        panes.feed(LEFT, "\x1b[4;6H\x1b_Ga=p,i=1,p=1,C=1,q=2\x1b\\");
+        let moved = recompose(&panes);
+        assert_eq!(row_text(&moved, 0), "text......│..........");
+        assert_eq!(row_text(&moved, 1), "..........│..........");
+        assert_eq!(row_text(&moved, 2), "..........│..........");
+        assert_eq!(row_text(&moved, 3), ".....###..│..........");
+
+        panes.feed(LEFT, "\x1b_Ga=d,q=2\x1b\\");
+        let deleted = recompose(&panes);
+        assert_eq!(row_text(&deleted, 3), "..........│..........");
+        assert!(deleted.images.is_empty());
+    }
+
+    #[test]
     fn painting_a_pane_without_images_allocates_nothing() {
         let panes = Panes::side_by_side();
         let parser = panes.parsers[&LEFT].lock().unwrap();
@@ -681,6 +721,7 @@ mod tests {
             rect,
             graphics(),
             &mut uses,
+            &mut Vec::new(),
         );
         assert_eq!(allocations() - before, 0);
     }

@@ -4,7 +4,7 @@ use std::hint::black_box;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::{compose, GraphicsParser, GridDiffer, Viewer};
+use super::{Composer, GraphicsParser, GridDiffer, Viewer};
 use crate::protocol::Size;
 use crate::server::graphics::place::tests::allocations;
 use crate::server::graphics::store::ImageStore;
@@ -31,7 +31,8 @@ struct Terminal {
     layout: Layout,
     parsers: BTreeMap<PaneId, GraphicsParser>,
     graphics: PaneGraphics,
-    settings: Settings,
+    settings: Arc<Settings>,
+    composer: Composer,
     differ: GridDiffer,
 }
 
@@ -47,7 +48,8 @@ impl Terminal {
             layout: Layout::new(PANE),
             parsers: BTreeMap::from([(PANE, Mutex::new(parser))]),
             graphics: PaneGraphics::new(images),
-            settings,
+            settings: Arc::new(settings),
+            composer: Composer::default(),
             differ: GridDiffer::new(WINDOW),
         }
     }
@@ -57,7 +59,7 @@ impl Terminal {
     }
 
     fn frame(&mut self) -> Vec<u8> {
-        let frame = compose(
+        let frame = self.composer.compose(
             &self.layout,
             WINDOW,
             PANE,
@@ -65,7 +67,7 @@ impl Terminal {
             &self.settings,
             Viewer::text(),
         );
-        self.differ.diff(&frame)
+        self.differ.diff(frame)
     }
 
     fn timed_frame(&mut self, output: &[u8]) -> Sample {

@@ -7,6 +7,7 @@ pub struct GridDiffer {
     client_size: Size,
     shown: Option<Vec<Cell>>,
     row: Vec<Cell>,
+    seen: Option<(u64, u64)>,
     modes: Option<InputModes>,
     cursor: Option<(u16, u16)>,
     cursor_visible: Option<bool>,
@@ -18,6 +19,7 @@ impl GridDiffer {
             client_size,
             shown: None,
             row: Vec::new(),
+            seen: None,
             modes: None,
             cursor: None,
             cursor_visible: None,
@@ -46,7 +48,7 @@ impl GridDiffer {
         escape::set_modes(&mut out, self.modes, frame.modes);
         self.modes = Some(frame.modes);
 
-        let drawn_cursor = self.paint_changed_rows(&frame.grid, &mut out);
+        let drawn_cursor = self.paint_changed_rows(frame, &mut out);
 
         let target = frame
             .cursor
@@ -76,13 +78,23 @@ impl GridDiffer {
         out
     }
 
-    fn paint_changed_rows(&mut self, grid: &Grid, out: &mut Vec<u8>) -> Option<Option<(u16, u16)>> {
+    fn paint_changed_rows(
+        &mut self,
+        frame: &Frame,
+        out: &mut Vec<u8>,
+    ) -> Option<Option<(u16, u16)>> {
         let Size { rows, cols } = self.client_size;
         let width = usize::from(cols);
         if width == 0 {
             return None;
         }
+        let grid = &frame.grid;
         let fresh = self.shown.is_none();
+        let unchanged_since = self
+            .seen
+            .filter(|&(source, _)| !fresh && source == frame.source)
+            .map(|(_, generation)| generation);
+        self.seen = Some((frame.source, grid.generation()));
         let shown = self
             .shown
             .get_or_insert_with(|| vec![Cell::default(); usize::from(rows) * width]);
@@ -93,6 +105,13 @@ impl GridDiffer {
             drawing: false,
         };
         for (row, old) in (0..rows).zip(shown.chunks_exact_mut(width)) {
+            if unchanged_since.is_some_and(|generation| !grid.changed_since(row, generation)) {
+                if cfg!(debug_assertions) {
+                    view_row(grid, row, cols, &mut self.row);
+                    assert!(*old == *self.row, "row {row} changed without being marked");
+                }
+                continue;
+            }
             view_row(grid, row, cols, &mut self.row);
             if !fresh && *old == *self.row {
                 continue;
