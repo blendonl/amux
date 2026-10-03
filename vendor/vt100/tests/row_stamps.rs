@@ -188,19 +188,11 @@ const TEXT: &[&str] = &[
 
 const COUNTED: &[&str] = &["X", "@", "P", "L", "M", "S", "T", "A", "B", "C"];
 
-#[derive(Clone, Copy)]
-enum Mix {
-    WideTextAtOneWidth,
-    NarrowTextAtAnyWidth,
-}
-
-fn random_step(parser: &mut vt100::Parser, random: &mut Random, mix: Mix) {
+fn random_step(parser: &mut vt100::Parser, random: &mut Random) {
     let (rows, cols) = parser.screen().size();
     match random.below(8) {
-        0 if matches!(mix, Mix::WideTextAtOneWidth) => {
-            parser.process(random.pick(WIDE_TEXT).as_bytes());
-        }
-        0..=2 => parser.process(random.pick(TEXT).as_bytes()),
+        0 => parser.process(random.pick(WIDE_TEXT).as_bytes()),
+        1 | 2 => parser.process(random.pick(TEXT).as_bytes()),
         3 => {
             let row = random.up_to(rows) + 1;
             let col = random.up_to(cols) + 1;
@@ -228,10 +220,7 @@ fn random_step(parser: &mut vt100::Parser, random: &mut Random, mix: Mix) {
         }
         _ => {
             let rows = random.up_to(4) + 2;
-            let cols = match mix {
-                Mix::WideTextAtOneWidth => cols,
-                Mix::NarrowTextAtAnyWidth => random.up_to(9) + 3,
-            };
+            let cols = random.up_to(9) + 3;
             parser.screen_mut().set_size(rows, cols);
         }
     }
@@ -244,38 +233,59 @@ struct Contents {
     has_placeholders: bool,
 }
 
-#[test]
-fn equal_stamps_mean_equal_rows() {
+fn random_walk(mut check: impl FnMut(&vt100::Screen, u64, usize)) {
     for seed in 1..=8 {
-        let mix = if seed % 2 == 0 {
-            Mix::WideTextAtOneWidth
-        } else {
-            Mix::NarrowTextAtAnyWidth
-        };
         let mut random = Random(0x9E37_79B9_7F4A_7C15 ^ seed);
         let mut parser = vt100::Parser::new(ROWS, COLS, 6);
-        let mut seen: HashMap<(u64, u64), Contents> = HashMap::new();
         for step in 0..4000 {
-            random_step(&mut parser, &mut random, mix);
-            for row in parser.screen().visible_rows() {
-                let contents = Contents {
-                    cells: row.cells.to_vec(),
-                    wrapped: row.wrapped,
-                    has_placeholders: row.has_placeholders,
-                };
-                match seen.get(&(row.id, row.stamp)) {
-                    Some(earlier) => assert_eq!(
-                        earlier, &contents,
-                        "seed {seed}, step {step}, row {}",
-                        row.id
-                    ),
-                    None => {
-                        seen.insert((row.id, row.stamp), contents);
-                    }
+            random_step(&mut parser, &mut random);
+            check(parser.screen(), seed, step);
+        }
+    }
+}
+
+#[test]
+fn equal_stamps_mean_equal_rows() {
+    let mut seen: HashMap<(u64, u64), Contents> = HashMap::new();
+    random_walk(|screen, seed, step| {
+        for row in screen.visible_rows() {
+            let contents = Contents {
+                cells: row.cells.to_vec(),
+                wrapped: row.wrapped,
+                has_placeholders: row.has_placeholders,
+            };
+            match seen.get(&(row.id, row.stamp)) {
+                Some(earlier) => assert_eq!(
+                    earlier, &contents,
+                    "seed {seed}, step {step}, row {}",
+                    row.id
+                ),
+                None => {
+                    seen.insert((row.id, row.stamp), contents);
                 }
             }
         }
-    }
+    });
+}
+
+#[test]
+fn every_wide_character_keeps_both_halves() {
+    random_walk(|screen, seed, step| {
+        for row in screen.visible_rows() {
+            let heads = std::iter::once(false)
+                .chain(row.cells.iter().map(vt100::Cell::is_wide));
+            let tails = row
+                .cells
+                .iter()
+                .map(vt100::Cell::is_wide_continuation)
+                .chain([false]);
+            assert!(
+                heads.eq(tails),
+                "seed {seed}, step {step}, row {}",
+                row.id
+            );
+        }
+    });
 }
 
 #[test]
