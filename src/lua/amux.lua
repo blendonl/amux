@@ -434,6 +434,7 @@
 ---@field clash_format string The name of a session whose name is taken, with {base} and {n}
 ---@field clash_start integer The first {n} of clash_format
 ---@field activity_interval_ms integer
+---@field frame_interval_ms integer The shortest time between two frames sent to a client; 0 sends every frame
 
 ---@class amux.opt.borders
 ---@field horizontal string
