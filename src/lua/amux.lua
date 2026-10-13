@@ -96,6 +96,9 @@
 ---| "switch_table"
 ---| "reload_config"
 ---| "which_key"
+---| "copy_mode"
+---| "copy_mode_page_up"
+---| "paste_buffer"
 
 ---An action: its name, or a table such as { split_pane = "left-right" }
 ---@alias amux.Action amux.ActionName|table<amux.ActionName, any>
@@ -130,7 +133,45 @@
 ---| "delete_word"
 ---| "delete_line"
 
----@alias amux.Binding amux.Action|fun(ctx: amux.Context)|amux.PromptAction|amux.TreeAction|amux.PickerAction
+---@alias amux.CopyAction
+---| "cursor_left"
+---| "cursor_down"
+---| "cursor_up"
+---| "cursor_right"
+---| "next_word"
+---| "previous_word"
+---| "next_word_end"
+---| "next_space"
+---| "previous_space"
+---| "next_space_end"
+---| "start_of_line"
+---| "back_to_indentation"
+---| "end_of_line"
+---| "history_top"
+---| "history_bottom"
+---| "top_line"
+---| "middle_line"
+---| "bottom_line"
+---| "scroll_up"
+---| "scroll_down"
+---| "halfpage_up"
+---| "halfpage_down"
+---| "page_up"
+---| "page_down"
+---| "begin_selection"
+---| "select_line"
+---| "other_end"
+---| "clear_selection"
+---| "copy_selection_and_cancel"
+---| "clear_selection_or_cancel"
+---| "cancel"
+---| "refresh_from_pane"
+---| "search_forward"
+---| "search_backward"
+---| "search_again"
+---| "search_reverse"
+
+---@alias amux.Binding amux.Action|fun(ctx: amux.Context)|amux.PromptAction|amux.TreeAction|amux.PickerAction|amux.CopyAction
 
 ---@alias amux.KeymapTable
 ---| "root"
@@ -139,6 +180,7 @@
 ---| "tree"
 ---| "picker"
 ---| "search"
+---| "copy"
 ---| string
 
 ---@class amux.KeymapOpts
@@ -164,6 +206,9 @@
 ---@field switch_table fun(name: string): amux.Action Reads the next key from this table
 ---@field reload_config fun(): amux.Action Reloads the config here and on this machine's server
 ---@field which_key fun(name: string): amux.Action Shows the keys of this table, then reads the next key from it
+---@field copy_mode fun(): amux.Action Browses the active pane's history in copy mode
+---@field copy_mode_page_up fun(): amux.Action Enters copy mode one page up
+---@field paste_buffer fun(): amux.Action Pastes the last copied text into the active pane
 
 ---@alias amux.EventName
 ---| "session_created"
@@ -298,6 +343,7 @@
 ---@field session amux.opt.session
 ---@field borders amux.opt.borders
 ---@field mouse amux.opt.mouse
+---@field clipboard amux.opt.clipboard
 ---@field cluster amux.opt.cluster
 ---@field discovery amux.opt.discovery
 ---@field lan amux.opt.lan
@@ -344,6 +390,9 @@
 ---@field overlay_border amux.Style The reconnecting overlay's border
 ---@field pane_border amux.Style Pane borders, from the server's config
 ---@field pane_border_active amux.Style The active pane's border, from the server's config
+---@field copy_position amux.Style Copy mode's position in the history, from the server's config
+---@field copy_selection amux.Style The selected text in copy mode, from the server's config
+---@field copy_prompt amux.Style Copy mode's search prompt and messages, from the server's config
 
 ---@class amux.opt.tree
 ---@field indent string
@@ -401,6 +450,12 @@
 
 ---@class amux.opt.mouse
 ---@field escape_time_ms integer
+---@field scroll boolean Whether the wheel scrolls pane history in copy mode
+---@field scroll_lines integer How many lines one wheel step scrolls
+
+---@class amux.opt.clipboard
+---@field osc52 boolean Whether copied text reaches this terminal's clipboard through OSC 52
+---@field command? string[] A command that gets copied text on stdin, such as { "wl-copy" }
 
 ---@class amux.opt.cluster
 ---@field ping_interval_ms integer
