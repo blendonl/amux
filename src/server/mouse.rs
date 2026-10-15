@@ -10,11 +10,21 @@ const BUTTON_BITS: u16 = 0b11;
 const RELEASE_BUTTON: u16 = 0b11;
 const MOTION_BIT: u16 = 32;
 const EXTENDED_BUTTON_BITS: u16 = 64 | 128;
+const MODIFIER_BITS: u16 = 4 | 8 | 16;
+const LEFT_BUTTON: u16 = 0;
+const WHEEL_UP: u16 = 64;
+const WHEEL_DOWN: u16 = 65;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputEvent {
     Bytes(Vec<u8>),
     Mouse(MouseEvent),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wheel {
+    Up,
+    Down,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +45,30 @@ impl MouseEvent {
             && !self.is_motion()
             && self.code & EXTENDED_BUTTON_BITS == 0
             && self.code & BUTTON_BITS != RELEASE_BUTTON
+    }
+
+    pub fn wheel(&self) -> Option<Wheel> {
+        match self.button() {
+            WHEEL_UP if self.pressed => Some(Wheel::Up),
+            WHEEL_DOWN if self.pressed => Some(Wheel::Down),
+            _ => None,
+        }
+    }
+
+    pub fn is_left_press(&self) -> bool {
+        self.pressed && self.button() == LEFT_BUTTON
+    }
+
+    pub fn is_left_drag(&self) -> bool {
+        self.pressed && self.button() == LEFT_BUTTON | MOTION_BIT
+    }
+
+    pub fn is_left_release(&self) -> bool {
+        !self.pressed && matches!(self.button(), LEFT_BUTTON | RELEASE_BUTTON)
+    }
+
+    fn button(&self) -> u16 {
+        self.code & !MODIFIER_BITS
     }
 
     pub fn reported_in(&self, mode: MouseProtocolMode) -> bool {
@@ -450,6 +484,48 @@ mod tests {
         assert!(!press(32, 0, 0).is_click());
         assert!(!press(64, 0, 0).is_click());
         assert!(!press(3, 0, 0).is_click());
+    }
+
+    #[test]
+    fn the_wheel_is_told_apart_whatever_modifiers_are_held() {
+        assert_eq!(press(64, 0, 0).wheel(), Some(Wheel::Up));
+        assert_eq!(press(65, 0, 0).wheel(), Some(Wheel::Down));
+        assert_eq!(press(64 | 4 | 8 | 16, 0, 0).wheel(), Some(Wheel::Up));
+        assert_eq!(press(65 | 16, 0, 0).wheel(), Some(Wheel::Down));
+        assert_eq!(
+            MouseDecoder::new().decode(b"\x1b[M\x61\x21\x21"),
+            vec![InputEvent::Mouse(press(65, 0, 0))]
+        );
+        for event in [
+            press(0, 0, 0),
+            press(66, 0, 0),
+            press(64 | 32, 0, 0),
+            release(64, 0, 0),
+            press(128, 0, 0),
+        ] {
+            assert_eq!(event.wheel(), None, "{event:?}");
+        }
+    }
+
+    #[test]
+    fn a_left_drag_is_motion_with_the_left_button_held() {
+        for code in [0, 4, 8, 16, 4 | 8 | 16] {
+            assert!(press(code, 0, 0).is_left_press(), "{code}");
+            assert!(press(code | 32, 0, 0).is_left_drag(), "{code}");
+            assert!(release(code, 0, 0).is_left_release(), "{code}");
+        }
+        assert!(release(3, 0, 0).is_left_release());
+
+        assert!(!press(32, 0, 0).is_left_press());
+        assert!(!press(0, 0, 0).is_left_drag());
+        assert!(!release(32, 0, 0).is_left_drag());
+        assert!(!press(0, 0, 0).is_left_release());
+        for code in [1, 2, 64, 65] {
+            assert!(!press(code, 0, 0).is_left_press(), "{code}");
+            assert!(!press(code | 32, 0, 0).is_left_drag(), "{code}");
+            assert!(!release(code, 0, 0).is_left_release(), "{code}");
+        }
+        assert!(!press(35, 0, 0).is_left_drag());
     }
 
     #[test]

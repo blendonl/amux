@@ -70,6 +70,8 @@ A session holds numbered windows, and each window splits into panes, each runnin
 | `Ctrl-b &`              | Kill the active window                                 |
 | `Ctrl-b ,`              | Rename the active window                               |
 | `Ctrl-b $`              | Rename the session                                     |
+| `Ctrl-b [`              | Browse the active pane's history in copy mode          |
+| `Ctrl-b ]`              | Paste the text last copied in copy mode                |
 | `Ctrl-b s p`            | Find a project in your project directories and open it |
 | `Ctrl-b s w`            | Find a worktree of this session's project and open it  |
 | `Ctrl-b s s`            | Pick a session or window anywhere in the cluster       |
@@ -82,8 +84,47 @@ A session holds numbered windows, and each window splits into panes, each runnin
 - A split shares the pane's space equally with its siblings, and every shell is resized to its pane. A split that leaves no room for the new pane is refused, and the status bar says why.
 - A pane whose shell exits leaves the layout and its neighbours take over its space. A window closes with its last pane, and the session ends with its last window.
 - Every client attached to a session sees the same active window and pane. The window takes the size of the client that typed last, and a client with a smaller terminal sees the top-left part of it.
-- While a window has more than one pane, the terminal reports mouse clicks to amux, and clicking a pane makes it the active one. Most terminals still select text when you hold Shift. A program that turns on mouse reporting itself, like `vim` with `mouse=a` or `htop`, gets the clicks inside its own pane in its own coordinates.
+- The terminal reports the mouse to amux. Clicking a pane makes it the active one. The wheel scrolls a pane's history: wheel up over a shell starts [copy mode](#copy-mode), and scrolling back down to the bottom leaves it. Dragging selects text and copies it when you let go. For your terminal's own selection, hold Shift while you drag, which most terminals allow.
+- A program that turns on mouse reporting itself, like `vim` with `mouse=a` or `htop`, gets the clicks and the wheel inside its own pane in its own coordinates. A program in the alternate screen that doesn't, like `less` or `man`, gets the wheel as `Up` and `Down` keys.
+- `amux.opt.mouse.scroll = false` gives the wheel and dragging back to the terminal. The terminal then reports the mouse only while a window has more than one pane or the active pane is in copy mode, so clicks still pick panes.
 - These keys work the same on a session on another server: they travel over the peer link to the server that holds the session.
+
+### Copy mode
+
+`Ctrl-b [` puts the active pane in copy mode, where you scroll back through its history and copy text from it. The pane holds still while you look: amux shows a copy of it taken when you pressed the keys, the program keeps running underneath, and what it prints meanwhile shows when you leave. The top right corner shows `[line/total]`, the line the cursor is on out of all the lines of history and screen. The keys are vi's:
+
+| Keys                             | Action                                                  |
+| -------------------------------- | ------------------------------------------------------- |
+| `h` `j` `k` `l`, arrow keys      | Move the cursor                                         |
+| `w`, `b`, `e`                    | Next word, previous word, end of the word               |
+| `W`, `B`, `E`                    | The same, for words that only spaces separate           |
+| `0` or `Home`, `^`, `$` or `End` | Start of the line, its first character, end of the line |
+| `g`, `G`                         | Top and bottom of the history                           |
+| `H`, `M`, `L`                    | Top, middle and bottom line of the pane                 |
+| `Ctrl-y`, `Ctrl-e`               | Scroll up and down a line                               |
+| `Ctrl-u`, `Ctrl-d`               | Scroll up and down half a page                          |
+| `PageUp`, `PageDown` or `Ctrl-f` | Scroll up and down a page                               |
+| `/`, `?`                         | Search down or up the history                           |
+| `n`, `N`                         | Next match, in the same or the other direction          |
+| `r`                              | Take a new copy of the pane, keeping your place         |
+| `v` or `Space`, `V`              | Start selecting characters, or whole lines              |
+| `o`                              | Move the cursor to the other end of the selection       |
+| `y` or `Enter`                   | Copy the selection and leave copy mode                  |
+| `Escape`                         | Clear the selection, or leave when nothing is selected  |
+| `q`, `Ctrl-c`                    | Leave copy mode                                         |
+
+- A number before a key repeats it: `10k` moves up ten lines. Other keys do nothing, and pasted text is dropped unless the search prompt is open.
+- A selection runs from where you started it to the cursor, both ends included, and a wide character is taken whole. `y` copies it to the clipboard of the client that pressed it (see [Clipboard](docs/lua.md#clipboard)) and to the paste buffer. A line that wrapped at the edge of the pane comes out as one line, the blanks at the end of each line are dropped, and there is no newline after the last line. When the selection holds only blanks, or nothing is selected, `y` just leaves copy mode. `r` clears the selection.
+- `/` searches down the history for the text you type, and `?` searches up. The text goes in a prompt on the bottom row of the pane, where the prompt keys edit it, pasted text lands in it, `Enter` searches, and `Escape` closes only the prompt. The text is matched as written, not as a pattern, and case is ignored unless it holds a capital letter. Each line is searched on its own, so text that wrapped onto the next line isn't found. The cursor moves to the start of the next match after it, or before it with `?`. Past the end of the history the search carries on from the other end and says `search hit BOTTOM, continuing at TOP` (or the `TOP` form) on the bottom row, and with no match anywhere it says `pattern not found`. The message goes with the next key. `n` repeats the search in the same direction and `N` in the other, and both take a count, so `3n` goes to the third match. With a selection, a search moves the cursor end of it like any other key. The prompt's keys come from the `prompt` table of the server that holds the session.
+- `Ctrl-b ]` types the paste buffer into the active pane as if you had pasted it: each newline becomes Enter, other control characters are dropped, and a program that turned on bracketed paste gets the text inside `ESC[200~ … ESC[201~`. The server keeps one paste buffer for all its sessions until it stops, so you can copy in one session and paste in another. A session on another server uses that server's buffer. With nothing copied yet, `Ctrl-b ]` says the paste buffer is empty.
+- The wheel scrolls copy mode by `amux.opt.mouse.scroll_lines` lines, 3 by default. Copy mode that the wheel started ends when the wheel brings you back to the bottom, unless something is selected, while copy mode from `Ctrl-b [` stays until you leave it. A click moves the cursor to the cell under the pointer and clears the selection. Dragging selects characters from where you pressed the button, starting copy mode first on a pane whose program didn't ask for the mouse, and scrolls a line when you drag onto the top or bottom row of the pane or past it. A drag stays with the pane it started in, and letting go copies the selection like `y` and leaves copy mode. On Android, a swipe on the terminal scrolls the history like the wheel.
+- Copy mode belongs to the pane, so every client attached to the session sees it. It stays while you switch windows and panes, detach and attach again, or reload the config.
+- The copy keys and the colours of the position, the selection and the search prompt come from the config of the server that holds the session, like the pane borders: `amux.keymap.set("copy", "K", "halfpage_up")` binds a key there, and `amux.opt.theme.copy_position`, `amux.opt.theme.copy_selection` and `amux.opt.theme.copy_prompt` colour them. [docs/lua.md](docs/lua.md#copy-mode) lists the actions.
+- `amux.action.copy_mode_page_up()` starts copy mode a page up, like tmux's `copy-mode -u`. It has no key, since `PageUp` after `Ctrl-b` turns the pages of the which-key popup. Bind it with `amux.keymap.set("root", "S-PageUp", amux.action.copy_mode_page_up())`.
+- Images are hidden while you browse: the pane shows only its text, and the images come back when you leave copy mode.
+- A program in the alternate screen, such as `vim`, `less` or `htop`, has no history there, so copy mode shows only its screen.
+- History isn't rewrapped when a pane changes size: each line keeps the width it had when it left the screen, so after the pane gets narrower, the ends of longer lines are cut off at its edge.
+- `clear` empties the screen but not the history, which copy mode still shows above it, since amux's terminal emulator ignores `ESC[3J`, the sequence `clear` sends to drop the scrollback.
 
 ### Images
 
@@ -264,6 +305,18 @@ amux.on("session_created", function(event) amux.log("new session " .. event.sess
 
 `name` defaults to the hostname and `projects_dir` to `~/projects`. A leading `~` in `projects_dir`, `worktrees_dir` and `search.project_dirs` means your home directory. Each entry under `servers` is a peer to link to. Each entry under `projects` is keyed by project name: `default_server` is where `amux new` puts that project's sessions when you don't pass `--on`, and `worktrees_dir` is where its worktrees go instead of the default `<checkout>/../<project>-worktrees`.
 
+```lua
+amux.opt.pane.scrollback = 10000
+```
+
+`amux.opt.pane.scrollback` is the number of lines of history each pane keeps, which is how far back copy mode can go. The default is 2,000 and the most is 100,000. History costs about 36 bytes per cell, so a busy 200-column pane holds roughly 14 MB of it at the default and 72 MB at 10,000 lines. A reload applies a new value to the panes opened after it, and running panes keep the history they started with.
+
+```lua
+amux.opt.mouse.scroll_lines = 5
+```
+
+`amux.opt.mouse.scroll`, `true` by default, has the terminal report the mouse to amux in every window, so the wheel scrolls history and dragging selects text (see [Windows and panes](#windows-and-panes)). `amux.opt.mouse.scroll_lines` is how many lines each turn of the wheel scrolls, 3 by default. The server that holds the session reads both, and a reload applies them at once.
+
 `amux.opt.discovery` controls how servers find each other without a config entry (see [Cluster](#cluster)):
 
 | Option           | Default                                    | Means                                                                 |
@@ -298,6 +351,11 @@ luarc    /home/you/.config/amux/.luarc.json
 
 The types know which functions only the client or only the server has, and `amux.on` knows the fields of each event, so `amux.on("pane_exited", function(event) … end)` completes `event.status`. `amux config check` still has the last word, since the language server can't run the config.
 
+`amux.opt.clipboard` decides where the text you copy goes. With `osc52`, the default, the client that copied writes it to its terminal as an OSC 52 sequence, which puts it on the clipboard of the machine the terminal runs on, through SSH too. `command` runs a program on the client's machine with the text on standard input, for terminals that ignore OSC 52. On Android, the app's terminal takes the whole copy, but Android's clipboard turns down a very large one, and the app then shows a short message instead. [docs/lua.md](docs/lua.md#clipboard) has the details.
+
+```lua
+amux.opt.clipboard.command = { "wl-copy" }
+```
 #### Reloading
 
 A change to the config takes effect without a restart:
@@ -316,7 +374,7 @@ A config that fails to load changes nothing. The running settings, bindings and 
 What a reload changes:
 
 - **The client**: the prefix, the key bindings, the status bar, the tree, the which-key popup, the search directories, the theme, and the notice and escape times, right away. An open prompt, tree or which-key popup closes.
-- **Panes and windows**: the ones opened after the reload get the new `pane`, `window` and session naming settings. Panes that are already running keep the shell, `TERM` and environment they started with. Pane borders are drawn again with the new `borders` and theme.
+- **Panes and windows**: the ones opened after the reload get the new `pane`, `window` and session naming settings. Panes that are already running keep the shell, `TERM`, environment and history length they started with. Pane borders are drawn again with the new `borders` and theme.
 - **Projects**: `projects` and `projects_dir` apply to the next session.
 - **Images**: `images.memory_mb` and `images.client_memory_mb` apply right away, and so does `images.client` in the client. `pane.images` and `pane.sixel` apply to the panes opened after the reload.
 - **The cluster**: servers added to `amux.opt.servers` or `servers.lua` are linked, and removed ones are dropped. The status interval applies right away, and the other `cluster` timings to the next dial, backoff and link.
@@ -350,7 +408,7 @@ The update leaves the running server and its sessions alone, on the old binary. 
 
 Every connection starts with a greeting that carries the protocol version. When the client and the running server speak different major versions, the client names both and asks you to run `amux kill-server`. `kill-server` also works on a server that is too old to answer the greeting.
 
-This version speaks protocol 9, which added config reloads. Protocol 8 added the steps `amux pair --verbose` prints, and protocol 7 added the Noise keys, trust updates and discovery, so every machine in the cluster needs the new build. Servers on different major versions refuse to link, and `amux servers` lists the older one as `incompatible, runs amux … (protocol 8.0)`. A build older than protocol 7 doesn't listen on TCP, so Tailscale and LAN discovery can't reach it either. The cluster cache of an older build still loads.
+This version speaks protocol 10, which added kitty and sixel images, the clipboard and copy mode. Protocol 9 added config reloads, protocol 8 added the steps `amux pair --verbose` prints, and protocol 7 added the Noise keys, trust updates and discovery, so every machine in the cluster needs the new build. Servers on different major versions refuse to link, and `amux servers` lists the older one as `incompatible, runs amux … (protocol 9.0)`. A build older than protocol 7 doesn't listen on TCP, so Tailscale and LAN discovery can't reach it either. The cluster cache of an older build still loads.
 
 amux no longer reads `config.toml`. Move its settings into `init.lua` as assignments to `amux.opt`: `name = "desktop"` becomes `amux.opt.name = "desktop"`, a `[servers.laptop]` table with `address = "ssh://laptop"` becomes `amux.opt.servers.laptop = { address = "ssh://laptop" }`, and `tailscale = false` under `[discovery]` becomes `amux.opt.discovery.tailscale = false`. Then run `amux config check`, and restart the server with `amux kill-server` so it loads the new file.
 
@@ -530,7 +588,7 @@ notes      4b825dc642cb6eb9a060e54bf8d69288fbee4904
 
 The Android app is a terminal that runs the real amux binary on the phone, with zsh, git and ssh in its panes. It opens straight into `amux`, which attaches to the most recent session or creates one, and a foreground service keeps the server running while the app is in the background. The phone then joins the cluster like any other machine (see [Joining the cluster from the phone](#joining-the-cluster-from-the-phone)).
 
-The app needs Android 10 (API 29) or later on arm64 or x86_64, and its zsh, git and ssh only work for the phone's primary user (see [Limits](#limits)). Its build, unit tests and lint run in a container, and its binary and userland run in a Termux container, but it hasn't been tried on a real phone yet.
+The app needs Android 10 (API 29) or later on arm64, or on x86_64 for a debug build, and its zsh, git and ssh only work for the phone's primary user (see [Limits](#limits)). Its build, unit tests and lint run in a container, and its binary and userland run in a Termux container, but it hasn't been tried on a real phone yet.
 
 #### Building and installing
 
@@ -546,19 +604,19 @@ The first run builds the image, which is about 4 GB and takes several minutes, a
 | Command                              | Does                                                                                                           |
 | ------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
 | `./android/build.sh image`           | Builds the `amux-android-build` image when it is missing or `android/docker/Dockerfile` has changed            |
-| `./android/build.sh binary`          | Cross-compiles amux with the NDK and writes the stripped binaries to `android/app/src/main/jniLibs/`           |
+| `./android/build.sh binary`          | Cross-compiles amux with the `dist` profile and writes the stripped binaries to `android/app/src/main/jniLibs` |
 | `./android/build.sh userland`        | Builds the userland for aarch64 and x86_64 in `android/.cache/userland/`, unless it is up to date              |
 | `./android/build.sh userland-check`  | Checks the libraries the userland's programs need, and runs the x86_64 userland in a Termux container          |
 | `./android/build.sh userland-inputs` | Prints the hash of the userland's inputs, which `userland` compares with the last build's to skip it           |
 | `./android/build.sh package`         | Splits each userland into `libu_*.so` files in `jniLibs/` and a zip in `android/app/src/main/assets/userland/` |
 | `./android/build.sh smoke`           | Runs the x86_64 binary and userland in a Termux container, laid out as the app lays them out                   |
 | `./android/build.sh apk`             | Builds the debug APK from those files, runs the JVM unit tests and lint, and prints what the APK holds         |
-| `./android/build.sh release-apk`     | Builds the release APK the same way, signed with the release key, and prints its signing certificate           |
+| `./android/build.sh release-apk`     | Builds the arm64-only release APK the same way, signed with the release key, and prints its certificate        |
 | `./android/build.sh all`             | `image`, `binary`, `userland`, `package`, `smoke` and `apk`, in that order                                     |
 
 Every step but `userland`, `userland-check` and `userland-inputs` builds the image first when it is out of date. A step that needs the output of an earlier one stops when that output is missing and names the step to run, so `apk` without the zips or the `libu_*.so` files says to run `package` first. The cargo and Gradle caches, the termux-packages checkout and the userland live in `android/.cache`, which git ignores.
 
-`release-apk` is the step the release workflow runs (see [Releasing](#releasing)). It needs `AMUX_RELEASE_KEYSTORE`, the path of the keystore, `AMUX_RELEASE_KEYSTORE_PASSWORD` and `AMUX_RELEASE_KEY_ALIAS`, and stops when one is missing. It writes `android/app/build/outputs/apk/release/app-release.apk`, which isn't debuggable.
+`release-apk` is the step the release workflow runs (see [Releasing](#releasing)). It needs `AMUX_RELEASE_KEYSTORE`, the path of the keystore, `AMUX_RELEASE_KEYSTORE_PASSWORD` and `AMUX_RELEASE_KEY_ALIAS`, and stops when one is missing. It writes `android/app/build/outputs/apk/release/app-release.apk`, which isn't debuggable, is shrunk with R8 and carries only arm64-v8a: Gradle's `amux.abis` property, which defaults to both ABIs, leaves out x86_64's libraries and userland zip, and the step fails if any x86_64 file is left in the APK.
 
 `userland` builds the packages in `android/userland/packages.txt`, and everything they depend on, with [termux-packages](https://github.com/termux/termux-packages). `android/userland/termux-packages.txt` pins its commit and its `ghcr.io/termux/package-builder` image. The step clones that commit into `android/.cache/termux-packages`, applies the patches in `android/userland/overlay/`, and builds every package from source for aarch64 and x86_64, with the app's package name, `io.github.blendonl.amux`, in place of Termux's. Termux's own packages can't be used, since every path in them points into Termux's data directory. The build runs in a container named `amux-userland-builder`, which stays for the next run. The step then extracts the packages into `android/.cache/userland/<arch>/prefix/`, without headers, static libraries and other build files, and collects their sources (see [Licenses and sources](#licenses-and-sources)).
 
@@ -617,7 +675,7 @@ A layer key held by one thumb changes the other half, where the other thumb is f
 - `sym`, on the right thumb, turns the left half into every symbol the base layer lacks: `! @ # $ %` and `^ & * ( )` on the top two rows, then `[`, `]`, `=`, `\` and `` ` `` above `{`, `}`, `+`, `|` and `~`.
 - `num`, on the right thumb, turns the left half into a phone keypad, `1` to `9` with `0` under `8`, plus `F11` and `F12`. Holding a digit sends `F1` to `F10`, which its corner shows.
 - `nav`, on the left thumb, turns the right half into the arrows on `h` `j` `k` `l`, with `Home`, `PgDn`, `PgUp` and `End` under them, `Del` and `Ins`. The top row stays, so `Ctrl` then `←` still works.
-- `Prefix`, on the left thumb, sends `Ctrl-b`, whatever `amux.opt.prefix` is set to, when tapped. Held, it turns the right half into amux's prefix keys: new, previous, next, rename and kill window, split left-right and top-bottom, next and kill pane, help, the project, worktree and cluster pickers, reload, detach, rename session, and `Hide`.
+- `Prefix`, on the left thumb, sends `Ctrl-b`, whatever `amux.opt.prefix` is set to, when tapped. Held, it turns the right half into amux's prefix keys: new, previous, next, rename and kill window, split left-right and top-bottom, next and kill pane, help, the project, worktree and cluster pickers, reload, detach, rename session, and `Hide`. Its `copy` and `paste` keys start [copy mode](#copy-mode) and type the paste buffer into the pane, like `Ctrl-b [` and `Ctrl-b ]`.
 
 The keys:
 
@@ -626,14 +684,15 @@ The keys:
 - `Ctrl`, `Alt`, `⇧`, `sym`, `num` and `nav` all work the same way. A tap applies to the next key only, and shows the key's label in green meanwhile. A second tap locks it on and fills the key green, and a third tap turns it off. Holding the key applies it to every key you press until you let go, so one thumb can hold `nav` while the other taps arrows. While `Ctrl` or `Alt` is on, the letters show what they will send, such as `^C`.
 - With `⇧`, a letter types its capital, and `'`, `-`, `;`, `,`, `.` and `/` type `"`, `_`, `:`, `<`, `>` and `?`. Digits and the keys on `sym` stay as they are.
 - `⌫`, `Del`, the arrows, `PgUp` and `PgDn` repeat while held.
-- `Paste` pastes the clipboard, as bracketed paste when the pane asks for it.
+- `Paste` pastes the phone's clipboard, as bracketed paste when the pane asks for it. The `paste` key on the `Prefix` layer types amux's paste buffer instead.
 - `Hide` hides the keyboard so the terminal takes the whole width, and a tap on the terminal brings it back.
 
 In both:
 
 - Pinch to zoom. The app remembers the text size.
 - Long-press to select text on the screen, then pick Copy or Paste from the menu that opens.
-- A tap on the terminal brings the keyboard back. In a window with several panes amux turns on mouse reporting (see [Windows and panes](#windows-and-panes)), so the tap also reaches amux as a click and makes the pane under it active.
+- Text you copy in [copy mode](#copy-mode) goes to the phone's clipboard, where other apps can paste it. When a copy is too large for Android's clipboard, a short message says so and the clipboard keeps what it had.
+- A tap on the terminal brings the keyboard back. amux turns on mouse reporting (see [Windows and panes](#windows-and-panes)), so the tap also reaches amux as a click and makes the pane under it active, and a swipe up or down scrolls the pane's history in [copy mode](#copy-mode).
 
 #### The landscape keyboard
 
@@ -818,7 +877,7 @@ amux pair k7-4821-9930
 amux pair k7-4821-9930 --host 192.168.0.24:40123
 ```
 
-The app holds a Wi-Fi multicast lock while its service runs, because Android drops multicast on Wi-Fi without one, and the phone needs multicast to find the desktop over mDNS. Where multicast doesn't get through anyway, add `--host <addr>:<port>` with the desktop's IP address and the port `amux pair` printed, as in the second line. The phone then saves the desktop as a server at that `tcp://` address.
+The app holds a Wi-Fi multicast lock while it is on screen, because Android drops multicast on Wi-Fi without one, and the phone needs multicast to find the desktop over mDNS. In the background it holds the lock only while its server listens on the LAN, which keeps Wi-Fi from waking for every multicast packet. Where multicast doesn't get through anyway, add `--host <addr>:<port>` with the desktop's IP address and the port `amux pair` printed, as in the second line. The phone then saves the desktop as a server at that `tcp://` address.
 
 On a tailnet, link the phone by hand. Tailnet discovery never dials phones (see [On the same tailnet](#on-the-same-tailnet)), and the phone's server has no `tailscale` CLI, so it can't vouch for the desktop through `tailscale whois` and doesn't listen on the tailnet. A `tcp://` link to a key that nothing vouches for is refused, so pair once, with `--host`, the desktop's tailnet IP address and the port `amux pair` printed, then point the phone at the desktop's tailnet listener:
 
@@ -875,13 +934,14 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 - Each **pane** spawns the user's shell in a PTY. Output goes through a `vt100` parser, so the server always holds the full screen state. That state is how a client gets a redraw when it reattaches. The shell doesn't inherit `SSH_*` variables from the server, and a session in a directory that doesn't exist fails instead of quietly starting in `$HOME`.
 - A **session** holds an ordered list of windows, and each **window** holds a layout tree and its panes. The layout splits the window into rectangles with a one-cell border between siblings, and each pane's PTY is sized to its rectangle.
 - The **compositor** paints the active window into a grid of cells: every pane's cells are read straight from its `vt100` screen while that pane's parser is locked, so nothing is copied per frame, and the borders are drawn with box-drawing characters. The cursor and input modes come from the active pane.
+- **Copy mode** belongs to a pane on the server. Entering it clones the pane's `vt100` screen with its history, so the view holds still while the program keeps running, and the compositor paints that copy in place of the live pane. While a pane is in copy mode, the host decodes the client's input into keys itself and looks them up in the `copy` table of its own config. A copy goes into the server's paste buffer and back to the client that asked for it as a `Clipboard` message, which the client writes to its terminal as OSC 52 or hands to its clipboard command.
 - **Images** come out of a pane's output before the `vt100` parser sees them: an APC scanner cuts out kitty graphics commands and unwraps tmux passthrough. The images go into one store for the whole server, under keys that are never reused, and each placement is anchored to the screen rows it covers, so it moves when they scroll and ends when the last of them leaves the screen. Each placement also gets a display key of its own, which is the id the client's terminal knows its image by, so the same image placed twice is sent twice. An animation's frames are kept with their image as kitty keeps them: a frame drawn over another frame stays as it was sent until a program edits it or composes onto it, and then the server draws it whole, blending as kitty does.
 - **Sixel** images come through the DCS callbacks of the vendored `vt100` parser. The pane decodes each one, marks the cells it covers and moves the cursor as xterm does, and the pump stores the image, padded to whole cells, outside the parser lock. A sixel placement paints only the cells that are still marked, so text printed over it cuts it, and it ends when none are left or a newer sixel covers all of them.
 - For a client that shows images, the compositor paints every placement as kitty Unicode placeholder cells: U+10EEEE with diacritics for the image row and column, and the display key as the foreground colour. They go through the differ, the borders and the client's chrome like any other cell. Placeholders a program prints itself are rewritten from its image and placement ids to the display key, and a client that can't show an image gets the text under it instead, or blanks for printed placeholders. A pane without images and without printed placeholders costs nothing extra.
 - Each attached **client** has its own differ, which compares the new grid with the last one that client was sent, clipped to that client's terminal size, and sends only the changed cells. It moves the cursor and clears line by line, never the whole screen. Frames are pulled, not pushed: output in a visible pane or a layout change only marks the client dirty, and the server composes a frame when the connection has room for one. A slow client skips intermediate screens, and its keystrokes never wait behind output. Keystrokes go back as raw bytes, key bindings as commands, and resizes are sent when `SIGWINCH` arrives.
 - Each attached client also has an **uploader**, which sends the images its frames use as `Image` messages: the stored bytes in chunks of up to 1 MiB, or 64 KiB when the client is on another server, and then a virtual placement of the placement's size. A frame may use an image before it arrives, since the terminal draws the cells again when it does. The uploader sends one image message after each frame and keeps going while no frame is due, so neither waits for the other. It keeps each terminal within `images.client_memory_mb`, counting each image's first frame, deletes an image from the terminal when its placement ends, and starts over on every attach. After an animated image's placement come its animation frames and state, and later changes follow as the difference between what the terminal has and what the store holds: new animation frames as sent, changed ones whole, and new gaps and controls. Deleting an animation frame sends the whole image again. The client turns those messages into kitty graphics commands, never mixing another command into an unfinished upload, and deletes everything it sent when it attaches again or exits.
 - A terminal fits a virtual placement's whole image into its cells, so a placement with a source rectangle, a cell offset, a stretch or a size of its own would look wrong. For those the uploader sends a **derived image** instead: a blocking task decodes the stored image, crops, scales and pads it to the placement's cells at the session's cell size, and keeps it deflated in the store under the display key, counted against the store's quota and the first thing let go of when it fills. Until it's ready the frame uses the key as if its upload were still on its way. When the session's cell size changes, the uploader deletes each derived image from the terminal and sends it again for the new size. A sixel image is already padded to its cells, so it never needs one.
-- The host decodes **mouse** reports from the client's input. A click focuses the pane under the pointer, and a report only reaches a pane whose program asked for that kind of event, re-encoded in that pane's coordinates and format. A lone `Escape` that could start a report is held for at most 25 ms, so it never gets stuck.
+- The host decodes **mouse** reports from the client's input. A click focuses the pane under the pointer, and a report only reaches a pane whose program asked for that kind of event, re-encoded in that pane's coordinates and format. Unless `mouse.scroll` is off, the host asks the terminal for button-motion reports in SGR form in every window: the other wheel events scroll copy mode or become arrow keys in the alternate screen, and a left drag belongs to the pane it started in until the button comes up. A lone `Escape` that could start a report is held for at most 25 ms, so it never gets stuck.
 - The **protocol** uses length-prefixed `postcard` frames. A connection opens with a `Greeting` and a `Welcome` whose layout never changes, then carries `ClientMessage` and `ServerMessage`. Any change to those messages bumps the major version. The server handles a connection as a `Duplex`, a pair of message channels, so it doesn't care what transport sits underneath.
 - A **peer link** carries the same frames. After the greeting both servers send a `Hello`, the lower ID decides whether the link is a duplicate, and then each side sends a snapshot of its sessions followed by events stamped with its incarnation and a sequence number, so stale or repeated updates are dropped. One writer drains a control lane (pongs, credit, goodbyes, trust updates) ahead of a bulk lane (snapshots, events and channel data), and the reader never waits on anything the other side controls, so a peer that stops reading cannot stall this one.
 - Over **TCP**, a connection opens with a `TcpOpen` frame that says whether it is a link or a pairing, then runs a `Noise_XX_25519_ChaChaPoly_BLAKE2s` handshake whose prologue binds that frame. A pump seals and opens the Noise messages between the socket and an in-memory duplex stream, so the peer link runs its usual framing on top. A pairing runs SPAKE2 over the same kind of connection first and then carries on as a link.
@@ -938,6 +998,8 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 | `src/server/graphics/`        | Kitty graphics commands, the image store, placements and the sixel decoder                                         |
 | `src/server/upload.rs`        | Sending each client the images its frames use, within its memory budget                                            |
 | `src/server/mouse.rs`         | Decoding and re-encoding mouse reports                                                                             |
+| `src/server/copy/`            | Copy mode: the pane snapshot, motions, selections, search and the keys                                             |
+| `src/server/paste.rs`         | The server's paste buffer, and typing it into a pane                                                               |
 | `src/server/pane.rs`          | PTY, shell process, terminal emulation                                                                             |
 | `src/client/mod.rs`           | Commands, server bootstrap, attaching                                                                              |
 | `src/client/relay.rs`         | The attached client: keys, panels, chrome and switching sessions                                                   |
@@ -948,7 +1010,9 @@ amux uses a client/server model like tmux. The server owns the shells and the cl
 | `src/client/listing.rs`       | `amux ls`, `amux projects`, `amux servers`, `amux discover` and `amux pair` output                                 |
 | `src/client/projects.rs`      | Resolving `-p` against the projects the cluster knows                                                              |
 | `src/client/terminal.rs`      | Raw mode, alternate screen, stdin reader                                                                           |
-| `src/client/keys.rs`          | Prefix key handling and the key bindings                                                                           |
+| `src/client/router.rs`        | Routing keys through the prefix, the key tables and submaps to commands and panels                                 |
+| `src/client/clipboard.rs`     | Putting copied text on the clipboard with OSC 52 or `amux.opt.clipboard.command`                                   |
+| `src/keys/`                   | Keys: how the config spells them, the bytes a terminal sends for them, and decoding input into keys and pastes     |
 | `src/update.rs`               | `amux update`: finding, checking and installing a release                                                          |
 | `tests/common/mod.rs`         | `TestServer`, `TestClient`, a PTY-driven client, linked test clusters and fakes for `ssh`, `tailscale` and the LAN |
 | `tests/common/git.rs`         | Temporary repos with a local bare `origin` for the project tests                                                   |
@@ -968,7 +1032,9 @@ Set `AMUX_LOG=debug` before the server starts to get more verbose logs.
 
 `cargo test` runs the unit tests and the integration tests in `tests/`. Each integration test starts its own server with a temporary `HOME`, `XDG_*` directories and socket, so it never touches your real server, config or state. Some tests drive the real `amux` binary inside a PTY. Cluster tests link several such servers on one machine through `exec:` addresses that run `amux bridge` with the other server's environment. Project tests work on temporary repos cloned from a local bare `origin`, and run git with their own identity and no user or system config.
 
-Discovery is off in every test server unless the test turns it on, so no test touches the real tailnet or LAN. A fake `tailscale` (`AMUX_TAILSCALE`) serves `status` and `whois` from JSON files the test rewrites, a directory stands in for mDNS (`AMUX_LAN_DIR`), and a fake `ssh` (`AMUX_SSH`) maps host names to test servers. The one test that pairs over real mDNS, on a random service type set with `AMUX_MDNS_SERVICE`, is ignored by default because loopback has no multicast. `cargo test -- --ignored` runs it on a machine with a real network.
+Discovery is off in every test server unless the test turns it on, so no test touches the real tailnet or LAN. A fake `tailscale` (`AMUX_TAILSCALE`) serves `status` and `whois` from JSON files the test rewrites, a directory stands in for mDNS (`AMUX_LAN_DIR`), and a fake `ssh` (`AMUX_SSH`) maps host names to test servers. The one test that pairs over real mDNS, on a random service type set with `AMUX_MDNS_SERVICE`, is ignored by default because loopback has no multicast. `cargo test --test pairing -- --ignored` runs it on a machine with a real network.
+
+The benchmarks are ignored tests too, and `scripts/bench` runs them in release mode, one at a time. `src/server/render/bench.rs` times composing and diffing a keystroke frame and a scrolling frame, `vendor/vt100/tests/throughput.rs` feeds `seq` output to the parser, and `tests/bench.rs` drives real servers and clients at 200×50: echo latency and `seq` throughput next to tmux when it is installed, the same across two linked servers, with another session flooding and behind a slow terminal, and the encoding of a 100 KB frame. Arguments go to `tests/bench.rs` as a filter, so `scripts/bench echo_latency` runs only its echo benchmarks. The script warns when the CPU governor isn't `performance`, because frequency scaling makes the numbers noisy.
 
 The `amux update` and `install.sh` tests serve fake releases from a `file://` directory through `AMUX_RELEASES_URL`, and update a copy of the binary in a temporary directory.
 
@@ -1031,4 +1097,4 @@ Beyond the design:
 - [x] An Android app that runs amux on a phone and joins the cluster, with zsh, git and ssh in its panes
 - [x] Key sequences and submaps, and `Ctrl-b s` to fuzzy-find projects and worktrees
 - [x] Images from the kitty graphics protocol, shown in kitty, ghostty and the Android app
-- [ ] Scrollback and copy mode
+- [x] Scrollback and copy mode

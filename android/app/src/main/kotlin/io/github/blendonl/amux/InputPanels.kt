@@ -23,6 +23,7 @@ class InputPanels(
     private var splitHidden = false
     private var landscape = false
     private var hardwareKeyboard = false
+    private var softInputState: Int? = null
 
     private val splitMode: Boolean
         get() = landscape && !hardwareKeyboard
@@ -83,6 +84,8 @@ class InputPanels(
         } else {
             WindowManager.LayoutParams.SOFT_INPUT_STATE_UNSPECIFIED
         }
+        if (state == softInputState) return
+        softInputState = state
         val adjust = window.attributes.softInputMode and WindowManager.LayoutParams.SOFT_INPUT_MASK_ADJUST
         window.setSoftInputMode(adjust or state)
         if (splitMode) hideSystemKeyboard()

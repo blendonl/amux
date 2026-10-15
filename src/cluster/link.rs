@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch, Notify};
@@ -17,13 +17,14 @@ use super::channel::Channels;
 use super::{Cluster, LinkGuard, Rejection, StateSource, TransportAuth};
 use crate::identity::ServerId;
 use crate::protocol::{
-    self, read_frame, write_message, Farewell, Hello, IncompatibleServer, PeerMessage, Refusal,
-    Role, Welcome,
+    self, read_frame, read_frame_into, write_message, Farewell, FrameBatch, Hello,
+    IncompatibleServer, PeerMessage, Refusal, Role, Welcome, READ_BUFFER_LEN,
 };
 use crate::settings::ClusterSettings;
 
 const PING_INTERVAL_ENV: &str = "AMUX_PING_INTERVAL_MS";
 const CONTROL_CAPACITY: usize = 64;
+const INTERACTIVE_CAPACITY: usize = 64;
 const BULK_CAPACITY: usize = 16;
 
 pub fn with_env(settings: ClusterSettings) -> Result<ClusterSettings> {
@@ -85,22 +86,33 @@ pub(super) struct LinkHandle {
 
 struct Lanes {
     control: mpsc::Sender<PeerMessage>,
-    control_lane: mpsc::Receiver<PeerMessage>,
     bulk: mpsc::Sender<PeerMessage>,
-    bulk_lane: mpsc::Receiver<PeerMessage>,
+    outbound: Outbound,
     stop: Arc<Notify>,
     finishing: watch::Receiver<bool>,
     stats: Arc<LinkStats>,
     channels: Arc<Channels>,
 }
 
+struct Outbound {
+    control: mpsc::Receiver<PeerMessage>,
+    interactive: mpsc::Receiver<PeerMessage>,
+    bulk: mpsc::Receiver<PeerMessage>,
+}
+
 fn new_lanes() -> (LinkHandle, Lanes) {
     let (control, control_lane) = mpsc::channel(CONTROL_CAPACITY);
+    let (interactive, interactive_lane) = mpsc::channel(INTERACTIVE_CAPACITY);
     let (bulk, bulk_lane) = mpsc::channel(BULK_CAPACITY);
     let (finish, finishing) = watch::channel(false);
     let stop = Arc::new(Notify::new());
     let stats = Arc::new(LinkStats::new());
-    let channels = Channels::new(bulk.clone(), control.clone(), Arc::clone(&stop));
+    let channels = Channels::new(
+        bulk.clone(),
+        interactive,
+        control.clone(),
+        Arc::clone(&stop),
+    );
     let handle = LinkHandle {
         control: control.clone(),
         stop: Arc::clone(&stop),
@@ -110,9 +122,12 @@ fn new_lanes() -> (LinkHandle, Lanes) {
     };
     let lanes = Lanes {
         control,
-        control_lane,
         bulk,
-        bulk_lane,
+        outbound: Outbound {
+            control: control_lane,
+            interactive: interactive_lane,
+            bulk: bulk_lane,
+        },
         stop,
         finishing,
         stats,
@@ -324,9 +339,8 @@ where
     } = link;
     let Lanes {
         control,
-        control_lane,
         bulk,
-        bulk_lane,
+        outbound,
         stop,
         finishing,
         stats,
@@ -334,7 +348,7 @@ where
     } = lanes;
 
     let mut tasks = JoinSet::new();
-    tasks.spawn(write_lanes(writer, control_lane, bulk_lane, finishing));
+    tasks.spawn(write_lanes(writer, outbound, finishing));
     tasks.spawn(read_frames(
         reader,
         Reader {
@@ -367,13 +381,18 @@ where
 
 async fn write_lanes<W>(
     mut writer: W,
-    mut control: mpsc::Receiver<PeerMessage>,
-    mut bulk: mpsc::Receiver<PeerMessage>,
+    outbound: Outbound,
     mut finishing: watch::Receiver<bool>,
 ) -> LinkEnd
 where
     W: AsyncWrite + Unpin,
 {
+    let Outbound {
+        mut control,
+        mut interactive,
+        mut bulk,
+    } = outbound;
+    let mut batch = FrameBatch::default();
     loop {
         let message = tokio::select! {
             biased;
@@ -383,19 +402,28 @@ where
                     return LinkEnd::Stopped;
                 }
                 while let Ok(message) = control.try_recv() {
-                    if let Err(err) = write_message(&mut writer, &message).await {
+                    let filled = batch.fill(message, || control.try_recv().ok());
+                    if let Err(err) = batch.write_to(&mut writer).await.and(filled) {
                         return LinkEnd::Failed(err.context("writing to the link"));
                     }
                 }
                 let _ = writer.shutdown().await;
                 return LinkEnd::Finished;
             }
+            Some(message) = interactive.recv() => message,
             message = bulk.recv() => match message {
                 Some(message) => message,
                 None => return LinkEnd::ServerGone,
             },
         };
-        if let Err(err) = write_message(&mut writer, &message).await {
+        let filled = batch.fill(message, || {
+            control
+                .try_recv()
+                .or_else(|_| interactive.try_recv())
+                .or_else(|_| bulk.try_recv())
+                .ok()
+        });
+        if let Err(err) = batch.write_to(&mut writer).await.and(filled) {
             return LinkEnd::Failed(err.context("writing to the link"));
         }
     }
@@ -413,7 +441,7 @@ struct Reader {
     channels: Arc<Channels>,
 }
 
-async fn read_frames<R>(mut reader: R, state: Reader) -> LinkEnd
+async fn read_frames<R>(reader: R, state: Reader) -> LinkEnd
 where
     R: AsyncRead + Unpin,
 {
@@ -424,12 +452,14 @@ where
         stats,
         channels,
     } = state;
+    let mut reader = BufReader::with_capacity(READ_BUFFER_LEN, reader);
+    let mut payload = Vec::new();
     loop {
-        let payload = match read_frame(&mut reader).await {
-            Ok(Some(payload)) => payload,
-            Ok(None) => return LinkEnd::Closed,
+        match read_frame_into(&mut reader, &mut payload).await {
+            Ok(true) => {}
+            Ok(false) => return LinkEnd::Closed,
             Err(err) => return LinkEnd::Failed(err.context("reading from the link")),
-        };
+        }
         stats.heard();
         let len = payload.len();
         let message = match postcard::from_bytes::<PeerMessage>(&payload) {
@@ -610,19 +640,23 @@ impl LinkStats {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::time::SystemTime;
 
     use tokio::io::{duplex, split, DuplexStream, ReadHalf, WriteHalf};
     use tokio::sync::broadcast;
 
     use super::*;
+    use crate::cluster::channel::CREDIT_BYTES;
     use crate::cluster::noise;
     use crate::cluster::{
-        Channel, ChannelEnd, ClusterOptions, NoiseKey, TrustStore, Voucher, CREDIT_WINDOW,
+        Channel, ChannelEnd, ClusterOptions, NoiseKey, Origin, Peer, StatusSummary, Target,
+        TrustStore, Voucher, CREDIT_WINDOW,
     };
     use crate::identity::{Incarnation, ServerIdentity};
     use crate::protocol::{
-        ClientMessage, Duplex, Event, ServerMessage, ServerState, ServerStatus, SessionId,
-        SessionInfo, Snapshot, StateEvent, TcpKind, Version, WindowSummary, PROTOCOL_MAJOR,
+        read_message, ChannelId, ClientMessage, Duplex, Event, ServerMessage, ServerState,
+        ServerStatus, ServerView, SessionId, SessionInfo, Snapshot, StateEvent, TcpKind, Version,
+        Via, WindowSummary, PROTOCOL_MAJOR,
     };
     use crate::settings::DiscoverySettings;
 
@@ -1281,6 +1315,241 @@ mod tests {
         ));
     }
 
+    fn measure(link: &Link<Reader, Writer>, latency: Duration) {
+        link.lanes.stats.lock().latency = Some(latency);
+    }
+
+    fn peer_named(name: &str) -> Peer {
+        Peer {
+            name: name.into(),
+            version: None,
+            last_seen: None,
+            stopped: false,
+            state: None,
+        }
+    }
+
+    fn gossiped(name: &str) -> Origin {
+        Origin::Gossiped { name: name.into() }
+    }
+
+    fn target(
+        origin: Origin,
+        peer: Option<ServerId>,
+        verified: bool,
+        incompatible: Option<Version>,
+    ) -> Target {
+        Target {
+            incompatible,
+            ..Target::new(origin, peer, verified, SystemTime::now())
+        }
+    }
+
+    fn summary_from_view(servers: &[ServerView], host: &str) -> StatusSummary {
+        let latency = servers
+            .iter()
+            .filter(|server| server.name == host)
+            .find_map(|server| match server.status {
+                ServerStatus::Online { latency } => latency,
+                _ => None,
+            });
+        StatusSummary {
+            latency: latency
+                .map(|latency| Duration::from_millis(latency.as_millis().try_into().unwrap())),
+            offline: servers
+                .iter()
+                .filter(|server| matches!(server.status, ServerStatus::Offline { .. }))
+                .map(|server| server.name.clone())
+                .collect(),
+        }
+    }
+
+    fn kind(status: &ServerStatus) -> &'static str {
+        match status {
+            ServerStatus::Local => "local",
+            ServerStatus::Online { .. } => "online",
+            ServerStatus::Offline { .. } => "offline",
+            ServerStatus::Incompatible { .. } => "incompatible",
+        }
+    }
+
+    #[tokio::test]
+    async fn the_status_summary_matches_the_cluster_view() {
+        let ours = node(LOWER, "ours").build();
+        let (_raw, link) = raw_peer(&ours, PIPE_CAPACITY).await;
+        let future = Version {
+            release: "9.0.0".into(),
+            major: PROTOCOL_MAJOR + 1,
+            minor: 0,
+        };
+        let [attic, bench, cellar, twin, gone] = [
+            "000000000000000000000000000000a1",
+            "000000000000000000000000000000b1",
+            "000000000000000000000000000000c1",
+            "000000000000000000000000000000d1",
+            "000000000000000000000000000000e1",
+        ]
+        .map(|id| id.parse::<ServerId>().unwrap());
+        {
+            let mut members = ours.cluster.members();
+            for (id, name) in [
+                (attic, "attic"),
+                (bench, "bench"),
+                (cellar, "cellar"),
+                (twin, "raw"),
+            ] {
+                members.peers.insert(id, peer_named(name));
+            }
+            let hidden = Origin::Discovered {
+                name: "hall".into(),
+                via: Via::Lan,
+            };
+            let targets = [
+                (
+                    "ssh:bench",
+                    target(gossiped("bench"), Some(bench), true, Some(future.clone())),
+                ),
+                (
+                    "exec:cellar",
+                    target(
+                        gossiped("cellar"),
+                        Some(cellar),
+                        false,
+                        Some(future.clone()),
+                    ),
+                ),
+                (
+                    "ssh:cellar",
+                    target(gossiped("cellar"), Some(cellar), true, None),
+                ),
+                ("ssh:den", target(gossiped("den"), None, false, None)),
+                (
+                    "ssh:eaves",
+                    target(gossiped("eaves"), None, false, Some(future.clone())),
+                ),
+                ("ssh:gone", target(gossiped("gone"), Some(gone), true, None)),
+                ("lan:hall", target(hidden, None, false, None)),
+                (
+                    "ssh:here",
+                    Target {
+                        is_self: true,
+                        ..target(gossiped("here"), None, true, None)
+                    },
+                ),
+            ];
+            for (address, target) in targets {
+                members.targets.insert(address.to_owned(), target);
+            }
+        }
+        let matches_the_view = || {
+            let servers = ours.cluster.view();
+            for host in ["raw", "attic", "bench", "den", "eaves", "nowhere"] {
+                assert_eq!(
+                    ours.cluster.status_summary(host),
+                    summary_from_view(&servers, host),
+                    "{host}"
+                );
+            }
+            servers
+        };
+
+        let servers = matches_the_view();
+        measure(&link, Duration::from_micros(12_345));
+        matches_the_view();
+
+        let kinds: Vec<(&str, &str)> = servers
+            .iter()
+            .map(|server| (server.name.as_str(), kind(&server.status)))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("attic", "offline"),
+                ("bench", "incompatible"),
+                ("cellar", "offline"),
+                ("den", "offline"),
+                ("eaves", "incompatible"),
+                ("gone", "offline"),
+                ("raw", "online"),
+                ("raw", "offline"),
+            ]
+        );
+        assert_eq!(
+            ours.cluster.status_summary("raw"),
+            StatusSummary {
+                latency: Some(Duration::from_millis(12)),
+                offline: ["attic", "cellar", "den", "gone", "raw"]
+                    .map(String::from)
+                    .to_vec(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn two_pongs_within_the_same_millisecond_give_an_equal_status() {
+        let ours = node(LOWER, "ours").build();
+        let (_raw, link) = raw_peer(&ours, PIPE_CAPACITY).await;
+
+        measure(&link, Duration::from_micros(12_100));
+        let first = ours.cluster.status_summary("raw");
+        measure(&link, Duration::from_micros(12_900));
+        let second = ours.cluster.status_summary("raw");
+        measure(&link, Duration::from_micros(13_000));
+        let third = ours.cluster.status_summary("raw");
+
+        assert_eq!(first, second);
+        assert_eq!(first.latency, Some(Duration::from_millis(12)));
+        assert_eq!(third.latency, Some(Duration::from_millis(13)));
+    }
+
+    #[tokio::test]
+    async fn the_writer_sends_control_then_channel_input_then_bulk_messages() {
+        let (control, control_lane) = mpsc::channel(CONTROL_CAPACITY);
+        let (interactive, interactive_lane) = mpsc::channel(INTERACTIVE_CAPACITY);
+        let (bulk, bulk_lane) = mpsc::channel(BULK_CAPACITY);
+        let (_finish, finishing) = watch::channel(false);
+        let id = ChannelId(1);
+        let frame = |index: u8| PeerMessage::ChannelToClient {
+            id,
+            message: ServerMessage::Output(vec![index]),
+        };
+        let input = |index: u8| PeerMessage::ChannelToHost {
+            id,
+            message: ClientMessage::Input(vec![index]),
+        };
+        let credit = |index: u8| PeerMessage::ChannelCredit {
+            id,
+            credit: u32::from(index),
+        };
+        for index in 0..3 {
+            bulk.send(frame(index)).await.unwrap();
+            interactive.send(input(index)).await.unwrap();
+            control.send(credit(index)).await.unwrap();
+        }
+        drop((control, interactive, bulk));
+
+        let mut written = Vec::new();
+        let outbound = Outbound {
+            control: control_lane,
+            interactive: interactive_lane,
+            bulk: bulk_lane,
+        };
+        let end = write_lanes(&mut written, outbound, finishing).await;
+
+        assert!(matches!(end, LinkEnd::ServerGone), "{end}");
+        let mut frames = written.as_slice();
+        let mut sent = Vec::new();
+        while let Some(message) = read_message::<_, PeerMessage>(&mut frames).await.unwrap() {
+            sent.push(message);
+        }
+        let expected: Vec<PeerMessage> = (0..3)
+            .map(credit)
+            .chain((0..3).map(input))
+            .chain((0..3).map(frame))
+            .collect();
+        assert_eq!(sent, expected);
+    }
+
     #[tokio::test]
     async fn a_silent_peer_is_dropped_after_the_missed_pings() {
         let settings = ClusterSettings {
@@ -1529,6 +1798,38 @@ mod tests {
         host.outgoing.send(output(window + 1)).await.unwrap();
         channel.delivered();
         assert_eq!(from_host(&mut channel).await, Some(output(window + 1)));
+    }
+
+    #[tokio::test]
+    async fn the_host_stops_at_its_byte_budget_before_its_message_window() {
+        let lower = node(LOWER, "low").build();
+        let higher = node(HIGHER, "high").build();
+        let _runs = running(&lower, &higher).await;
+        let mut channel = open(&lower, &higher, ClientMessage::ListSessions).await;
+        let host = higher.next_hosted().await;
+
+        let half_budget = |index: u8| ServerMessage::Output(vec![index; CREDIT_BYTES / 2]);
+        for index in 0..2 {
+            host.outgoing.send(half_budget(index)).await.unwrap();
+        }
+        for index in 0..2 {
+            assert_eq!(from_host(&mut channel).await, Some(half_budget(index)));
+        }
+        host.outgoing.send(half_budget(2)).await.unwrap();
+        assert!(
+            host.outgoing.try_send(half_budget(3)).is_err(),
+            "the host rendered past its byte budget"
+        );
+
+        channel.delivered();
+        assert_eq!(from_host(&mut channel).await, Some(half_budget(2)));
+        host.outgoing.send(half_budget(3)).await.unwrap();
+        assert!(
+            host.outgoing.try_send(half_budget(4)).is_err(),
+            "the host rendered past its byte budget"
+        );
+        channel.delivered();
+        assert_eq!(from_host(&mut channel).await, Some(half_budget(3)));
     }
 
     #[tokio::test]

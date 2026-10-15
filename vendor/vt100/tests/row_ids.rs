@@ -128,3 +128,55 @@ fn erasing_and_moving_the_cursor_keep_ids() {
     parser.process(b"\x1b[2J\x1b[H\x1b[2K\x1b[3;1Hx");
     assert_eq!(ids(&parser), before);
 }
+
+fn scrolled(
+    before: &[u64],
+    region: std::ops::RangeInclusive<usize>,
+    count: usize,
+    up: bool,
+) -> Vec<Option<u64>> {
+    let mut expected: Vec<Option<u64>> =
+        before.iter().copied().map(Some).collect();
+    let rows = &mut expected[region];
+    let count = count.min(rows.len());
+    if up {
+        rows.rotate_left(count);
+        let kept = rows.len() - count;
+        rows[kept..].fill(None);
+    } else {
+        rows.rotate_right(count);
+        rows[..count].fill(None);
+    }
+    expected
+}
+
+#[test]
+fn scrolling_a_region_moves_only_the_ids_inside_it() {
+    for (top, bottom) in [(0, 2), (1, 3), (2, 5), (0, 5)] {
+        for count in 1..=4 {
+            for (code, up) in [('S', true), ('T', false)] {
+                let mut parser =
+                    parser(6, &format!("\x1b[{};{}r", top + 1, bottom + 1));
+                let before = ids(&parser);
+                parser.process(format!("\x1b[{count}{code}").as_bytes());
+                let after = ids(&parser);
+                let expected = scrolled(&before, top..=bottom, count, up);
+                let case = format!("{count}{code} in {top}..={bottom}");
+                let fresh: Vec<u64> = after
+                    .iter()
+                    .zip(&expected)
+                    .filter(|(_, expected)| expected.is_none())
+                    .map(|(&id, _)| id)
+                    .collect();
+                assert_fresh(&fresh, &before);
+                for (row, (id, expected)) in
+                    after.iter().zip(&expected).enumerate()
+                {
+                    if let Some(expected) = expected {
+                        assert_eq!(id, expected, "{case}: row {row}");
+                    }
+                }
+            }
+        }
+    }
+}

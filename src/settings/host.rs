@@ -31,7 +31,7 @@ impl Default for PaneSettings {
         Self {
             shell: None,
             term: "screen-256color".into(),
-            scrollback: 10_000,
+            scrollback: 2_000,
             env: BTreeMap::new(),
             strip_env: vec!["SSH_".into()],
             images: true,
@@ -54,6 +54,7 @@ pub struct SessionSettings {
     pub clash_format: String,
     pub clash_start: usize,
     pub activity_interval_ms: u64,
+    pub frame_interval_ms: u64,
 }
 
 impl SessionSettings {
@@ -73,6 +74,10 @@ impl SessionSettings {
     pub fn activity_interval(&self) -> Duration {
         Duration::from_millis(self.activity_interval_ms)
     }
+
+    pub fn frame_interval(&self) -> Duration {
+        Duration::from_millis(self.frame_interval_ms)
+    }
 }
 
 impl Default for SessionSettings {
@@ -82,6 +87,7 @@ impl Default for SessionSettings {
             clash_format: "{base}-{n}".into(),
             clash_start: 2,
             activity_interval_ms: 5000,
+            frame_interval_ms: 8,
         }
     }
 }
@@ -124,6 +130,8 @@ impl Default for BorderSettings {
 #[serde(default, deny_unknown_fields)]
 pub struct MouseSettings {
     pub escape_time_ms: u64,
+    pub scroll: bool,
+    pub scroll_lines: u16,
 }
 
 impl MouseSettings {
@@ -134,7 +142,11 @@ impl MouseSettings {
 
 impl Default for MouseSettings {
     fn default() -> Self {
-        Self { escape_time_ms: 25 }
+        Self {
+            escape_time_ms: 25,
+            scroll: true,
+            scroll_lines: 3,
+        }
     }
 }
 
@@ -273,6 +285,10 @@ mod tests {
         assert_eq!(
             SessionSettings::default().activity_interval(),
             Duration::from_secs(5)
+        );
+        assert_eq!(
+            SessionSettings::default().frame_interval(),
+            Duration::from_millis(8)
         );
         assert_eq!(
             MouseSettings::default().escape_time(),

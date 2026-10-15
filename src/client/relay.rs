@@ -13,6 +13,7 @@ use super::chrome::{
     detach_hint, draw_row, render_reconnecting, Panel, PanelEvent, Picker, Placement, Prompt,
     PromptPurpose, Rect, StatusLine, StatusSides, Style, WhichKey, WindowTab,
 };
+use super::clipboard::{self, ClipboardCommand};
 use super::graphics::{KittyWriter, TerminalProbe};
 use super::router::{self, Action, KeyRouter, Level};
 use super::scripting::{ClientContext, Effect, Scripting, StatusContext};
@@ -82,6 +83,7 @@ pub struct Relay {
     jobs: Vec<(JobId, Job)>,
     next_job: u64,
     panel_job: Option<JobId>,
+    clipboard_commands: Vec<ClipboardCommand>,
     chrome_dirty: bool,
     end: Option<Result<Outcome, String>>,
 }
@@ -127,6 +129,7 @@ impl Relay {
             jobs: Vec::new(),
             next_job: 0,
             panel_job: None,
+            clipboard_commands: Vec::new(),
             chrome_dirty: true,
             end: None,
         }
@@ -145,6 +148,7 @@ impl Relay {
         match message {
             Some(ServerMessage::Output(bytes)) => self.host_output(&bytes),
             Some(ServerMessage::Image(op)) => self.kitty.write(op, &mut self.output),
+            Some(ServerMessage::Clipboard(text)) => self.copy(text),
             Some(ServerMessage::Attached(attached)) => self.attached_to(attached),
             Some(ServerMessage::SessionState(state)) => {
                 self.session = Some(state);
@@ -294,6 +298,14 @@ impl Relay {
             Found::Opened(Ok(opening)) => self.open_session(opening),
             Found::Opened(Err(error)) => self.notify(error),
         }
+    }
+
+    pub fn take_clipboard_commands(&mut self) -> Vec<ClipboardCommand> {
+        mem::take(&mut self.clipboard_commands)
+    }
+
+    pub fn clipboard_failed(&mut self, error: String) {
+        self.notify(error);
     }
 
     pub fn has_ended(&self) -> bool {
@@ -492,7 +504,18 @@ impl Relay {
             return;
         }
         self.output.extend_from_slice(bytes);
-        self.chrome_dirty = true;
+        self.chrome_dirty |= self.overlays_session();
+    }
+
+    fn copy(&mut self, text: String) {
+        let settings = &self.settings.clipboard;
+        if settings.osc52 {
+            clipboard::write_osc52(&text, &mut self.output);
+        }
+        if let Some(argv) = settings.command.clone() {
+            self.clipboard_commands
+                .push(ClipboardCommand { argv, text });
+        }
     }
 
     fn attached_to(&mut self, attached: AttachedSession) {
@@ -770,17 +793,28 @@ impl Relay {
         }
     }
 
+    fn overlays_session(&self) -> bool {
+        self.which_key.is_some()
+            || self.reconnecting.is_some()
+            || self.panel.is_some()
+            || self.borrows_last_row()
+    }
+
     fn which_key_area(&self) -> Rect {
         let mut area = self.above_status();
-        let borrows_last_row = self.notice.is_some()
+        if self.borrows_last_row() {
+            area.rows = area.rows.saturating_sub(1);
+        }
+        area
+    }
+
+    fn borrows_last_row(&self) -> bool {
+        let shown_on_last_row = self.notice.is_some()
             || self
                 .panel
                 .as_ref()
                 .is_some_and(|panel| panel.placement() == Some(Placement::StatusRow));
-        if !self.settings.status.enabled && borrows_last_row {
-            area.rows = area.rows.saturating_sub(1);
-        }
-        area
+        !self.settings.status.enabled && shown_on_last_row
     }
 
     fn above_status(&self) -> Rect {
@@ -916,6 +950,7 @@ pub async fn run(
     let config_paths = super::config_paths(endpoint)?;
     let mut config_watch = Watch::new(&config_paths);
     let mut next_check = Instant::now() + relay.reload_settings().interval();
+    let (clipboard_failed, mut clipboard_failures) = mpsc::channel(8);
 
     loop {
         let mut output = relay.take_output();
@@ -956,6 +991,14 @@ pub async fn run(
                 }
             });
         }
+        for command in relay.take_clipboard_commands() {
+            let failed = clipboard_failed.clone();
+            tokio::spawn(async move {
+                if let Err(error) = command.run().await {
+                    let _ = failed.send(error).await;
+                }
+            });
+        }
 
         let escape = relay.escape_deadline();
         let which_key = relay.which_key_deadline();
@@ -989,6 +1032,7 @@ pub async fn run(
             }
             Some(reply) = reloads.recv() => relay.server_reloaded(reply),
             Some((id, found)) = finished_jobs.recv() => relay.job_done(id, found),
+            Some(error) = clipboard_failures.recv() => relay.clipboard_failed(error),
             () = sleep_until(escape.unwrap_or_else(Instant::now)), if escape.is_some() => {
                 relay.escape_timeout();
             }
@@ -1044,7 +1088,7 @@ mod tests {
         Direction, ImageFormat, ImageOp, ProjectCheckout, ProjectRef, ServerStatus, SessionCommand,
         SessionId, SessionInfo, WindowSummary,
     };
-    use crate::settings::{Binding, Color, StyleSpec, PREFIX_TABLE};
+    use crate::settings::{Binding, ClipboardSettings, Color, StyleSpec, PREFIX_TABLE};
 
     const SIZE: Size = Size { rows: 10, cols: 40 };
     const BOTTOM: u16 = SIZE.rows - 1;
@@ -1143,6 +1187,19 @@ mod tests {
         assert_eq!(row_text(&parser, 0), "hello");
         assert_eq!(parser.screen().cursor_position(), (0, 5));
         assert_eq!(relay.label(), "work");
+    }
+
+    #[test]
+    fn host_output_alone_writes_only_the_host_bytes() {
+        let (mut relay, mut parser) = relay_on("laptop");
+        relay.server_message(Some(state("work", 1)));
+        relay.server_message(Some(ServerMessage::Error("boom".into())));
+        assert_eq!(bottom(&mut relay, &mut parser), "boom");
+
+        let output = b"\x1b[1;1Hhello".to_vec();
+        relay.server_message(Some(ServerMessage::Output(output.clone())));
+        relay.server_message(Some(ServerMessage::Output(output.clone())));
+        assert_eq!(relay.take_output(), [output.clone(), output].concat());
     }
 
     #[test]
@@ -1639,6 +1696,92 @@ mod tests {
         assert_eq!(relay.clear_images(), b"");
     }
 
+    fn copying(osc52: bool, command: Option<&[&str]>) -> Relay {
+        let mut relay = relay_with(
+            Settings {
+                clipboard: ClipboardSettings {
+                    osc52,
+                    command: command.map(|argv| argv.iter().map(|&arg| arg.into()).collect()),
+                },
+                ..Settings::default()
+            },
+            Keymap::default(),
+        );
+        relay.take_output();
+        relay
+    }
+
+    #[test]
+    fn copied_text_reaches_the_terminal_clipboard_as_osc_52() {
+        let mut relay = copying(true, None);
+        relay.server_message(Some(ServerMessage::Clipboard("naïve 日本\n".into())));
+        assert_eq!(relay.take_output(), b"\x1b]52;c;bmHDr3ZlIOaXpeacrAo=\x07");
+        assert_eq!(relay.take_clipboard_commands(), vec![]);
+        assert_eq!(relay.take_messages(), vec![]);
+    }
+
+    #[test]
+    fn copied_text_reaches_the_clipboard_while_a_panel_hides_the_session() {
+        let mut relay = copying(true, None);
+        relay.input(b"\x02ss");
+        relay.server_message(Some(cluster()));
+        relay.take_output();
+
+        relay.server_message(Some(ServerMessage::Output(b"hidden".to_vec())));
+        relay.server_message(Some(ServerMessage::Clipboard("hi".into())));
+        assert_eq!(relay.take_output(), b"\x1b]52;c;aGk=\x07");
+    }
+
+    #[test]
+    fn copied_text_skips_osc_52_when_it_is_off() {
+        let mut relay = copying(false, None);
+        relay.server_message(Some(ServerMessage::Clipboard("hi".into())));
+        assert_eq!(relay.take_output(), b"");
+        assert_eq!(relay.take_clipboard_commands(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn the_clipboard_command_gets_the_copied_text_on_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        let copied = dir.path().join("copied");
+        let script = ["sh", "-c", "cat > \"$1\"", "sh", copied.to_str().unwrap()];
+        let mut relay = copying(false, Some(&script));
+        relay.server_message(Some(ServerMessage::Clipboard("naïve 日本\n".into())));
+        assert_eq!(relay.take_output(), b"");
+
+        let [command] = <[_; 1]>::try_from(relay.take_clipboard_commands()).unwrap();
+        command.run().await.unwrap();
+        assert_eq!(std::fs::read_to_string(&copied).unwrap(), "naïve 日本\n");
+        assert_eq!(relay.take_clipboard_commands(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn a_clipboard_command_that_fails_shows_a_notice() {
+        let mut parser = terminal(SIZE.rows, SIZE.cols);
+        let mut relay = copying(true, Some(&["sh", "-c", "exit 3"]));
+        relay.server_message(Some(ServerMessage::Clipboard("hi".into())));
+        assert_eq!(relay.take_output(), b"\x1b]52;c;aGk=\x07");
+
+        let [command] = <[_; 1]>::try_from(relay.take_clipboard_commands()).unwrap();
+        let error = command.run().await.unwrap_err();
+        assert_eq!(error, "the clipboard command sh failed: exit status: 3");
+        relay.clipboard_failed(error);
+        assert_eq!(
+            bottom(&mut relay, &mut parser),
+            "the clipboard command sh failed: exit s…"
+        );
+
+        let missing = ClipboardCommand {
+            argv: vec!["/nonexistent/amux-copy".into()],
+            text: "hi".into(),
+        };
+        let error = missing.run().await.unwrap_err();
+        assert!(
+            error.starts_with("could not run the clipboard command /nonexistent/amux-copy: "),
+            "{error}"
+        );
+    }
+
     fn relay_with(settings: Settings, keymap: Keymap) -> Relay {
         Relay::new(
             "laptop".into(),
@@ -1886,6 +2029,42 @@ mod tests {
         assert!(relay.take_output().is_empty());
     }
 
+    fn without_the_status_bar() -> (Relay, vt100::Parser) {
+        let mut settings = Settings::default();
+        settings.status.enabled = false;
+        (
+            relay_with(settings, Keymap::default()),
+            terminal(SIZE.rows, SIZE.cols),
+        )
+    }
+
+    fn output_on_the_last_row() -> ServerMessage {
+        ServerMessage::Output(format!("\x1b[{};1Hbottom\x1b[1;1H", SIZE.rows).into_bytes())
+    }
+
+    #[test]
+    fn a_notice_on_the_borrowed_last_row_is_drawn_again_over_host_output() {
+        let (mut relay, mut parser) = without_the_status_bar();
+        relay.server_message(Some(ServerMessage::Error("boom".into())));
+        assert_eq!(bottom(&mut relay, &mut parser), "boom");
+
+        relay.server_message(Some(output_on_the_last_row()));
+        assert_eq!(bottom(&mut relay, &mut parser), "boom");
+        assert_eq!(parser.screen().cursor_position(), (0, 0));
+    }
+
+    #[test]
+    fn a_prompt_on_the_borrowed_last_row_is_drawn_again_over_host_output() {
+        let (mut relay, mut parser) = without_the_status_bar();
+        relay.server_message(Some(state("work", 1)));
+        relay.input(b"\x02,");
+        assert_eq!(bottom(&mut relay, &mut parser), "rename window: vim");
+
+        relay.server_message(Some(output_on_the_last_row()));
+        assert_eq!(bottom(&mut relay, &mut parser), "rename window: vim");
+        assert_eq!(parser.screen().cursor_position(), (BOTTOM, 18));
+    }
+
     #[test]
     fn the_reload_notice_names_what_did_not_reload() {
         assert_eq!(reload_notice(Ok(()), Ok(None)), "config reloaded");
@@ -2075,7 +2254,7 @@ mod tests {
         relay.input(b"\x1b[5~\x1b[5~");
         let screen = rows(&mut relay, &mut parser);
         assert_eq!(screen[0], rule(4));
-        assert_eq!(screen[1], " Up    → pane up");
+        assert_eq!(screen[1], " [     → copy mode");
         assert_eq!(relay.take_messages(), vec![]);
 
         relay.input(b"d");

@@ -11,8 +11,8 @@ mod tests {
     use crate::lua::opt::{shape, Shape};
     use crate::lua::runtime::{load_init, Process};
     use crate::settings::{
-        Binding, KeyTable, KeyboardLayer, PickerAction, ProjectConfig, PromptAction, ServerConfig,
-        Settings, TreeAction,
+        Binding, CopyAction, KeyTable, KeyboardLayer, PickerAction, ProjectConfig, PromptAction,
+        ServerConfig, Settings, TreeAction,
     };
 
     #[derive(Default)]
@@ -177,6 +177,10 @@ mod tests {
         assert_eq!(
             stubs.alias("amux.PickerAction"),
             set(variants::<PickerAction>())
+        );
+        assert_eq!(
+            stubs.alias("amux.CopyAction"),
+            set(variants::<CopyAction>())
         );
     }
 

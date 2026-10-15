@@ -1,6 +1,7 @@
 use super::draw::{self, Rect, Span, Style};
 use super::panel::{Panel, PanelEvent, Placement};
-use crate::keys::{Decoded, Key, KeyDecoder};
+use crate::keys::{Decoded, KeyDecoder};
+use crate::line_editor::{Finish, LineEditor};
 use crate::protocol::{ClientMessage, SessionCommand};
 use crate::settings::{CallbackId, PromptAction, Table, Theme};
 use crate::target::Target;
@@ -35,8 +36,7 @@ impl PromptPurpose {
 pub struct Prompt {
     purpose: PromptPurpose,
     label: String,
-    text: Vec<char>,
-    cursor: usize,
+    line: LineEditor,
     keys: KeyDecoder,
     bindings: Table<PromptAction>,
     style: Style,
@@ -51,15 +51,10 @@ impl Prompt {
         bindings: Table<PromptAction>,
         theme: &Theme,
     ) -> Self {
-        let text: Vec<char> = initial
-            .chars()
-            .filter(|character| !character.is_control())
-            .collect();
         Self {
             purpose,
             label: label.into(),
-            cursor: text.len(),
-            text,
+            line: LineEditor::new(initial),
             keys: KeyDecoder::default(),
             bindings,
             style: theme.prompt.into(),
@@ -67,77 +62,11 @@ impl Prompt {
         }
     }
 
-    pub fn text(&self) -> String {
-        self.text.iter().collect()
-    }
-
-    fn visible_text(&self, columns: usize) -> (String, usize) {
-        let widths: Vec<usize> = self
-            .text
-            .iter()
-            .map(|&character| draw::char_width(character))
-            .collect();
-        let mut start = self.cursor;
-        let mut cursor_column = 0;
-        while start > 0 && cursor_column + widths[start - 1] < columns {
-            start -= 1;
-            cursor_column += widths[start];
-        }
-
-        let mut visible = String::new();
-        let mut used = 0;
-        for (&character, &width) in self.text[start..].iter().zip(&widths[start..]) {
-            if used + width > columns {
-                break;
-            }
-            visible.push(character);
-            used += width;
-        }
-        (visible, cursor_column)
-    }
-
     fn press(&mut self, decoded: &Decoded, attached: &Target) -> Option<PanelEvent> {
-        self.bindings
-            .resolve(decoded)
-            .into_iter()
-            .find_map(|(key, action)| self.apply(key, action, attached))
-    }
-
-    fn apply(
-        &mut self,
-        key: Key,
-        action: Option<PromptAction>,
-        attached: &Target,
-    ) -> Option<PanelEvent> {
-        match action {
-            Some(PromptAction::Submit) => return Some(self.purpose.submit(self.text(), attached)),
-            Some(PromptAction::Cancel) => return Some(PanelEvent::Cancel),
-            Some(PromptAction::DeleteBackward) if self.cursor > 0 => {
-                self.cursor -= 1;
-                self.text.remove(self.cursor);
-            }
-            Some(PromptAction::DeleteForward) if self.cursor < self.text.len() => {
-                self.text.remove(self.cursor);
-            }
-            Some(PromptAction::DeleteLine) => {
-                self.text.clear();
-                self.cursor = 0;
-            }
-            Some(PromptAction::CursorLeft) => self.cursor = self.cursor.saturating_sub(1),
-            Some(PromptAction::CursorRight) => {
-                self.cursor = (self.cursor + 1).min(self.text.len());
-            }
-            Some(PromptAction::CursorStart) => self.cursor = 0,
-            Some(PromptAction::CursorEnd) => self.cursor = self.text.len(),
-            None => {
-                if let Some(character) = key.printable() {
-                    self.text.insert(self.cursor, character);
-                    self.cursor += 1;
-                }
-            }
-            _ => {}
+        match self.line.press(decoded, &self.bindings)? {
+            Finish::Submit => Some(self.purpose.submit(self.line.text(), attached)),
+            Finish::Cancel => Some(PanelEvent::Cancel),
         }
-        None
     }
 }
 
@@ -178,7 +107,7 @@ impl Panel for Prompt {
         };
         let label = draw::truncate(&label, label_budget);
         let label_width = draw::width(&label);
-        let (visible, cursor_column) = self.visible_text(columns - label_width);
+        let (visible, cursor_column) = self.line.visible(columns - label_width, draw::char_width);
 
         let (row, col) = (usize::from(area.row), usize::from(area.col));
         let spans = [
@@ -257,8 +186,8 @@ mod tests {
     #[test]
     fn the_initial_text_is_edited_at_its_end() {
         let prompt = edited("sh", &[b"ell"]);
-        assert_eq!(prompt.text(), "shell");
-        assert_eq!(prompt.cursor, 5);
+        assert_eq!(prompt.line.text(), "shell");
+        assert_eq!(prompt.line.cursor(), 5);
     }
 
     #[test]
@@ -278,7 +207,7 @@ mod tests {
         for (chunks, text, cursor) in cases {
             let prompt = edited("abcd", chunks);
             assert_eq!(
-                (prompt.text().as_str(), prompt.cursor),
+                (prompt.line.text().as_str(), prompt.line.cursor()),
                 (text, cursor),
                 "{chunks:?}"
             );
@@ -323,16 +252,22 @@ mod tests {
     #[test]
     fn escape_sequences_split_across_chunks_still_edit() {
         let prompt = edited("abc", &[b"\x1b[", b"D", b"X"]);
-        assert_eq!((prompt.text().as_str(), prompt.cursor), ("abXc", 3));
+        assert_eq!(
+            (prompt.line.text().as_str(), prompt.line.cursor()),
+            ("abXc", 3)
+        );
 
         let prompt = edited("abc", &[b"\x1b", b"[H", b"X"]);
-        assert_eq!((prompt.text().as_str(), prompt.cursor), ("Xabc", 1));
+        assert_eq!(
+            (prompt.line.text().as_str(), prompt.line.cursor()),
+            ("Xabc", 1)
+        );
 
         let prompt = edited("abc", &[b"\x1b[1", b";5", b"D"]);
-        assert_eq!(prompt.cursor, 2);
+        assert_eq!(prompt.line.cursor(), 2);
 
         let prompt = edited("", &[&[0xc3], &[0xa9], &[0xe6, 0x97], &[0xa5]]);
-        assert_eq!(prompt.text(), "é日");
+        assert_eq!(prompt.line.text(), "é日");
     }
 
     #[test]
@@ -351,8 +286,11 @@ mod tests {
     #[test]
     fn unknown_keys_do_not_change_the_text() {
         let prompt = edited("sh", &[b"\x1b[15~\x1b[<0;3;4M\t\x1b[A\x02"]);
-        assert_eq!((prompt.text().as_str(), prompt.cursor), ("sh", 2));
-        assert_eq!(new_prompt("name", "a\x1bb").text(), "ab");
+        assert_eq!(
+            (prompt.line.text().as_str(), prompt.line.cursor()),
+            ("sh", 2)
+        );
+        assert_eq!(new_prompt("name", "a\x1bb").line.text(), "ab");
     }
 
     #[test]

@@ -1,10 +1,9 @@
-// Modified by amux: kitty graphics commands, XTVERSION and an image store
+// Modified by amux: kitty graphics commands, XTVERSION, an image store, and OSC strings long enough for a 1 MiB OSC 52 copy, with longer ones dropped whole
 package com.termux.terminal;
-
-import android.util.Base64;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Stack;
@@ -93,7 +92,9 @@ public final class TerminalEmulator {
     private static final int MAX_ESCAPE_PARAMETERS = 32;
 
     /** Needs to be large enough to contain reasonable OSC 52 pastes. */
-    private static final int MAX_OSC_STRING_LENGTH = 8192;
+    private static final int MAX_OSC_STRING_LENGTH = 1536 * 1024;
+
+    private static final int MAX_DEVICE_CONTROL_STRING_LENGTH = 8192;
 
     /** DECSET 1 - application cursor keys. */
     private static final int DECSET_BIT_APPLICATION_CURSOR_KEYS = 1;
@@ -192,6 +193,8 @@ public final class TerminalEmulator {
 
     /** Holds OSC and device control arguments, which can be strings. */
     private final StringBuilder mOSCOrDeviceControlArgs = new StringBuilder();
+
+    private boolean mOSCTooLong;
 
     /**
      * True if the current escape sequence should continue, false if the current escape sequence should be terminated.
@@ -1041,7 +1044,7 @@ public final class TerminalEmulator {
             }
             break;
             default:
-                if (mOSCOrDeviceControlArgs.length() > MAX_OSC_STRING_LENGTH) {
+                if (mOSCOrDeviceControlArgs.length() > MAX_DEVICE_CONTROL_STRING_LENGTH) {
                     // Too long.
                     mOSCOrDeviceControlArgs.setLength(0);
                     finishSequence();
@@ -1508,6 +1511,7 @@ public final class TerminalEmulator {
                 break;
             case ']': // OSC
                 mOSCOrDeviceControlArgs.setLength(0);
+                mOSCTooLong = false;
                 continueSequence(ESC_OSC);
                 break;
             case '>': // DECKPNM
@@ -2038,6 +2042,12 @@ public final class TerminalEmulator {
 
     /** An Operating System Controls (OSC) Set Text Parameters. May come here from BEL or ST. */
     private void doOscSetTextParameters(String bellOrStringTerminator) {
+        if (mOSCTooLong) {
+            mOSCTooLong = false;
+            finishSequence();
+            return;
+        }
+
         int value = -1;
         String textParameter = "";
         // Extract initial $value from initial "$value;..." string.
@@ -2133,7 +2143,7 @@ public final class TerminalEmulator {
             case 52: // Manipulate Selection Data. Skip the optional first selection parameter(s).
                 int startIndex = textParameter.indexOf(";") + 1;
                 try {
-                    String clipboardText = new String(Base64.decode(textParameter.substring(startIndex), 0), StandardCharsets.UTF_8);
+                    String clipboardText = new String(Base64.getMimeDecoder().decode(textParameter.substring(startIndex)), StandardCharsets.UTF_8);
                     mSession.onCopyTextToClipboard(clipboardText);
                 } catch (Exception e) {
                     Logger.logError(mClient, LOG_TAG, "OSC Manipulate selection, invalid string '" + textParameter + "");
@@ -2309,12 +2319,14 @@ public final class TerminalEmulator {
     }
 
     private void collectOSCArgs(int b) {
-        if (mOSCOrDeviceControlArgs.length() < MAX_OSC_STRING_LENGTH) {
+        if (mOSCOrDeviceControlArgs.length() >= MAX_OSC_STRING_LENGTH) {
+            mOSCOrDeviceControlArgs.setLength(0);
+            mOSCOrDeviceControlArgs.trimToSize();
+            mOSCTooLong = true;
+        } else if (!mOSCTooLong) {
             mOSCOrDeviceControlArgs.appendCodePoint(b);
-            continueSequence(mEscapeState);
-        } else {
-            unknownSequence(b);
         }
+        continueSequence(mEscapeState);
     }
 
     private void unimplementedSequence(int b) {

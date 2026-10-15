@@ -832,8 +832,8 @@ fn default_layers() -> BTreeMap<String, KeyboardLayer> {
             KeyRow::Keys(vec![
                 prefixed("$", "session"),
                 named("Hide"),
-                blank(),
-                blank(),
+                prefixed("[", "copy"),
+                prefixed("]", "paste"),
                 blank(),
             ]),
             KeyRow::Base,
@@ -1480,6 +1480,21 @@ mod tests {
                 label: Some("projects".into()),
                 ..KeyTable::default()
             })
+        );
+        assert_eq!(
+            keys_of(&half(&resolved.layers["amux"].right)[3])[2..4],
+            [
+                KeySlot::Table(KeyTable {
+                    send: Some("\u{2}[".into()),
+                    label: Some("copy".into()),
+                    ..KeyTable::default()
+                }),
+                KeySlot::Table(KeyTable {
+                    send: Some("\u{2}]".into()),
+                    label: Some("paste".into()),
+                    ..KeyTable::default()
+                }),
+            ]
         );
         let other = KeyboardSettings::default().resolved("M-a".parse().unwrap());
         assert_eq!(

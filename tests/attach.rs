@@ -1,6 +1,6 @@
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use amux::protocol::{ClientMessage, ClientTerminal, NewSession, ServerMessage, SessionCommand};
 use common::{
@@ -64,6 +64,52 @@ async fn input_is_handled_while_the_client_is_not_reading_output() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+#[tokio::test]
+async fn constant_output_is_paced() {
+    let server = TestServer::builder()
+        .config("amux.opt.session.frame_interval_ms = 50")
+        .start();
+    let mut client = server.client().await;
+    client.new_session(None).await;
+    client.type_text("seq 1000000000\r").await;
+    client
+        .wait_for_screen("a screen full of numbers", |screen| {
+            screen_row(screen, 0).trim().parse::<u64>().is_ok()
+        })
+        .await;
+
+    let watched = Instant::now();
+    let mut frames = 0;
+    while watched.elapsed() < Duration::from_secs(1) {
+        match client.recv().await {
+            Some(ServerMessage::Output(_)) => frames += 1,
+            Some(_) => {}
+            None => panic!("the server hung up while `seq` was running"),
+        }
+    }
+    assert!(frames <= 25, "{frames} frames in one second");
+}
+
+#[tokio::test]
+async fn a_keystroke_after_idle_is_not_paced() {
+    let server = TestServer::builder()
+        .config("amux.opt.session.frame_interval_ms = 500")
+        .start();
+    let mut client = server.client().await;
+    client.new_session(None).await;
+    client.wait_for_text("$").await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let typed = Instant::now();
+    client.type_text("z").await;
+    client.wait_for_text("$ z").await;
+    let echoed = typed.elapsed();
+    assert!(
+        echoed < Duration::from_millis(250),
+        "the echo took {echoed:?}"
+    );
 }
 
 #[tokio::test]

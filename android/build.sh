@@ -17,6 +17,7 @@ readonly release_apk=app/build/outputs/apk/release/app-release.apk
 readonly release_key_env=(AMUX_RELEASE_KEYSTORE AMUX_RELEASE_KEYSTORE_PASSWORD AMUX_RELEASE_KEY_ALIAS)
 readonly min_sdk=29
 readonly abis=(arm64-v8a x86_64)
+readonly release_abi=arm64-v8a
 
 readonly userland_dir=$android_dir/userland
 readonly userland_out=$cache_dir/userland
@@ -70,7 +71,7 @@ run_in_image() {
         "$@" \
         "$image" \
         bash -c "set -euo pipefail
-            $(declare -p jni_libs assets smoke_lib apk release_apk min_sdk abis userland_arches)
+            $(declare -p jni_libs assets smoke_lib apk release_apk min_sdk abis release_abi userland_arches)
             $(declare -f rust_target userland_abi describe_apk "$task")
             $task"
 }
@@ -88,12 +89,12 @@ cross_compile() {
     for abi in "${abis[@]}"; do
         targets+=(-t "$abi")
     done
-    cargo ndk --platform "$min_sdk" "${targets[@]}" build --release --locked --bin amux
+    cargo ndk --platform "$min_sdk" "${targets[@]}" build --profile dist --locked --bin amux
 
     local strip=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip
     for abi in "${abis[@]}"; do
         mkdir -p "$jni_libs/$abi"
-        "$strip" -o "$jni_libs/$abi/libamux.so" "$CARGO_TARGET_DIR/$(rust_target "$abi")/release/amux"
+        "$strip" -o "$jni_libs/$abi/libamux.so" "$CARGO_TARGET_DIR/$(rust_target "$abi")/dist/amux"
     done
     ls -l "$jni_libs"/*/libamux.so
 }
@@ -148,11 +149,12 @@ require_userland() {
 
 describe_apk() {
     local file=$1 abi
+    shift
     printf '\n$ ls -lh %s\n' "$file"
     ls -lh "$file"
     printf '\n$ unzip -l %s lib/*/libamux.so assets/userland/*\n' "$file"
     unzip -l "$file" 'lib/*/libamux.so' 'assets/userland/*'
-    for abi in "${abis[@]}"; do
+    for abi in "$@"; do
         printf '\n$ unzip -Z1 %s lib/%s/libu_*.so | wc -l\n' "$file" "$abi"
         unzip -Z1 "$file" "lib/$abi/libu_*.so" | wc -l
     done
@@ -163,13 +165,18 @@ describe_apk() {
 build_apk() {
     cd android
     ./gradlew --no-daemon assembleDebug testDebugUnitTest lintDebug
-    describe_apk "$apk"
+    describe_apk "$apk" "${abis[@]}"
 }
 
 build_release_apk() {
     cd android
-    ./gradlew --no-daemon assembleRelease testReleaseUnitTest lintRelease
-    describe_apk "$release_apk"
+    ./gradlew --no-daemon -Pamux.abis="$release_abi" assembleRelease testReleaseUnitTest lintRelease
+    describe_apk "$release_apk" "$release_abi"
+    printf '\n$ unzip -Z1 %s | grep x86_64\n' "$release_apk"
+    if unzip -Z1 "$release_apk" | grep x86_64; then
+        echo "$release_apk carries x86_64 files, the release is arm64-only" >&2
+        exit 1
+    fi
     printf '\n$ apksigner verify --print-certs %s\n' "$release_apk"
     apksigner verify --print-certs "$release_apk"
 }

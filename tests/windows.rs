@@ -94,6 +94,36 @@ async fn pane_sizes_follow_the_layout() {
 }
 
 #[tokio::test]
+async fn a_pane_narrowed_through_a_wide_character_prints_at_its_new_edge() {
+    let server = TestServer::start();
+    let mut client = session_with_prompt(&server, "s").await;
+    client
+        .type_text(
+            "printf '\\033[2J\\033[1;40H\\344\\270\\255'; read line; \
+             printf '\\033[1;40Hx\\033[3;1H'; echo edge-$((6*7))\r",
+        )
+        .await;
+    client
+        .wait_for_screen("a wide character across the split", |screen| {
+            screen
+                .cell(0, BORDER_COLUMN - 1)
+                .is_some_and(|cell| cell.contents() == "中")
+        })
+        .await;
+
+    split_left_right(&mut client).await;
+    client
+        .command(SessionCommand::SelectPane(Direction::Left))
+        .await;
+    client.type_text("\r").await;
+    wait_in(&mut client, LEFT, "edge-42").await;
+
+    let edge = client.screen().cell(0, BORDER_COLUMN - 1).unwrap();
+    assert_eq!(edge.contents(), "x");
+    server.wait_for_windows("s", &[window(0, 2)]).await;
+}
+
+#[tokio::test]
 async fn windows_are_created_cycled_and_selected_by_number() {
     let server = TestServer::start();
     let mut client = session_with_prompt(&server, "s").await;
@@ -265,21 +295,25 @@ fn kill_targets_a_pane_or_a_window() {
     });
 }
 
+async fn wait_for_mouse_mode(client: &mut TestClient, mode: MouseProtocolMode) {
+    client
+        .wait_for_screen(&format!("{mode:?} mouse reports in SGR"), |screen| {
+            screen.mouse_protocol_mode() == mode
+                && screen.mouse_protocol_encoding() == MouseProtocolEncoding::Sgr
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn a_click_focuses_a_pane_and_reaches_only_panes_that_asked_for_the_mouse() {
     let server = TestServer::start();
     let mut client = session_with_prompt(&server, "s").await;
+    wait_for_mouse_mode(&mut client, MouseProtocolMode::ButtonMotion).await;
+    split_left_right(&mut client).await;
     assert_eq!(
         client.screen().mouse_protocol_mode(),
-        MouseProtocolMode::None
+        MouseProtocolMode::ButtonMotion
     );
-    split_left_right(&mut client).await;
-    client
-        .wait_for_screen("click reporting in SGR", |screen| {
-            screen.mouse_protocol_mode() == MouseProtocolMode::PressRelease
-                && screen.mouse_protocol_encoding() == MouseProtocolEncoding::Sgr
-        })
-        .await;
 
     client
         .type_text("printf '\\033[?1000h'; echo mouse-$((6*7))\r")
@@ -293,6 +327,38 @@ async fn a_click_focuses_a_pane_and_reaches_only_panes_that_asked_for_the_mouse(
     wait_in(&mut client, LEFT, "focused-42").await;
     assert!(!client.contents().contains("^[[<"), "{}", client.contents());
     assert!(!region(client.screen(), LEFT).contains("^[["));
+}
+
+#[tokio::test]
+async fn without_scrolling_only_split_windows_and_copy_mode_report_clicks() {
+    let server = TestServer::builder()
+        .config("amux.opt.mouse.scroll = false")
+        .start();
+    let mut client = session_with_prompt(&server, "s").await;
+    assert_eq!(
+        client.screen().mouse_protocol_mode(),
+        MouseProtocolMode::None
+    );
+
+    client
+        .command(SessionCommand::CopyMode { page_up: false })
+        .await;
+    wait_for_mouse_mode(&mut client, MouseProtocolMode::PressRelease).await;
+    client.type_text("q").await;
+    client
+        .wait_for_screen("no mouse reports", |screen| {
+            screen.mouse_protocol_mode() == MouseProtocolMode::None
+        })
+        .await;
+
+    split_left_right(&mut client).await;
+    wait_for_mouse_mode(&mut client, MouseProtocolMode::PressRelease).await;
+    client.type_text("\x1b[<0;10;5M\x1b[<0;10;5m").await;
+    client.type_text("seq 1 50; echo seq-$((6*7))\r").await;
+    wait_in(&mut client, LEFT, "seq-42").await;
+    client.type_text("\x1b[<64;10;5M").await;
+    client.type_text("echo live-$((6*7))\r").await;
+    wait_in(&mut client, LEFT, "live-42").await;
 }
 
 #[tokio::test]

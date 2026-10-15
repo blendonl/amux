@@ -135,6 +135,19 @@ fn attaching_without_a_server_says_so() {
 }
 
 #[test]
+fn a_bridge_reading_from_dev_null_exits_cleanly() {
+    let server = TestServer::start();
+
+    let output = server.run(&["bridge"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn an_old_server_gets_the_kill_server_hint_and_kill_server_stops_it() {
     let server = TestServer::builder().prepare();
     let mut old_server = Command::new(std::env::current_exe().unwrap())

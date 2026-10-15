@@ -1,9 +1,11 @@
 use std::env;
+use std::os::fd::AsFd;
 use std::process::{self, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{self, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::unix::pipe;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
 use tracing::info;
@@ -23,6 +25,7 @@ const AMUX_LOCATIONS: [&str; 4] = [
     "/opt/homebrew/bin/amux",
 ];
 const NOT_INSTALLED_STATUS: u8 = 127;
+const BRIDGE_BUFFER_LEN: usize = 64 * 1024;
 
 pub fn command(
     ssh: &SshSettings,
@@ -154,18 +157,19 @@ pub async fn bridge(endpoint: &Endpoint, no_start: bool) -> Result<()> {
     } else {
         client::connect_or_start_server(endpoint).await?
     };
-    let (mut from_server, mut to_server) = stream.into_split();
+    let (from_server, to_server) = stream.into_split();
 
     let upstream = async move {
-        let copied = io::copy(&mut io::stdin(), &mut to_server).await;
-        let _ = to_server.shutdown().await;
-        copied
+        match stdin_pipe() {
+            Ok(stdin) => forward(stdin, to_server).await,
+            Err(_) => forward(io::stdin(), to_server).await,
+        }
     };
     let downstream = async move {
-        let mut stdout = io::stdout();
-        let copied = io::copy(&mut from_server, &mut stdout).await;
-        let _ = stdout.flush().await;
-        copied
+        match stdout_pipe() {
+            Ok(stdout) => forward(from_server, stdout).await,
+            Err(_) => forward(from_server, io::stdout()).await,
+        }
     };
 
     let ended = tokio::select! {
@@ -179,6 +183,26 @@ pub async fn bridge(endpoint: &Endpoint, no_start: bool) -> Result<()> {
             process::exit(1)
         }
     }
+}
+
+fn stdin_pipe() -> io::Result<pipe::Receiver> {
+    pipe::Receiver::from_owned_fd(std::io::stdin().as_fd().try_clone_to_owned()?)
+}
+
+fn stdout_pipe() -> io::Result<pipe::Sender> {
+    pipe::Sender::from_owned_fd(std::io::stdout().as_fd().try_clone_to_owned()?)
+}
+
+async fn forward<R, W>(reader: R, mut writer: W) -> io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut reader = BufReader::with_capacity(BRIDGE_BUFFER_LEN, reader);
+    let copied = io::copy_buf(&mut reader, &mut writer).await;
+    let _ = writer.flush().await;
+    let _ = writer.shutdown().await;
+    copied
 }
 
 #[cfg(test)]

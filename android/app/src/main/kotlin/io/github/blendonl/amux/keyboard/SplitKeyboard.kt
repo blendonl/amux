@@ -15,6 +15,20 @@ class SplitKeyboard(layout: KeyboardLayout, private val sink: KeySink, private v
         var cancel: () -> Unit = {}
     }
 
+    private class Shown(
+        val layout: KeyboardLayout,
+        val layers: List<String>,
+        val modifiers: List<Latch.Look>,
+        val layerLatches: Map<String, Latch.Look>,
+        val popup: Popup?,
+    ) {
+        fun sameAs(other: Shown): Boolean = layout === other.layout &&
+            layers == other.layers &&
+            modifiers == other.modifiers &&
+            layerLatches == other.layerLatches &&
+            popup === other.popup
+    }
+
     var layout: KeyboardLayout = layout
         set(value) {
             field = value
@@ -28,17 +42,20 @@ class SplitKeyboard(layout: KeyboardLayout, private val sink: KeySink, private v
     private val listeners = mutableListOf<() -> Unit>()
     private val down = mutableListOf<Down>()
     private var run: Run? = null
+    private var active: List<Layer> = emptyList()
 
     var popup: Popup? = null
         private set
+
+    private var shown = shownNow()
 
     val shifted: Boolean
         get() = modifiers.getValue(Modifier.SHIFT).active
 
     val activeLayer: Layer
-        get() = activeLayers().firstOrNull() ?: layout.base
+        get() = active.firstOrNull() ?: layout.base
 
-    fun rows(side: Side): KeyRows = activeLayers().firstNotNullOfOrNull { it.rows(side) } ?: layout.baseRows(side)
+    fun rows(side: Side): KeyRows = active.firstNotNullOfOrNull { it.rows(side) } ?: layout.baseRows(side)
 
     fun label(key: Key): String {
         val text = key.label(shifted)
@@ -232,6 +249,18 @@ class SplitKeyboard(layout: KeyboardLayout, private val sink: KeySink, private v
     }
 
     private fun changed() {
+        active = activeLayers()
+        val now = shownNow()
+        if (now.sameAs(shown)) return
+        shown = now
         listeners.forEach { it() }
     }
+
+    private fun shownNow() = Shown(
+        layout,
+        active.map(Layer::name),
+        modifiers.values.map(Latch::look),
+        layerLatches.mapValues { it.value.look },
+        popup,
+    )
 }

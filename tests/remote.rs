@@ -5,8 +5,8 @@ use amux::protocol::{
     ClientMessage, Direction, NewSession, ServerMessage, ServerView, SessionCommand, Size, Split,
 };
 use common::{
-    linked, screen_column, screen_region, terminal_log, window_summary as window, Listing, Resume,
-    TestClient, TestServer, DETACH, KITTY, PLAIN, SIZE,
+    linked, screen_column, screen_region, screen_row, terminal_log, window_summary as window,
+    Listing, Resume, TestClient, TestServer, DETACH, KITTY, PLAIN, SIZE,
 };
 use nix::sys::signal::{kill, Signal};
 
@@ -639,6 +639,39 @@ async fn window_and_pane_commands_drive_a_session_on_a_peer() {
 
     blocking(|| a.run_ok(&["kill", "-t", "s@b:0.0"]));
     blocking(|| a.wait_for_ls("s to end on b", |ls| ls.sessions("b").is_empty()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_yank_in_a_session_on_a_peer_reaches_the_local_client() {
+    let [a, _b] = pair();
+    let mut client = a.client().await;
+    let request = NewSession {
+        on: Some("b".into()),
+        ..client.session_request(Some("s"))
+    };
+    assert_eq!(client.create(request).await.server, "b");
+    client.wait_for_text("$").await;
+    client.type_text("echo remote-$((6*7)) done\r").await;
+    client.wait_for_text("remote-42 done").await;
+
+    client
+        .command(SessionCommand::CopyMode { page_up: false })
+        .await;
+    client
+        .wait_for_screen("copy mode on b", |screen| {
+            screen_row(screen, 0).ends_with(']')
+        })
+        .await;
+    client.type_text("k0vEy").await;
+    client
+        .wait_until("the yank from b", |client| !client.clipboard().is_empty())
+        .await;
+    assert_eq!(client.clipboard(), ["remote-42"]);
+    client
+        .wait_for_screen("the live pane on b", |screen| {
+            !screen_row(screen, 0).contains('[')
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

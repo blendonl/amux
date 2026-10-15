@@ -80,8 +80,14 @@
             "label": "session"
           },
           "Hide",
-          "",
-          "",
+          {
+            "send": "\u0002[",
+            "label": "copy"
+          },
+          {
+            "send": "\u0002]",
+            "label": "paste"
+          },
           ""
         ],
         [

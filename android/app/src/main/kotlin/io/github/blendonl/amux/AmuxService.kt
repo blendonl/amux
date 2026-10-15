@@ -32,6 +32,8 @@ class AmuxService : Service() {
     private lateinit var installer: UserlandInstaller
     private lateinit var notification: ServerNotification
     private lateinit var locks: ServiceLocks
+    private lateinit var multicast: MulticastNeed
+    private var lanPortWatch: FileWatch? = null
     private var supervisor: ServerSupervisor? = null
     private var preparer: Thread? = null
     private var preparing = false
@@ -48,12 +50,18 @@ class AmuxService : Service() {
     var userlandFailure: String? = null
         private set
 
+    var appVisible: Boolean
+        get() = multicast.appVisible
+        set(value) {
+            multicast.appVisible = value
+        }
+
     override fun onCreate() {
         super.onCreate()
         installer = userlandInstaller()
         notification = ServerNotification(this)
         locks = ServiceLocks(this)
-        locks.holdMulticast()
+        multicast = MulticastNeed { hold -> if (!destroyed) locks.holdMulticast(hold) }
     }
 
     override fun onBind(intent: Intent): IBinder = binder
@@ -76,6 +84,7 @@ class AmuxService : Service() {
 
     override fun onDestroy() {
         destroyed = true
+        lanPortWatch?.stop()
         supervisor?.requestStop()
         locks.releaseAll()
         observers.clear()
@@ -134,11 +143,18 @@ class AmuxService : Service() {
         when (prepared) {
             is Prepared.Failed -> update(ServerState.Failed(prepared.failure))
             is Prepared.Ready -> {
+                followLanPort(prepared.environment)
                 update(ServerState.Starting)
                 supervisor = ServerSupervisor(prepared.environment) { next -> mainThread.post { update(next) } }
                     .also { it.start() }
             }
         }
+    }
+
+    private fun followLanPort(amux: AmuxEnvironment) {
+        if (lanPortWatch != null) return
+        lanPortWatch = FileWatch(amux.lanPortFile) { mainThread.post(multicast::check) }.also(FileWatch::start)
+        multicast.follow(amux.lanPortFile)
     }
 
     private fun stopAmux() {

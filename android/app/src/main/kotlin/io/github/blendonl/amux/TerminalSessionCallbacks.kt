@@ -4,6 +4,8 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.os.SystemClock
+import android.os.TransactionTooLargeException
+import android.widget.Toast
 import com.termux.terminal.TerminalEmulator
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
@@ -24,7 +26,12 @@ class TerminalSessionCallbacks(
     override fun onSessionFinished(finishedSession: TerminalSession) = onFinished(finishedSession)
 
     override fun onCopyTextToClipboard(session: TerminalSession, text: String) {
-        clipboard.setPrimaryClip(ClipData.newPlainText(context.getString(R.string.app_name), text))
+        try {
+            clipboard.setPrimaryClip(ClipData.newPlainText(context.getString(R.string.app_name), text))
+        } catch (error: RuntimeException) {
+            if (error.cause !is TransactionTooLargeException) throw error
+            Toast.makeText(context, R.string.clipboard_too_large, Toast.LENGTH_SHORT).show()
+        }
     }
 
     override fun onPasteTextFromClipboard(session: TerminalSession) {

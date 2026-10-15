@@ -113,6 +113,22 @@ impl Default for WhichKeySettings {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClipboardSettings {
+    pub osc52: bool,
+    pub command: Option<Vec<String>>,
+}
+
+impl Default for ClipboardSettings {
+    fn default() -> Self {
+        Self {
+            osc52: true,
+            command: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ClientImages {

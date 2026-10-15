@@ -21,11 +21,14 @@ class AmuxEnvironment(
     val tmpDir = if (withUserland) userland.tmp else dirs.cache
     val binary = File(dirs.nativeLibraries, BINARY_NAME)
     val binaryLink = File(binDir, "amux")
-    val initFile = File(configHome, "amux/init.lua")
+    val configDir = File(configHome, "amux")
+    val initFile = File(configDir, "init.lua")
     val zshrc = File(home, ".zshrc")
     val runtimeDir = File(tmpDir, "amux-$uid")
     val socket = File(runtimeDir, "default")
     val serverLog = File(runtimeDir, "default.log")
+    val serverStateDir = File(stateHome, "amux/${socket.name}")
+    val lanPortFile = File(serverStateDir, "lan-port")
 
     val variables: Map<String, String> = buildMap {
         put("HOME", home.path)
@@ -58,6 +61,7 @@ class AmuxEnvironment(
         listOf(home, configHome, stateHome).forEach { Files.createDirectories(it.toPath()) }
         if (!withUserland) refreshBinaryLink()
         createPrivateDirectory(runtimeDir)
+        createPrivateDirectory(serverStateDir)
         writeIfMissing(initFile, "amux.opt.name = \"$serverName\"\n")
         writeIfMissing(zshrc, zshrcTemplate.replace(HOST_PLACEHOLDER, serverName))
     }

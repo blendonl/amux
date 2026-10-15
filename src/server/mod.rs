@@ -1,10 +1,12 @@
 mod connection;
+mod copy;
 mod forward;
 mod graphics;
 mod layout;
 pub mod lua_host;
 mod mouse;
 mod pane;
+mod paste;
 mod projects;
 mod reload;
 mod render;
@@ -23,6 +25,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
+use nix::sys::socket::{setsockopt, sockopt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{broadcast, watch, Mutex as AsyncMutex, Notify};
@@ -44,22 +47,24 @@ use crate::protocol::{
     Role, ServerMessage, ServerState, ServerStatus, ServerView, SessionId, SessionInfo, Size,
     Snapshot, StateEvent, Version, WindowSummary,
 };
-use crate::settings::{SessionSettings, Settings};
+use crate::settings::{Keymap, SessionSettings, Settings};
 use crate::target::{self, Candidate, Target};
 use connection::Origin;
 use forward::{Host, RemoteSession};
 use graphics::store::ImageStore;
-use lua_host::{HookEvent, HookSink, LuaHost};
+use lua_host::{HookEvent, HookSink, HostConfig, LuaHost};
+use paste::PasteBuffer;
 use projects::{blocking, Projects, REGISTRY_FILE};
 use session::{Binding, Session, SessionHost};
 
 const LOG_FILTER_ENV: &str = "AMUX_LOG";
 const EVENT_CAPACITY: usize = 256;
+const CLIENT_SEND_BUFFER_LEN: usize = 32 * 1024;
 
 pub async fn run(socket: &Path, config: Option<&Path>) -> Result<()> {
     init_logging();
     let config_paths = paths::config_paths(config)?;
-    let (settings, host) = LuaHost::start(config_paths.clone())?;
+    let (HostConfig { settings, keymap }, host) = LuaHost::start(config_paths.clone())?;
     let settings = settings.expand_home(&paths::home_dir()?);
     info!(
         init = ?config_paths.init,
@@ -109,7 +114,7 @@ pub async fn run(socket: &Path, config: Option<&Path>) -> Result<()> {
     };
     let server = Server::new(
         identity,
-        settings,
+        HostConfig { settings, keymap },
         config_paths,
         registry,
         options,
@@ -162,6 +167,9 @@ pub async fn run(socket: &Path, config: Option<&Path>) -> Result<()> {
 
 async fn serve(server: Arc<Server>, mut stream: UnixStream) -> Result<()> {
     let role = protocol::accept(&mut stream, &Version::current(), &server.identity.name).await?;
+    if role == Some(Role::Client) {
+        let _ = setsockopt(&stream, sockopt::SndBuf, &CLIENT_SEND_BUFFER_LEN);
+    }
     let (reader, writer) = stream.into_split();
     match role {
         Some(Role::Client) => {
@@ -185,12 +193,14 @@ enum Resolved {
 pub struct Server {
     identity: ServerIdentity,
     settings: watch::Sender<Arc<Settings>>,
+    keymap: watch::Sender<Arc<Keymap>>,
     config: ConfigPaths,
     config_watch: Mutex<config::Watch>,
     state: Mutex<LocalState>,
     events: broadcast::Sender<Event>,
     hooks: HookSink,
     images: Arc<ImageStore>,
+    paste: Arc<PasteBuffer>,
     cluster: Arc<Cluster>,
     lan: LanListener,
     discovery: Discovery,
@@ -225,7 +235,7 @@ struct SessionSpec<'a> {
 impl Server {
     fn new(
         identity: ServerIdentity,
-        settings: Settings,
+        HostConfig { settings, keymap }: HostConfig,
         config: ConfigPaths,
         registry: Registry,
         options: ClusterOptions,
@@ -249,12 +259,14 @@ impl Server {
             Self {
                 identity,
                 settings: watch::channel(Arc::new(settings)).0,
+                keymap: watch::channel(Arc::new(keymap)).0,
                 config,
                 config_watch,
                 state: Mutex::new(state),
                 events: broadcast::channel(EVENT_CAPACITY).0,
                 hooks: HookSink::default(),
                 images,
+                paste: Arc::default(),
                 discovery: Discovery::new(Arc::clone(&cluster), discovery, lan.watch()),
                 cluster,
                 lan,
@@ -287,6 +299,10 @@ impl Server {
 
     fn watch_settings(&self) -> watch::Receiver<Arc<Settings>> {
         self.settings.subscribe()
+    }
+
+    fn watch_keymap(&self) -> watch::Receiver<Arc<Keymap>> {
+        self.keymap.subscribe()
     }
 
     async fn forget_server(&self, server: &str) -> Result<Option<String>> {
@@ -371,8 +387,10 @@ impl Server {
             spec.binding,
             SessionHost {
                 settings: self.watch_settings(),
+                keymap: self.watch_keymap(),
                 hooks: self.hooks.clone(),
                 images: Arc::clone(&self.images),
+                paste: Arc::clone(&self.paste),
             },
         )?;
         state.sessions.insert(name.clone(), Arc::clone(&session));
@@ -591,24 +609,12 @@ impl Server {
     }
 
     fn cluster_status(&self, host: &str) -> ClusterStatus {
-        let peers = self.cluster.view();
-        let latency = peers
-            .iter()
-            .filter(|peer| peer.name == host)
-            .find_map(|peer| match peer.status {
-                ServerStatus::Online { latency } => latency,
-                _ => None,
-            });
-        let offline = peers
-            .into_iter()
-            .filter(|peer| matches!(peer.status, ServerStatus::Offline { .. }))
-            .map(|peer| peer.name)
-            .collect();
+        let summary = self.cluster.status_summary(host);
         ClusterStatus {
             local: self.identity.name.clone(),
             host: host.to_owned(),
-            latency,
-            offline,
+            latency: summary.latency,
+            offline: summary.offline,
         }
     }
 

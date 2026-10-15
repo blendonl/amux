@@ -12,11 +12,21 @@ use crate::target::Target;
 
 pub const MIN_ROWS: u16 = 2;
 pub const MIN_COLS: u16 = 2;
+pub const MAX_CLIPBOARD_LEN: usize = 1024 * 1024;
 const LOCALE_ENV_PREFIX: &str = "LC_";
 const LOCALE_ENV: [&str; 2] = ["LANG", "COLORTERM"];
 
 pub fn is_locale_variable(key: &str) -> bool {
     key.starts_with(LOCALE_ENV_PREFIX) || LOCALE_ENV.contains(&key)
+}
+
+pub fn cap_clipboard(mut text: String) -> String {
+    let mut end = text.len().min(MAX_CLIPBOARD_LEN);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,6 +379,8 @@ pub enum SessionCommand {
     KillPane,
     KillWindow,
     RenameWindow(String),
+    CopyMode { page_up: bool },
+    PasteBuffer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -405,7 +417,7 @@ pub enum ClientMessage {
     },
     Debug(DebugCommand),
     KillServer,
-    Input(Vec<u8>),
+    Input(#[serde(with = "serde_bytes")] Vec<u8>),
     Resize(Size),
     Command(SessionCommand),
     Switch(Target),
@@ -466,7 +478,7 @@ pub enum ServerMessage {
     Project(ProjectCheckout),
     Links(Vec<LinkInfo>),
     Done,
-    Output(Vec<u8>),
+    Output(#[serde(with = "serde_bytes")] Vec<u8>),
     SessionState(SessionState),
     ClusterStatus(ClusterStatus),
     Reconnecting {
@@ -495,4 +507,5 @@ pub enum ServerMessage {
     PairingStep(String),
     Notice(String),
     Image(ImageOp),
+    Clipboard(String),
 }

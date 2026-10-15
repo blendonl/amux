@@ -1,5 +1,7 @@
 use std::fmt;
+use std::ops::Range;
 
+use unicode_width::UnicodeWidthChar;
 use vt100::Color;
 
 use super::placeholder::{placeholder_cell, ImageSpan, MAX_IMAGE_CELLS};
@@ -150,18 +152,63 @@ impl fmt::Debug for Cell {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Grid {
     size: Size,
     cells: Vec<Cell>,
+    generation: u64,
+    changed: Vec<u64>,
 }
+
+impl PartialEq for Grid {
+    fn eq(&self, other: &Self) -> bool {
+        self.size == other.size && self.cells == other.cells
+    }
+}
+
+impl Eq for Grid {}
 
 impl Grid {
     pub fn new(size: Size) -> Self {
         Self {
             size,
             cells: vec![Cell::default(); usize::from(size.rows) * usize::from(size.cols)],
+            generation: 0,
+            changed: vec![0; usize::from(size.rows)],
         }
+    }
+
+    pub fn reset(&mut self, size: Size) {
+        self.size = size;
+        self.cells.clear();
+        self.cells.resize(
+            usize::from(size.rows) * usize::from(size.cols),
+            Cell::default(),
+        );
+        self.changed.clear();
+        self.changed.resize(usize::from(size.rows), self.generation);
+    }
+
+    pub fn next_generation(&mut self) {
+        self.generation += 1;
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn changed_since(&self, row: u16, generation: u64) -> bool {
+        self.changed
+            .get(usize::from(row))
+            .is_some_and(|&changed| changed >= generation)
+    }
+
+    #[cfg(test)]
+    pub fn painted_rows(&self) -> usize {
+        self.changed
+            .iter()
+            .filter(|&&changed| changed == self.generation)
+            .count()
     }
 
     #[cfg(test)]
@@ -173,14 +220,110 @@ impl Grid {
         self.index(row, col).map(|index| &self.cells[index])
     }
 
+    pub fn row(&self, row: u16) -> Option<&[Cell]> {
+        let width = usize::from(self.size.cols);
+        let start = usize::from(row) * width;
+        (row < self.size.rows).then(|| &self.cells[start..start + width])
+    }
+
+    #[cfg(test)]
     pub fn paint(&mut self, screen: &vt100::Screen, rect: Rect) {
-        let area = self.clip(rect);
-        for row in 0..area.rows {
-            for col in 0..area.cols {
-                let cell = screen.cell(row, col).map(Cell::from_vt100);
-                self.set(area.row + row, area.col + col, cell.unwrap_or_default());
+        let mut rows = screen.visible_rows();
+        for offset in 0..rect.rows {
+            let cells = rows.next().map_or(&[][..], |row| row.cells);
+            self.paint_row(
+                rect.row.saturating_add(offset),
+                rect.col,
+                rect.cols,
+                cells,
+                Cell::from_vt100,
+            );
+        }
+    }
+
+    pub fn paint_row(
+        &mut self,
+        row: u16,
+        col: u16,
+        width: u16,
+        cells: &[vt100::Cell],
+        convert: impl Fn(&vt100::Cell) -> Cell,
+    ) {
+        let area = self.clip(Rect {
+            row,
+            col,
+            rows: 1,
+            cols: width,
+        });
+        if area.rows == 0 || area.cols == 0 {
+            return;
+        }
+        self.touch(area.row);
+        let width = usize::from(area.cols);
+        let start = usize::from(area.row) * usize::from(self.size.cols) + usize::from(area.col);
+        for (index, target) in self.cells[start..start + width].iter_mut().enumerate() {
+            *target = match cells.get(index) {
+                Some(source) if is_orphaned(cells, index, width) => {
+                    Cell::blank(convert(source).style())
+                }
+                Some(source) => convert(source),
+                None => Cell::default(),
+            };
+        }
+    }
+
+    pub fn write_text(&mut self, row: u16, col: u16, clip: Rect, text: &str, style: Style) {
+        let area = self.clip(clip);
+        if !(area.row..area.bottom()).contains(&row) {
+            return;
+        }
+        let mut col = col.max(area.col);
+        for character in text.chars() {
+            let wide = match character.width() {
+                Some(0) | None => continue,
+                Some(1) => false,
+                Some(_) => true,
+            };
+            let end = col + 1 + u16::from(wide);
+            if end > area.right() {
+                break;
             }
-            self.repair_wide_cells(area.row + row, area.col, area.right());
+            let glyph = Cell::glyph(character, style);
+            self.set(row, col, Cell { wide, ..glyph });
+            if wide {
+                let continuation = Cell {
+                    wide_continuation: true,
+                    ..Cell::blank(style)
+                };
+                self.set(row, col + 1, continuation);
+            }
+            col = end;
+        }
+        self.repair_wide_cells(row, area.col, area.right());
+    }
+
+    pub fn restyle(&mut self, row: u16, cols: Range<u16>, clip: Rect, style: Style) {
+        let area = self.clip(clip);
+        let mut start = cols.start.max(area.col);
+        let mut end = cols.end.min(area.right());
+        if !(area.row..area.bottom()).contains(&row) || start >= end {
+            return;
+        }
+        if start > area.col
+            && self
+                .cell(row, start)
+                .is_some_and(Cell::is_wide_continuation)
+        {
+            start -= 1;
+        }
+        if end < area.right() && self.cell(row, end - 1).is_some_and(Cell::is_wide) {
+            end += 1;
+        }
+        self.touch(row);
+        for col in start..end {
+            if let Some(index) = self.index(row, col) {
+                self.cells[index].style = style;
+            }
         }
     }
 
@@ -299,12 +442,38 @@ impl Grid {
     pub fn set(&mut self, row: u16, col: u16, cell: Cell) {
         if let Some(index) = self.index(row, col) {
             self.cells[index] = cell;
+            self.touch(row);
+        }
+    }
+
+    fn touch(&mut self, row: u16) {
+        if let Some(changed) = self.changed.get_mut(usize::from(row)) {
+            *changed = self.generation;
         }
     }
 
     fn style_at(&self, row: u16, col: u16) -> Style {
         self.cell(row, col).map(Cell::style).unwrap_or_default()
     }
+}
+
+fn is_orphaned(cells: &[vt100::Cell], index: usize, width: usize) -> bool {
+    let cell = &cells[index];
+    if cell.is_wide() {
+        index + 1 >= width
+            || !cells
+                .get(index + 1)
+                .is_some_and(vt100::Cell::is_wide_continuation)
+    } else if cell.is_wide_continuation() {
+        index == 0 || !cells.get(index - 1).is_some_and(vt100::Cell::is_wide)
+    } else {
+        false
+    }
+}
+
+pub fn text_width(text: &str) -> u16 {
+    let width: usize = text.chars().filter_map(UnicodeWidthChar::width).sum();
+    u16::try_from(width).unwrap_or(u16::MAX)
 }
 
 struct Joins {
@@ -464,6 +633,39 @@ mod tests {
         let cut = grid.cell(0, 1).unwrap();
         assert!(cut.is_erased() && !cut.is_wide());
         assert_eq!(cut.style().bg, Color::Idx(2));
+    }
+
+    #[test]
+    fn restyling_covers_both_halves_of_a_wide_character_at_either_edge() {
+        let pane = screen(8, 1, "a中b文c");
+        let whole = rect(0, 0, 1, 8);
+        let mut grid = Grid::new(size(8, 1));
+        grid.paint(pane.screen(), whole);
+        let selected = Style {
+            inverse: true,
+            ..Style::default()
+        };
+        let styled = |grid: &Grid| -> Vec<bool> {
+            (0..8)
+                .map(|col| grid.cell(0, col).unwrap().style() == selected)
+                .collect()
+        };
+
+        grid.restyle(0, 2..5, whole, selected);
+        assert_eq!(
+            styled(&grid),
+            [false, true, true, true, true, true, false, false]
+        );
+        assert_eq!(row_text(&grid, 0), "a中b文c.");
+
+        let mut grid = Grid::new(size(8, 1));
+        grid.paint(pane.screen(), whole);
+        grid.restyle(0, 0..u16::MAX, rect(0, 2, 1, 3), selected);
+        grid.restyle(1, 0..8, whole, selected);
+        assert_eq!(
+            styled(&grid),
+            [false, false, true, true, true, false, false, false]
+        );
     }
 
     #[test]
